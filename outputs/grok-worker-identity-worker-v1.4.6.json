@@ -1,0 +1,51 @@
+{
+  "admission": {
+    "deadline_ms": 120000,
+    "marginal_contribution": "Prove Grok worker identity and resolved model for canary.",
+    "rejection_reasons": [],
+    "result": "admitted",
+    "route": "parallel_worker",
+    "route_id": "route-1784020053368-1",
+    "slice_id": "grok-identity-canary"
+  },
+  "cumulative_model_turns": 3,
+  "duration_ms": 3192,
+  "identity": {
+    "auth_source": "gateway",
+    "effort_verification": "cli_argument_only",
+    "model_verification": "verified",
+    "requested_effort": "high",
+    "requested_model": "grok-4.5",
+    "resolved_model": "grok-4.5-build"
+  },
+  "report": {
+    "changed_paths": [],
+    "evidence": [
+      "go.mod line 1: module claudexflow"
+    ],
+    "needs": [],
+    "status": "completed",
+    "summary": "Read go.mod at repo root. Exact module directive: `module claudexflow`. No files edited.",
+    "verification": [
+      "Read go.mod; first line is module claudexflow"
+    ]
+  },
+  "retry_eligible": false,
+  "session_id": "ae42e343-745e-4ef3-9cbc-ca19496b8fac",
+  "slice_id": "grok-identity-canary",
+  "start_attempts": 1,
+  "state": "completed",
+  "tool_uses": {
+    "Read": 1,
+    "StructuredOutput": 1
+  },
+  "turn": 1,
+  "turn_accounting_quality": "exact",
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 6400,
+    "input_tokens": 6419,
+    "output_tokens": 204
+  },
+  "worker_id": "worker-1"
+}
