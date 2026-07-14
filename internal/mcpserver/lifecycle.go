@@ -17,9 +17,13 @@ import (
 func (s *Server) registerRoute(plan router.Plan) router.Plan {
 	sequence := s.nextRoute.Add(1)
 	plan.RouteID = fmt.Sprintf("route-%d-%d", time.Now().UnixMilli(), sequence)
+	rootSessionID, parentSessionID := s.threadBinding()
 	record := &RouteRecord{
 		RouteID: plan.RouteID, State: "open", Plan: plan,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		RootSessionID:   rootSessionID,
+		ParentSessionID: parentSessionID,
+		WorkDir:         s.root,
 		Diagnostics: RouteDiagnostics{
 			Coverage:       "child model calls observed by claudex-flow only; Claude Code Supervisor and tools outside claudex-flow are excluded",
 			AccountingUnit: "relative_resource_intensity", SupervisorIncluded: false, ComparableSpend: false,
@@ -32,8 +36,30 @@ func (s *Server) registerRoute(plan router.Plan) router.Plan {
 		s.routes = map[string]*RouteRecord{}
 	}
 	s.routes[record.RouteID] = record
+	snapshot := cloneRouteRecord(*record)
 	s.mu.Unlock()
+	// Durable open index: survives MCP process restart (claudex --resume).
+	s.persistOpenRoute(snapshot)
 	return plan
+}
+
+// lookupRoute returns an open/terminal route from memory, hydrating from durable
+// open-routes index once if missing (resume across MCP processes).
+func (s *Server) lookupRoute(routeID string) *RouteRecord {
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	rec := s.routes[routeID]
+	s.mu.Unlock()
+	if rec != nil {
+		return rec
+	}
+	s.loadOpenRoutesIntoMemory()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.routes[routeID]
 }
 
 func (s *Server) recordRouteModelCall(routeID, role, requestedModel, requestedEffort string, result claude.Result, sameLaneRetry bool) {
@@ -89,12 +115,11 @@ func (s *Server) validateRouteTool(routeID, tool string) error {
 	if routeID == "" {
 		return nil
 	}
-	s.mu.Lock()
-	record := s.routes[routeID]
+	record := s.lookupRoute(routeID)
 	if record == nil {
-		s.mu.Unlock()
 		return fmt.Errorf("unknown route_id %q", routeID)
 	}
+	s.mu.Lock()
 	state := record.State
 	plan := record.Plan
 	s.mu.Unlock()
@@ -135,12 +160,11 @@ func (s *Server) recordRouteOutcome(_ context.Context, _ *mcp.CallToolRequest, i
 		return nil, RouteRecord{}, fmt.Errorf("route outcome evidence exceeds bounded field limits")
 	}
 
-	s.mu.Lock()
-	record := s.routes[in.RouteID]
+	record := s.lookupRoute(in.RouteID)
 	if record == nil {
-		s.mu.Unlock()
 		return nil, RouteRecord{}, fmt.Errorf("unknown route_id %q", in.RouteID)
 	}
+	s.mu.Lock()
 	if record.State != "open" {
 		s.mu.Unlock()
 		return nil, RouteRecord{}, fmt.Errorf("route_id %q already has terminal state %s", in.RouteID, record.State)
@@ -165,6 +189,8 @@ func (s *Server) recordRouteOutcome(_ context.Context, _ *mcp.CallToolRequest, i
 		snapshot = cloneRouteRecord(*current)
 	}
 	s.mu.Unlock()
+	// Terminal: drop from open durable index (ledger keeps the history).
+	s.dropOpenRoute(in.RouteID)
 	return nil, snapshot, nil
 }
 

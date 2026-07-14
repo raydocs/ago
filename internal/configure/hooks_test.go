@@ -11,9 +11,18 @@ func TestEnsureHooksInstallsRouteHintAndSupervisorGate(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "settings.json")
 	initial := map[string]any{
-		"hooks": map[string]any{"UserPromptSubmit": []any{map[string]any{
-			"matcher": "", "hooks": []any{map[string]any{"type": "command", "command": "/bin/thread", "args": []any{"thread-hook"}}},
-		}}},
+		"hooks": map[string]any{
+			"UserPromptSubmit": []any{map[string]any{
+				"matcher": "", "hooks": []any{map[string]any{"type": "command", "command": "/bin/thread", "args": []any{"thread-hook"}}},
+			}},
+			// Legacy blocking stall-watch must be stripped on configure-hooks.
+			"PostToolUse": []any{map[string]any{
+				"matcher": "*", "hooks": []any{map[string]any{
+					"type": "command", "command": "/bin/claudex-flow", "args": []any{"stall-watch"},
+					"asyncRewake": true, "timeout": float64(360),
+				}},
+			}},
+		},
 	}
 	raw, _ := json.MarshalIndent(initial, "", "  ")
 	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
@@ -24,8 +33,8 @@ func TestEnsureHooksInstallsRouteHintAndSupervisorGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed["route-hint"] || !changed["supervisor-gate:PreToolUse"] {
-		t.Fatalf("expected installs, got %#v", changed)
+	if !changed["route-hint"] || !changed["supervisor-gate:PreToolUse"] || !changed["remove:stall-watch"] {
+		t.Fatalf("expected installs + stall-watch removal, got %#v", changed)
 	}
 
 	// Second call is idempotent.
@@ -54,5 +63,8 @@ func TestEnsureHooksInstallsRouteHintAndSupervisorGate(t *testing.T) {
 	post := hooks["PostToolUse"].([]any)
 	if !hasHandler(post, "/bin/claudex-flow", "supervisor-gate") {
 		t.Fatalf("PostToolUse supervisor-gate missing: %#v", post)
+	}
+	if hasHandler(post, "/bin/claudex-flow", "stall-watch") {
+		t.Fatalf("stall-watch must be removed from PostToolUse: %#v", post)
 	}
 }

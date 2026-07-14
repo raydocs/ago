@@ -26,12 +26,33 @@ func TestWatchReturnsWhenTranscriptProgresses(t *testing.T) {
 			_ = file.Close()
 		}
 	}()
-	out, err := Watch(context.Background(), bytes.NewReader(input), Config{Timeout: time.Second, Poll: 5 * time.Millisecond, StateDir: filepath.Join(dir, "state")})
+	out, err := Watch(context.Background(), bytes.NewReader(input), Config{Timeout: time.Second, Poll: 5 * time.Millisecond, StateDir: filepath.Join(dir, "state"), Blocking: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if out.State != "progressed" {
 		t.Fatalf("state=%q, want progressed", out.State)
+	}
+}
+
+func TestWatchNonBlockingNeverWaits(t *testing.T) {
+	// Production PostToolUse path must return immediately (self-deadlock fix).
+	dir := t.TempDir()
+	transcript := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(transcript, []byte("tool result\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := hookJSON(t, HookInput{SessionID: "s", TranscriptPath: transcript, HookEventName: "PostToolUse", ToolName: "Bash", ToolUseID: "t1"})
+	started := time.Now()
+	out, err := Watch(context.Background(), bytes.NewReader(input), Config{Timeout: 5 * time.Minute, Poll: time.Second, StateDir: filepath.Join(dir, "state"), Blocking: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.State != "nonblocking_pass" {
+		t.Fatalf("state=%q", out.State)
+	}
+	if time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("non-blocking watch took too long: %s", time.Since(started))
 	}
 }
 
@@ -43,7 +64,7 @@ func TestWatchClaimsOneRewakeAndLogsIt(t *testing.T) {
 	}
 	hook := HookInput{SessionID: "session-2", TranscriptPath: transcript, HookEventName: "PostToolUse", ToolName: "Playwright", ToolUseID: "tool-2"}
 	input := hookJSON(t, hook)
-	cfg := Config{Timeout: 25 * time.Millisecond, Poll: 5 * time.Millisecond, StateDir: filepath.Join(dir, "state")}
+	cfg := Config{Timeout: 25 * time.Millisecond, Poll: 5 * time.Millisecond, StateDir: filepath.Join(dir, "state"), Blocking: true}
 	first, err := Watch(context.Background(), bytes.NewReader(input), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +92,7 @@ func TestWatchClaimsOneRewakeAndLogsIt(t *testing.T) {
 func TestWatchFailsOpenWhenTranscriptIsUnavailable(t *testing.T) {
 	dir := t.TempDir()
 	input := hookJSON(t, HookInput{SessionID: "session-3", TranscriptPath: filepath.Join(dir, "missing.jsonl"), HookEventName: "PostToolUse"})
-	out, err := Watch(context.Background(), bytes.NewReader(input), Config{Timeout: time.Millisecond, Poll: time.Millisecond, StateDir: filepath.Join(dir, "state")})
+	out, err := Watch(context.Background(), bytes.NewReader(input), Config{Timeout: time.Millisecond, Poll: time.Millisecond, StateDir: filepath.Join(dir, "state"), Blocking: true})
 	if err != nil {
 		t.Fatal(err)
 	}

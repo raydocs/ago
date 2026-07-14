@@ -9,6 +9,8 @@ import (
 
 // EnsureHooks idempotently installs root-only zero-model control hooks:
 // route-hint on UserPromptSubmit and supervisor-gate on Pre/Post tool + compact.
+// It also removes blocking stall-watch PostToolUse handlers (self-deadlock with
+// Claude Code's hook lifecycle; stall-watch now no-ops and is not reinstalled).
 func EnsureHooks(settingsPath, command string) (map[string]bool, error) {
 	raw, err := os.ReadFile(settingsPath)
 	if err != nil {
@@ -25,6 +27,9 @@ func EnsureHooks(settingsPath, command string) (map[string]bool, error) {
 	}
 
 	changed := map[string]bool{}
+	if removeHandlers(hooks, command, "stall-watch") {
+		changed["remove:stall-watch"] = true
+	}
 	// route-hint first on UserPromptSubmit so routing context is available early.
 	if ensureHandler(hooks, "UserPromptSubmit", "", command, []any{"route-hint"}, map[string]any{
 		"type": "command", "command": command, "args": []any{"route-hint"}, "timeout": float64(2),
@@ -148,4 +153,49 @@ func hasHandler(groups []any, command, arg string) bool {
 		}
 	}
 	return false
+}
+
+// removeHandlers strips every hook entry matching command+arg across all events.
+func removeHandlers(hooks map[string]any, command, arg string) bool {
+	removed := false
+	for event, rawGroups := range hooks {
+		groups, ok := rawGroups.([]any)
+		if !ok {
+			continue
+		}
+		nextGroups := make([]any, 0, len(groups))
+		for _, rawGroup := range groups {
+			group, ok := rawGroup.(map[string]any)
+			if !ok {
+				nextGroups = append(nextGroups, rawGroup)
+				continue
+			}
+			entries, _ := group["hooks"].([]any)
+			kept := make([]any, 0, len(entries))
+			for _, rawEntry := range entries {
+				entry, ok := rawEntry.(map[string]any)
+				if !ok {
+					kept = append(kept, rawEntry)
+					continue
+				}
+				if fmt.Sprint(entry["command"]) == command {
+					args, _ := entry["args"].([]any)
+					if len(args) == 1 && fmt.Sprint(args[0]) == arg {
+						removed = true
+						continue
+					}
+				}
+				kept = append(kept, rawEntry)
+			}
+			if len(kept) == 0 {
+				// Drop empty matcher groups.
+				removed = true
+				continue
+			}
+			group["hooks"] = kept
+			nextGroups = append(nextGroups, group)
+		}
+		hooks[event] = nextGroups
+	}
+	return removed
 }

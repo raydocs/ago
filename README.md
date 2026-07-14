@@ -154,9 +154,7 @@ Dashboard：<https://claudex-threads.ppop.workers.dev>
 
 普通 MCP 调用具有 120 秒 hard wall-clock timeout，防止 Playwright/Context7 等工具无限挂起；`claudex-flow` 单独覆盖为 11 分钟，保留真实 Worker turn 的执行空间。
 
-`PostToolUse` 与 `PostToolUseFailure` 还接入一个零模型 watchdog。若工具已经返回、但主 Thread transcript 连续 5 分钟没有任何增长，Claude Code 的 `asyncRewake` 会向同一 turn 注入一次 `CLAUDEX_STALL_REWAKE`：Supervisor 先核对副作用状态，只继续未完成的 gate，不重放部署或写入。正常推理一旦产生 transcript 增量，watchdog 会立即退出。
-
-每个 tool result 最多触发一次恢复；记录保存在 `~/.config/claudex/stall-watch/events.jsonl`。这个机制不会回溯已经发生在安装前的停滞，也不会自动重启或杀掉 Claude Code。
+**v1.4.6+：** 不再在 `PostToolUse` 上挂阻塞型 `stall-watch`。实测表明：工具结果要等 Hook 结束才会写入 transcript，而 stall-watch 又等待 transcript 增长 → 固定约 5 分钟假死。`configure-hooks` 会卸掉遗留 stall-watch；`stall-watch` 命令本身也改为非阻塞 no-op。
 
 ## Supervisor gate (v1.4.2)
 

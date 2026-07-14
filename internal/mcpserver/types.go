@@ -308,14 +308,19 @@ type RouteDiagnostics struct {
 }
 
 type RouteRecord struct {
-	RouteID      string           `json:"route_id"`
-	State        string           `json:"state"`
-	Plan         router.Plan      `json:"plan"`
-	CreatedAt    string           `json:"created_at"`
-	Diagnostics  RouteDiagnostics `json:"diagnostics"`
-	Outcome      *RouteOutcome    `json:"outcome,omitempty"`
-	LedgerStatus string           `json:"ledger_status"`
-	LedgerError  string           `json:"ledger_error,omitempty"`
+	RouteID         string           `json:"route_id"`
+	State           string           `json:"state"`
+	Plan            router.Plan      `json:"plan"`
+	CreatedAt       string           `json:"created_at"`
+	// RootSessionID is best-effort bind for resume / multi-process recovery.
+	RootSessionID   string           `json:"root_session_id,omitempty"`
+	ParentSessionID string           `json:"parent_session_id,omitempty"`
+	// WorkDir absolute cwd when the route was planned (boundary for gate/verify).
+	WorkDir         string           `json:"workdir,omitempty"`
+	Diagnostics     RouteDiagnostics `json:"diagnostics"`
+	Outcome         *RouteOutcome    `json:"outcome,omitempty"`
+	LedgerStatus    string           `json:"ledger_status"`
+	LedgerError     string           `json:"ledger_error,omitempty"`
 }
 
 type EmptyInput struct{}

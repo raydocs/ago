@@ -21,6 +21,12 @@ type Config struct {
 	Timeout  time.Duration
 	Poll     time.Duration
 	StateDir string
+	// Blocking waits for transcript progress up to Timeout.
+	// MUST be false for Claude Code PostToolUse hooks: the tool result cannot
+	// enter the transcript until the hook exits, so a wait self-deadlocks until
+	// timeout (observed ~300s with CLAUDEX_STALL_TIMEOUT_SECONDS=300).
+	// Unit tests of rewake claim logic may set Blocking=true.
+	Blocking bool
 }
 
 type HookInput struct {
@@ -75,6 +81,17 @@ func Watch(ctx context.Context, input io.Reader, cfg Config) (Outcome, error) {
 	if err := json.Unmarshal(raw, &hook); err != nil {
 		return Outcome{}, fmt.Errorf("parse hook input: %w", err)
 	}
+
+	// Production hook path: never block the tool pipeline.
+	if !cfg.Blocking {
+		return Outcome{
+			State:     "nonblocking_pass",
+			SessionID: hook.SessionID,
+			ToolName:  hook.ToolName,
+			ToolUseID: hook.ToolUseID,
+		}, nil
+	}
+
 	path, err := expandPath(hook.TranscriptPath)
 	if err != nil {
 		return unavailable(hook), nil

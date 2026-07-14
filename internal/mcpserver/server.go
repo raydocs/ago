@@ -30,11 +30,12 @@ type Server struct {
 	sliceInputs     map[string]WorkerStartInput
 	sliceHistory    []*sliceState
 	laneHealth      map[string]router.LaneHealth
-	routes          map[string]*RouteRecord
-	routeLedgerPath string
-	nextID          atomic.Int32
-	nextRoute       atomic.Int32
-	runModel        func(context.Context, claude.Request) claude.Result
+	routes                 map[string]*RouteRecord
+	routeLedgerPath        string
+	openRoutesPathOverride string // tests
+	nextID                 atomic.Int32
+	nextRoute              atomic.Int32
+	runModel               func(context.Context, claude.Request) claude.Result
 
 	workerStarts    atomic.Int32
 	workerTurns     atomic.Int32
@@ -106,6 +107,8 @@ func Run(ctx context.Context, version, settings string) error {
 		slots:           make(chan struct{}, maxConcurrentRuns),
 		runModel:        claude.Run,
 	}
+	// Resume recovery: hydrate open routes from durable index before serving tools.
+	s.loadOpenRoutesIntoMemory()
 	server := mcp.NewServer(&mcp.Implementation{Name: "claudex-flow", Version: version}, nil)
 	readOnly, openWorld, destructive := true, true, true
 

@@ -73,6 +73,16 @@ func modelMatches(requested, resolved string) bool {
 	if requested == resolved || strings.HasPrefix(resolved, requested+"-") || strings.HasPrefix(resolved, requested+"[") {
 		return true
 	}
+	// Family match: grok-4.5 ↔ grok-4.5-build-*, but never match claude-opus-* to grok-*.
+	if strings.HasPrefix(requested, "grok") {
+		return strings.Contains(resolved, "grok")
+	}
+	if strings.HasPrefix(requested, "gpt-5.6") || strings.HasPrefix(requested, "gpt-5") {
+		return strings.Contains(resolved, "gpt-5") || strings.Contains(resolved, "sol") || strings.Contains(resolved, "terra") || strings.Contains(resolved, "luna")
+	}
+	if strings.HasPrefix(requested, "gemini") {
+		return strings.Contains(resolved, "gemini")
+	}
 	switch requested {
 	case "opus":
 		return strings.Contains(resolved, "opus")

@@ -198,7 +198,12 @@ func stallWatch(ctx context.Context) {
 	if stateDir == "" {
 		stateDir = stallwatch.DefaultStateDir()
 	}
-	out, err := stallwatch.Watch(ctx, os.Stdin, stallwatch.Config{Timeout: timeout, Poll: time.Second, StateDir: stateDir})
+	// Blocking is always false on the Claude Code hook path. Waiting for
+	// transcript progress self-deadlocks: the tool result cannot land in the
+	// transcript until PostToolUse hooks exit (canary: ~300s fake stalls).
+	out, err := stallwatch.Watch(ctx, os.Stdin, stallwatch.Config{
+		Timeout: timeout, Poll: time.Second, StateDir: stateDir, Blocking: false,
+	})
 	if err != nil {
 		// A watchdog must fail open rather than block or wake a healthy session.
 		return
@@ -586,6 +591,13 @@ func doctor() error {
 			if !hasCommandHook(settings, event, guardCommand, []string{"supervisor-gate"}) {
 				settingsFailures = append(settingsFailures, event+" supervisor-gate is missing")
 				failures = append(failures, event+" supervisor-gate is missing")
+			}
+		}
+		// Blocking stall-watch on PostToolUse self-deadlocks tool results (~5 min).
+		for _, event := range []string{"PostToolUse", "PostToolUseFailure"} {
+			if hasCommandHook(settings, event, guardCommand, []string{"stall-watch"}) {
+				settingsFailures = append(settingsFailures, event+" stall-watch must be removed (self-deadlock)")
+				failures = append(failures, event+" still has blocking stall-watch; run configure-hooks / reinstall 1.4.6+")
 			}
 		}
 		for _, event := range []string{"PreCompact", "PostCompact"} {
