@@ -11,7 +11,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const ContractVersion = "claudex-workflow.v1.4.4"
+const ContractVersion = "claudex-workflow.v1.4.5"
 
 type RuntimeContract struct {
 	Version           string   `json:"version"`

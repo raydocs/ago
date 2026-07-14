@@ -56,6 +56,7 @@ type Status struct {
 	HandoffMDPath        string         `json:"handoff_md_path,omitempty"`
 	OverflowLatched       bool   `json:"overflow_latched,omitempty"`
 	LatestPromptTokens    int64  `json:"latest_prompt_tokens,omitempty"`
+	TokenSource           string `json:"token_source,omitempty"`
 	ToolResultBytesWindow int64  `json:"tool_result_bytes_window,omitempty"`
 	ContextPressure       string `json:"context_pressure,omitempty"`
 	DeployCalls           int    `json:"deploy_calls,omitempty"`
@@ -277,6 +278,7 @@ func statusFrom(st state, dir string) Status {
 		GateCount: len(st.UsedGateIDs), Override: st.Override,
 		HandoffJSONPath: st.HandoffJSONPath, HandoffMDPath: st.HandoffMDPath,
 		OverflowLatched: st.OverflowLatched, LatestPromptTokens: st.LatestPromptTokens,
+		TokenSource: st.TokenSource,
 		ToolResultBytesWindow: st.ToolResultBytesWindow, ContextPressure: st.ContextPressure,
 		DeployCalls: st.DeployCalls, TestCalls: st.TestCalls,
 		StatePath: statePath(dir, st.SessionID), Exists: true,

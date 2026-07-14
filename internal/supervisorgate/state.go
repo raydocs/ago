@@ -116,6 +116,11 @@ type state struct {
 	OverflowLatched       bool   `json:"overflow_latched,omitempty"`
 	DeployCalls           int    `json:"deploy_calls,omitempty"`
 	TestCalls             int    `json:"test_calls,omitempty"`
+
+	// Recovery hints for handoff capsules (best-effort, zero-model).
+	TranscriptPath string   `json:"transcript_path,omitempty"`
+	PathHints      []string `json:"path_hints,omitempty"`
+	TokenSource    string   `json:"token_source,omitempty"` // hook | transcript | ""
 }
 
 type gateEvent struct {

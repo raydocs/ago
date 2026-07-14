@@ -1,6 +1,7 @@
 package routeeval
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,5 +34,36 @@ func TestDryRunPromoteRealRouteRecordSchema(t *testing.T) {
 	}
 	if dry.DistinctRouteIDs != 3 {
 		t.Fatalf("distinct=%d", dry.DistinctRouteIDs)
+	}
+}
+
+func TestDryRunPromoteRejectsMajorCorrectionCohort(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "route-outcomes.jsonl")
+	var body string
+	for i := 1; i <= 10; i++ {
+		body += fmt.Sprintf(
+			`{"route_id":"r-%d","state":"accepted","family":"implement","plan":{"kind":"implement"},"outcome":{"status":"accepted","human_correction":"major"},"diagnostics":{"duration_ms":3600000,"failed_calls":9,"usage":{"input_tokens":900000}}}`+"\n",
+			i,
+		)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dry, err := DryRunPromote(path, "implement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dry.Accepted != 10 || !dry.MeetsK10 {
+		t.Fatalf("setup: accepted=%d meetsK10=%v", dry.Accepted, dry.MeetsK10)
+	}
+	if dry.Recommendation == "eligible_for_manual_promote_review" {
+		t.Fatalf("major corrections must block promote, got %#v", dry)
+	}
+	if dry.MeetsNonInferiority {
+		t.Fatalf("expected non-inferiority fail, blockers=%v", dry.Blockers)
+	}
+	if dry.MajorCorrections != 10 {
+		t.Fatalf("major=%d", dry.MajorCorrections)
 	}
 }

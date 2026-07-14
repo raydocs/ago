@@ -142,7 +142,14 @@ func TestHandoffFailClosedUnknownMCPAndBash(t *testing.T) {
 func TestDestructiveGitDeniedOnNormalRoot(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{StateDir: dir, HighCostSoft: 100, HighCostHard: 100, Now: fixedNow(t)}
-	for _, cmd := range []string{"git reset --hard HEAD", "git push --force origin main"} {
+	for _, cmd := range []string{
+		"git reset --hard HEAD",
+		"git push --force origin main",
+		"git -C . reset --hard HEAD",
+		"git push origin main --force",
+		"git push origin main -f",
+		"git -C /tmp/repo push --force-with-lease origin main",
+	} {
 		dec, _, err := Run(bytes.NewReader(hookJSON(t, HookInput{
 			SessionID: "g", HookEventName: "PreToolUse", ToolName: "Bash",
 			ToolInput: json.RawMessage(`{"command":` + jsonString(cmd) + `}`),
@@ -153,6 +160,60 @@ func TestDestructiveGitDeniedOnNormalRoot(t *testing.T) {
 		if dec.Permission != "deny" || !strings.Contains(dec.Reason, "GIT_DESTRUCTIVE") {
 			t.Fatalf("cmd %q => %#v", cmd, dec)
 		}
+	}
+}
+
+func TestBashIsDestructiveGitArgvVariants(t *testing.T) {
+	deny := []string{
+		"git -C . reset --hard HEAD",
+		"git push origin main --force",
+		"git push origin main -f",
+		"/usr/bin/git --no-pager -C /tmp reset --hard",
+		"git push --force-with-lease=main origin main",
+	}
+	for _, cmd := range deny {
+		if !bashIsDestructiveGit(json.RawMessage(`{"command":` + jsonString(cmd) + `}`)) {
+			t.Fatalf("expected destructive: %q", cmd)
+		}
+	}
+	allow := []string{
+		"git status",
+		"git push origin main",
+		"git reset --soft HEAD~1",
+		"echo git reset --hard", // not a git argv invocation as first field after chain? Actually whole segment is echo...
+	}
+	for _, cmd := range allow {
+		if bashIsDestructiveGit(json.RawMessage(`{"command":` + jsonString(cmd) + `}`)) {
+			t.Fatalf("expected allow: %q", cmd)
+		}
+	}
+}
+
+func TestTranscriptUsageSampleFillsPromptTokens(t *testing.T) {
+	dir := t.TempDir()
+	transcript := filepath.Join(dir, "t.jsonl")
+	line := `{"timestamp":"2026-07-14T00:00:00Z","sessionId":"s","requestId":"r","message":{"id":"m","model":"x","usage":{"input_tokens":100000,"output_tokens":10,"cache_read_input_tokens":120000,"cache_creation_input_tokens":0}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{StateDir: dir, HighCostSoft: 100, HighCostHard: 100, Now: fixedNow(t)}
+	// Official shape: PostToolUse without input_tokens fields.
+	if _, _, err := Run(bytes.NewReader(hookJSON(t, HookInput{
+		SessionID: "sess-t3", HookEventName: "PostToolUse", ToolName: "Read",
+		TranscriptPath: transcript,
+		ToolInput:      json.RawMessage(`{"file_path":"a.go"}`),
+	})), cfg); err != nil {
+		t.Fatal(err)
+	}
+	st, err := LoadStatus(dir, "sess-t3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LatestPromptTokens != 220000 {
+		t.Fatalf("expected transcript sample 220000, got %d source=%s", st.LatestPromptTokens, st.TokenSource)
+	}
+	if st.TokenSource != "transcript" {
+		t.Fatalf("token_source=%q", st.TokenSource)
 	}
 }
 

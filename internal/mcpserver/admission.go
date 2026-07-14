@@ -65,7 +65,7 @@ func evaluateWorkerAdmission(in WorkerStartInput) WorkerAdmission {
 	if in.Write && !hasExplicitPath(in.Paths) {
 		admission.RejectionReasons = append(admission.RejectionReasons, "write workers require explicit non-overlapping paths")
 	}
-	if reason := compositeSliceReason(detectSliceDomains(in)); reason != "" {
+	if reason := compositeSliceReasonForInput(in); reason != "" {
 		admission.RejectionReasons = append(admission.RejectionReasons, reason)
 		admission.SuggestedSlices = suggestSlices(in)
 	}

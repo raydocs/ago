@@ -298,10 +298,36 @@ func (s *Server) applyResult(w *workerState, result claude.Result, requestedMaxT
 	w.identity = executionIdentity(workerModel, workerEffort, result)
 	turns, quality := result.AccountedTurns(requestedMaxTurns)
 	w.cumulativeModelTurns += turns
-	w.turnAccountingQuality = quality
+	// T6: aggregate quality is the worst sample ever applied (unknown > upper_bound > exact).
+	// An earlier upper_bound charge must not be re-labeled exact by a later exact sample.
+	w.turnAccountingQuality = worseTurnQuality(w.turnAccountingQuality, quality)
 	if result.SessionID != "" {
 		w.sessionID = result.SessionID
 	}
+}
+
+// worseTurnQuality returns the more conservative of two accounting qualities.
+// Order (worst first): unknown > upper_bound > exact > "".
+func worseTurnQuality(a, b string) string {
+	rank := func(q string) int {
+		switch q {
+		case "unknown":
+			return 3
+		case "upper_bound":
+			return 2
+		case "exact":
+			return 1
+		default:
+			return 0
+		}
+	}
+	if rank(b) > rank(a) {
+		return b
+	}
+	if a == "" {
+		return b
+	}
+	return a
 }
 
 // workerInvokeMaxTurns keeps per-invoke MaxTurns ≤ 10 and never exceeds remaining cumulative budget.

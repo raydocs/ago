@@ -120,3 +120,42 @@ func TestPartialUnknownPathRejectsOrMultiDomain(t *testing.T) {
 		t.Fatalf("UI path + unknown backend path must not admit as single-domain UI: %#v domains=%v", admission, detectSliceDomains(in))
 	}
 }
+
+func TestUnknownOnlySinglePackageAdmits(t *testing.T) {
+	// Codex follow-up: internal/catalog/catalog.go must not be fabricated as API+UI.
+	in := WorkerStartInput{
+		SliceID:              "catalog-fix",
+		Objective:            "Fix a localized catalog lookup bug.",
+		MarginalContribution: "Own catalog package so supervisor only verifies go test.",
+		OutputContract:       "changed paths + go test output",
+		DoneCondition:        "go test ./internal/catalog",
+		Paths:                []string{"internal/catalog/catalog.go"},
+		Write:                true,
+		DeadlineMS:           60_000,
+	}
+	admission := evaluateWorkerAdmission(in)
+	if admission.Result != admissionAdmitted {
+		t.Fatalf("unknown-only single package must admit, got %#v domains=%v", admission, detectSliceDomains(in))
+	}
+	domains := detectSliceDomains(in)
+	if len(domains) != 1 || domains[0] != domainUnknown {
+		t.Fatalf("expected only unknown domain, got %v", domains)
+	}
+}
+
+func TestUnknownMultiPackageRejects(t *testing.T) {
+	in := WorkerStartInput{
+		SliceID:              "multi-pkg",
+		Objective:            "Touch two unrelated packages.",
+		MarginalContribution: "bad slice",
+		OutputContract:       "paths",
+		DoneCondition:        "go test ./...",
+		Paths:                []string{"internal/catalog/catalog.go", "cmd/claudex-flow/main.go"},
+		Write:                true,
+		DeadlineMS:           60_000,
+	}
+	admission := evaluateWorkerAdmission(in)
+	if admission.Result != admissionRejected {
+		t.Fatalf("unknown multi-package must reject, got %#v", admission)
+	}
+}

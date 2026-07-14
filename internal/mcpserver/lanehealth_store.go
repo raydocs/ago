@@ -75,6 +75,7 @@ func loadDurableLaneHealth() []router.LaneHealth {
 			}
 			out = append(out, router.LaneHealth{
 				Tool: e.Tool, Status: e.Status, FailureClass: e.FailureClass, Reason: e.Reason,
+				ObservedAt: e.ObservedAt,
 			})
 		}
 		return nil

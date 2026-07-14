@@ -1,0 +1,38 @@
+{
+  "version": "claudex-workflow.v1.4.5",
+  "supervisor_profile": "gpt-5.6-sol/xhigh",
+  "worker_profile": "grok-4.5/high",
+  "tools": [
+    "route_task",
+    "record_route_outcome",
+    "start_worker",
+    "resume_worker",
+    "search_external",
+    "digest_urls",
+    "explore_repository",
+    "find_thread",
+    "read_thread",
+    "consult_native_claude",
+    "close_worker",
+    "workflow_status",
+    "declare_gate",
+    "close_gate",
+    "ack_reroute",
+    "gate_status",
+    "runtime_contract"
+  ],
+  "worker_start_fields": [
+    "context",
+    "deadline_ms",
+    "done_condition",
+    "marginal_contribution",
+    "objective",
+    "output_contract",
+    "paths",
+    "retry_reason",
+    "route_id",
+    "slice_id",
+    "workdir",
+    "write"
+  ]
+}

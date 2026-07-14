@@ -255,7 +255,8 @@ func refreshLifecycle(st *state, hook HookInput, cfg Config) {
 		}
 	}
 	if path := strings.TrimSpace(hook.TranscriptPath); path != "" {
-		if info, err := os.Stat(expandHome(path)); err == nil && info.Size() >= cfg.MaxTranscriptBytes {
+		st.TranscriptPath = expandHome(path)
+		if info, err := os.Stat(st.TranscriptPath); err == nil && info.Size() >= cfg.MaxTranscriptBytes {
 			st.HandoffRequired = true
 			st.HandoffReason = fmt.Sprintf("transcript_bytes=%d exceeds budget %d", info.Size(), cfg.MaxTranscriptBytes)
 		}
@@ -320,6 +321,16 @@ func ingestUsageHint(st *state, hook HookInput) {
 	promptSide := hook.InputTokens + hook.CacheReadInputTokens + hook.CacheCreationInputTokens
 	if promptSide > 0 {
 		st.LatestPromptTokens = promptSide // current sample, not max-ever
+		st.TokenSource = "hook"
+		return
+	}
+	// Official Claude Code PostToolUse payloads do not include input_tokens/cache_*.
+	// Fall back to sampling the latest assistant usage from the session transcript (T3 partial).
+	if path := strings.TrimSpace(hook.TranscriptPath); path != "" {
+		if n, ok := sampleTranscriptPromptTokens(path); ok && n > 0 {
+			st.LatestPromptTokens = n
+			st.TokenSource = "transcript"
+		}
 	}
 }
 
@@ -361,6 +372,10 @@ func handleStopFailure(st *state, hook HookInput, cfg Config) Decision {
 func recordTool(st *state, hook HookInput, cfg Config) Decision {
 	name := hook.ToolName
 	st.LastToolName = name
+	// Capture write-path hints for handoff recovery (bounded).
+	if p := toolPathFromInput(hook.ToolInput); p != "" && (name == "Write" || name == "Edit" || name == "MultiEdit") {
+		st.PathHints = appendPathHint(st.PathHints, p, 32)
+	}
 	// T3: rolling tool_response bytes (bounded); not lifetime cumulative.
 	if len(hook.ToolResponse) > 0 {
 		st.ToolResultBytesWindow += int64(len(hook.ToolResponse))

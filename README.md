@@ -1,6 +1,6 @@
 # claudex-flow
 
-`claudex-flow` v1.4.4 是为 Claude Code 实现的 **Amp-style Agent Mode**。它不是“为整项任务挑一个模型”，而是一个有主线程、持久 Worker、能力代理、零模型 prompt route hint、**Supervisor 工具预算与 Root 生命周期闸门**、历史 Thread 搜索/读取、证据回注、路由结果账本、独立 Luna compact lane 与云端 Thread 记录的运行时。
+`claudex-flow` v1.4.5 是为 Claude Code 实现的 **Amp-style Agent Mode**。它不是“为整项任务挑一个模型”，而是一个有主线程、持久 Worker、能力代理、零模型 prompt route hint、**Supervisor 工具预算与 Root 生命周期闸门**、历史 Thread 搜索/读取、证据回注、路由结果账本、独立 Luna compact lane 与云端 Thread 记录的运行时。
 
 v0.5 的优化目标不是增加 Agent 数量，而是降低**验收通过所需的总成本和关键路径时间**：先冻结验收契约，Sol 能单路径完成时直接做；只有一个独立切片能避免 Supervisor 重复实现时才启动 Worker。
 

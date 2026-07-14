@@ -81,6 +81,8 @@ type LaneHealth struct {
 	Status       string `json:"status"`
 	FailureClass string `json:"failure_class,omitempty"`
 	Reason       string `json:"reason,omitempty"`
+	// ObservedAt is RFC3339Nano; used to merge session vs durable health by freshness (T12).
+	ObservedAt string `json:"observed_at,omitempty"`
 }
 
 type SurfaceSnapshot struct {

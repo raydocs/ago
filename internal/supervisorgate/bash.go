@@ -2,7 +2,9 @@ package supervisorgate
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 // bashReadOnly allows a narrow whitelist of read-only shell forms during handoff.
@@ -39,20 +41,216 @@ func bashReadOnly(raw json.RawMessage) bool {
 }
 
 // bashIsDestructiveGit detects hard-denied git operations on normal Roots.
+// Uses argv-style parsing so global options (-C, -c, …) and flag position
+// (e.g. git push origin main --force / -f) cannot bypass the gate.
 func bashIsDestructiveGit(raw json.RawMessage) bool {
-	cmd := strings.ToLower(bashCommand(raw))
+	cmd := bashCommand(raw)
 	if cmd == "" {
 		return false
 	}
-	// Conservative substring match: these must never be automated thrash.
-	if strings.Contains(cmd, "git reset --hard") || strings.Contains(cmd, "git reset -hard") {
-		return true
-	}
-	if strings.Contains(cmd, "git push --force") || strings.Contains(cmd, "git push -f") ||
-		strings.Contains(cmd, "git push --force-with-lease") {
-		return true
+	for _, seg := range splitShellSegments(cmd) {
+		if gitSegmentDestructive(seg) {
+			return true
+		}
 	}
 	return false
+}
+
+// splitShellSegments splits a shell command on top-level chain operators.
+// Quote-aware enough for common agent commands; fail-closed on oddities by
+// still scanning the unsplit form as a single segment.
+func splitShellSegments(cmd string) []string {
+	var segs []string
+	var b strings.Builder
+	inSingle, inDouble, escaped := false, false, false
+	flush := func() {
+		s := strings.TrimSpace(b.String())
+		if s != "" {
+			segs = append(segs, s)
+		}
+		b.Reset()
+	}
+	runes := []rune(cmd)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if escaped {
+			b.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' && !inSingle {
+			escaped = true
+			b.WriteRune(r)
+			continue
+		}
+		if r == '\'' && !inDouble {
+			inSingle = !inSingle
+			b.WriteRune(r)
+			continue
+		}
+		if r == '"' && !inSingle {
+			inDouble = !inDouble
+			b.WriteRune(r)
+			continue
+		}
+		if !inSingle && !inDouble {
+			if r == '\n' || r == '\r' || r == ';' {
+				flush()
+				continue
+			}
+			if r == '|' || r == '&' {
+				// Treat |, ||, &, && as separators.
+				flush()
+				// skip doubled operators
+				if i+1 < len(runes) && runes[i+1] == r {
+					i++
+				}
+				continue
+			}
+		}
+		b.WriteRune(r)
+	}
+	flush()
+	if len(segs) == 0 {
+		return []string{strings.TrimSpace(cmd)}
+	}
+	return segs
+}
+
+func gitSegmentDestructive(seg string) bool {
+	fields := shellFields(seg)
+	if len(fields) == 0 {
+		return false
+	}
+	// Only the primary command word counts (skip FOO=bar env assignments).
+	// This avoids false positives on `echo git reset --hard`.
+	cmdIdx := -1
+	for i, f := range fields {
+		if strings.Contains(f, "=") && !strings.HasPrefix(f, "-") && filepath.Base(f) != "git" {
+			// env assignment like FOO=1
+			if !strings.HasPrefix(f, "=") && strings.IndexByte(f, '=') > 0 {
+				continue
+			}
+		}
+		cmdIdx = i
+		break
+	}
+	if cmdIdx < 0 {
+		return false
+	}
+	base := filepath.Base(fields[cmdIdx])
+	if base != "git" && base != "git.exe" {
+		return false
+	}
+	args := fields[cmdIdx+1:]
+	sub, rest := parseGitArgv(args)
+	switch sub {
+	case "reset":
+		for _, a := range rest {
+			if a == "--hard" || a == "-hard" {
+				return true
+			}
+		}
+	case "push":
+		for _, a := range rest {
+			if a == "--force" || a == "-f" || a == "--force-with-lease" ||
+				strings.HasPrefix(a, "--force-with-lease=") ||
+				strings.HasPrefix(a, "--force=") {
+				return true
+			}
+		}
+	case "clean":
+		// git clean -fd / -fx is also destructive; deny force-style cleans.
+		for _, a := range rest {
+			if a == "-f" || a == "-fd" || a == "-fx" || a == "-ff" ||
+				a == "--force" || strings.HasPrefix(a, "-") && strings.Contains(a, "f") && !strings.HasPrefix(a, "--") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// parseGitArgv skips git global options and returns (subcommand, remaining args).
+func parseGitArgv(args []string) (sub string, rest []string) {
+	// Global options that take a separate value.
+	takesValue := map[string]bool{
+		"-C": true, "-c": true, "--git-dir": true, "--work-tree": true,
+		"--namespace": true, "--config-env": true, "-o": true,
+	}
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if a == "" {
+			i++
+			continue
+		}
+		if a == "--" {
+			i++
+			break
+		}
+		if takesValue[a] {
+			i += 2
+			continue
+		}
+		// -Cpath style is rare; handle -c key=value already as single token via =
+		if strings.HasPrefix(a, "-C") && len(a) > 2 {
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "--git-dir=") || strings.HasPrefix(a, "--work-tree=") ||
+			strings.HasPrefix(a, "--namespace=") || strings.HasPrefix(a, "--config-env=") {
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			// bare global flag (-p, --no-pager, --bare, …)
+			i++
+			continue
+		}
+		// first non-option token is the subcommand
+		return a, args[i+1:]
+	}
+	return "", nil
+}
+
+// shellFields is a lightweight field splitter: whitespace outside simple quotes.
+func shellFields(s string) []string {
+	var out []string
+	var b strings.Builder
+	inSingle, inDouble, escaped := false, false, false
+	flush := func() {
+		if b.Len() > 0 {
+			out = append(out, b.String())
+			b.Reset()
+		}
+	}
+	for _, r := range s {
+		if escaped {
+			b.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' && !inSingle {
+			escaped = true
+			continue
+		}
+		if r == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if r == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if !inSingle && !inDouble && unicode.IsSpace(r) {
+			flush()
+			continue
+		}
+		b.WriteRune(r)
+	}
+	flush()
+	return out
 }
 
 // bashClass classifies Bash for high-cost / budget counting (T11 partial).
