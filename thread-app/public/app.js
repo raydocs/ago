@@ -4,13 +4,24 @@ import {
   stableTitleFromThread,
   compactModelName,
 } from "./shell-model.mjs";
+import {
+  filterEventsByMode,
+  summarizeExecutions,
+  formatCompactLabel,
+  detectHandoffSticky,
+  cacheHitRate,
+  honestCostLabel,
+  isHousekeepingTool,
+  shortToolName,
+} from "./timeline-model.mjs";
 
-const APP_VERSION = "0.2.5";
+const APP_VERSION = "0.3.0";
 const state = {
   threads: [],
   currentID: null,
   current: null,
   view: "thread",
+  timelineMode: "decision", // decision | full | errors
   searchTimer: null,
   pollTimer: null,
   refreshing: false,
@@ -18,9 +29,21 @@ const state = {
   renderToken: 0,
   outline: {
     marks: [],
+    anchors: [],
+    contentH: 1,
+    trackH: 1,
     dragging: false,
     hoverIndex: -1,
     raf: 0,
+    tipHideTimer: 0,
+    tipThrottle: 0,
+    lastY: 0,
+    lastT: 0,
+    velocity: 0,
+    momentumRaf: 0,
+    hoverClientY: null,
+    lastTipText: "",
+    lastPlayY: -1,
   },
 };
 
@@ -103,6 +126,9 @@ function bindEvents() {
   on("#metadata-close", "click", closeMetadata);
   on("#rail-peek", "click", expandRail);
   on("#search-toggle", "click", toggleSearchPanel);
+  document.querySelectorAll(".timeline-mode-btn").forEach((btn) => {
+    btn.addEventListener("click", () => setTimelineMode(btn.dataset.mode));
+  });
   on("#organize-toggle", "click", toggleOrganizeMenu);
   document.querySelectorAll(".organize-item").forEach((item) => {
     item.addEventListener("click", () => selectOrganizeMode(item.dataset.sort));
@@ -158,46 +184,138 @@ function bindOutlineScrubber() {
   const scrubber = $("#outline-scrubber");
   if (!scroller || !track || !scrubber) return;
 
+  const stopMomentum = () => {
+    if (state.outline.momentumRaf) {
+      cancelAnimationFrame(state.outline.momentumRaf);
+      state.outline.momentumRaf = 0;
+    }
+  };
+
+  const ratioFromClientY = (clientY) => {
+    // Use cached track box when possible to avoid layout thrash during drag.
+    const rect = track.getBoundingClientRect();
+    state.outline.trackH = rect.height || state.outline.trackH || 1;
+    if (rect.height <= 0) return 0;
+    return Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
+  };
+
+  const schedulePaint = (fn) => {
+    if (state.outline.raf) return;
+    state.outline.raf = requestAnimationFrame(() => {
+      state.outline.raf = 0;
+      fn();
+    });
+  };
+
   scroller.addEventListener("scroll", () => {
-    if (state.outline.raf) cancelAnimationFrame(state.outline.raf);
-    state.outline.raf = requestAnimationFrame(updateOutlineThumb);
+    schedulePaint(() => {
+      if (state.outline.hoverClientY != null && !state.outline.dragging) {
+        const ratio = ratioFromClientY(state.outline.hoverClientY);
+        // Position every frame; text throttled inside.
+        showOutlinePreviewAtRatio(ratio, state.outline.hoverClientY, { forceText: false });
+        paintOutlinePlayhead({ hoverRatio: ratio });
+      } else {
+        paintOutlinePlayhead();
+      }
+    });
   }, { passive: true });
 
-  const scrubFromClientY = (clientY, { jump = false } = {}) => {
-    const rect = track.getBoundingClientRect();
-    if (rect.height <= 0) return;
-    const ratio = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
+  const scrubFromClientY = (clientY, { preview = true, sampleVelocity = false } = {}) => {
+    const ratio = ratioFromClientY(clientY);
     const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-    const top = ratio * max;
-    if (jump) scroller.scrollTo({ top, behavior: "smooth" });
-    else scroller.scrollTop = top;
-    updateOutlineThumb();
+    const nextTop = ratio * max;
+    const now = performance.now();
+    if (sampleVelocity) {
+      const dt = Math.max(1, now - (state.outline.lastT || now));
+      const dy = nextTop - scroller.scrollTop;
+      state.outline.velocity = state.outline.velocity * 0.6 + (dy / dt) * 0.4;
+      state.outline.lastT = now;
+      state.outline.lastY = clientY;
+    }
+    // Direct assignment — no smooth scroll fighting pointer.
+    scroller.scrollTop = nextTop;
+    state.outline.hoverClientY = clientY;
+    paintOutlinePlayhead({ hoverRatio: ratio });
+    if (preview) showOutlinePreviewAtRatio(ratio, clientY, { forceText: sampleVelocity ? false : true });
+  };
+
+  const startMomentum = () => {
+    stopMomentum();
+    let v = state.outline.velocity;
+    if (Math.abs(v) < 0.06) {
+      state.outline.velocity = 0;
+      return;
+    }
+    v = Math.max(-7.5, Math.min(7.5, v));
+    let prev = performance.now();
+    const step = (now) => {
+      const dt = Math.min(32, now - prev);
+      prev = now;
+      v *= Math.pow(0.96, dt / 16.67);
+      if (Math.abs(v) < 0.028) {
+        state.outline.velocity = 0;
+        state.outline.momentumRaf = 0;
+        return;
+      }
+      const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      scroller.scrollTop = Math.max(0, Math.min(max, scroller.scrollTop + v * dt));
+      // scroll listener paints playhead; only refresh tip text throttled
+      if (state.outline.hoverClientY != null) {
+        const ratio = ratioFromClientY(state.outline.hoverClientY);
+        showOutlinePreviewAtRatio(ratio, state.outline.hoverClientY, { forceText: false });
+      }
+      state.outline.momentumRaf = requestAnimationFrame(step);
+    };
+    state.outline.momentumRaf = requestAnimationFrame(step);
   };
 
   track.addEventListener("pointerdown", (event) => {
     if (event.button !== 0) return;
+    stopMomentum();
     state.outline.dragging = true;
-    scrubber.classList.add("is-dragging");
+    state.outline.velocity = 0;
+    state.outline.lastT = performance.now();
+    state.outline.lastY = event.clientY;
+    scrubber.classList.add("is-dragging", "is-hovering");
     track.setPointerCapture?.(event.pointerId);
-    scrubFromClientY(event.clientY);
+    scrubFromClientY(event.clientY, { preview: true, sampleVelocity: false });
     event.preventDefault();
   });
   track.addEventListener("pointermove", (event) => {
-    if (!state.outline.dragging) return;
-    scrubFromClientY(event.clientY);
+    state.outline.hoverClientY = event.clientY;
+    if (state.outline.dragging) {
+      stopMomentum();
+      scrubFromClientY(event.clientY, { preview: true, sampleVelocity: true });
+      return;
+    }
+    scrubber.classList.add("is-hovering");
+    const ratio = ratioFromClientY(event.clientY);
+    paintOutlinePlayhead({ hoverRatio: ratio });
+    showOutlinePreviewAtRatio(ratio, event.clientY, { forceText: false });
+  });
+  track.addEventListener("pointerenter", (event) => {
+    scrubber.classList.add("is-hovering");
+    state.outline.hoverClientY = event.clientY;
+    const ratio = ratioFromClientY(event.clientY);
+    paintOutlinePlayhead({ hoverRatio: ratio });
+    showOutlinePreviewAtRatio(ratio, event.clientY, { forceText: true });
   });
   const endDrag = (event) => {
     if (!state.outline.dragging) return;
     state.outline.dragging = false;
     scrubber.classList.remove("is-dragging");
     try { track.releasePointerCapture?.(event.pointerId); } catch {}
+    startMomentum();
   };
   track.addEventListener("pointerup", endDrag);
   track.addEventListener("pointercancel", endDrag);
   track.addEventListener("lostpointercapture", endDrag);
-
-  scrubber.addEventListener("mouseleave", () => {
-    if (!state.outline.dragging) hideOutlineTooltip();
+  track.addEventListener("pointerleave", () => {
+    if (state.outline.dragging) return;
+    state.outline.hoverClientY = null;
+    scrubber.classList.remove("is-hovering");
+    hideOutlineTooltip();
+    paintOutlinePlayhead();
   });
 }
 
@@ -563,12 +681,100 @@ function renderDetail(graph) {
     strip.hidden = true;
     strip.replaceChildren();
   }
+  renderThreadBadges(graph);
+  renderExecutionStrip(graph);
+  syncTimelineModeUI();
+  const toolbar = $("#timeline-toolbar");
+  if (toolbar) toolbar.hidden = false;
   renderTurns(graph);
   renderArtifacts(graph.artifacts || []);
   renderUsage(graph.usage || {});
   const policy = $("#redaction-policy");
   if (policy) policy.textContent = graph.redaction?.policy_version || "unknown";
   renderViewState();
+}
+
+function setTimelineMode(mode) {
+  if (!["decision", "full", "errors"].includes(mode)) return;
+  state.timelineMode = mode;
+  syncTimelineModeUI();
+  if (state.current) renderTurns(state.current);
+}
+
+function syncTimelineModeUI() {
+  document.querySelectorAll(".timeline-mode-btn").forEach((btn) => {
+    const active = btn.dataset.mode === state.timelineMode;
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-selected", String(active));
+  });
+}
+
+function renderThreadBadges(graph) {
+  const host = $("#thread-badges");
+  if (!host) return;
+  host.replaceChildren();
+  const events = Array.isArray(graph.events) ? graph.events : [];
+  const { sticky, handoff } = detectHandoffSticky(events);
+  const flags = [];
+  if (sticky) flags.push(["Sticky · ack required", "badge-sticky"]);
+  if (handoff) flags.push(["Handoff", "badge-handoff"]);
+  if (!flags.length) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  for (const [label, cls] of flags) {
+    const chip = document.createElement("span");
+    chip.className = `thread-badge ${cls}`;
+    chip.textContent = label;
+    host.append(chip);
+  }
+}
+
+function renderExecutionStrip(graph) {
+  const host = $("#execution-strip");
+  if (!host) return;
+  const events = Array.isArray(graph.events) ? graph.events : [];
+  const summary = summarizeExecutions(events);
+  if (!summary.items.length) {
+    host.hidden = true;
+    host.replaceChildren();
+    return;
+  }
+  host.hidden = false;
+  host.replaceChildren();
+  const line = document.createElement("div");
+  line.className = "execution-strip-summary";
+  const parts = [];
+  if (summary.workers) parts.push(`${summary.workers} worker${summary.workers === 1 ? "" : "s"}`);
+  if (summary.agents) parts.push(`${summary.agents} agent${summary.agents === 1 ? "" : "s"}`);
+  if (summary.failed) parts.push(`${summary.failed} failed`);
+  if (summary.totalMs > 0) parts.push(formatDuration(summary.totalMs));
+  line.textContent = parts.join(" · ") || "Executions";
+  host.append(line);
+
+  const list = document.createElement("div");
+  list.className = "execution-strip-list";
+  for (const item of summary.items.slice(0, 12)) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `execution-chip${item.failed ? " is-failed" : ""}`;
+    const status = stateLabel(item.status);
+    const model = compactModel(item.model);
+    chip.textContent = [
+      item.kind === "agent" ? "Agent" : "Worker",
+      model,
+      item.effort,
+      status,
+      item.duration_ms != null ? formatDuration(item.duration_ms) : "",
+    ].filter(Boolean).join(" · ");
+    chip.title = item.summary || chip.textContent;
+    if (item.event_id) {
+      chip.addEventListener("click", () => focusEvent(item.event_id));
+    }
+    list.append(chip);
+  }
+  host.append(list);
 }
 
 function metaItem(text, technical = false) {
@@ -816,7 +1022,7 @@ function finalizeTurn(turn) {
 function eventsForHumanView(graph) {
   const events = Array.isArray(graph.events) ? graph.events : [];
   const rootID = graph.thread?.session_id;
-  const filtered = !rootID
+  const scoped = !rootID
     ? events.slice()
     : events.filter((event) => {
       // Main timeline: this thread's own messages/tools + worker cards.
@@ -825,6 +1031,8 @@ function eventsForHumanView(graph) {
       if (event.type === "worker") return true;
       return false;
     });
+
+  const filtered = filterEventsByMode(scoped, state.timelineMode || "decision");
 
   return filtered.sort((left, right) => {
     const ta = Date.parse(left.started_at);
@@ -850,12 +1058,37 @@ function eventsForHumanView(graph) {
 function renderTurns(graph) {
   const list = $("#event-list");
   list.replaceChildren();
+  const allScoped = (() => {
+    const events = Array.isArray(graph.events) ? graph.events : [];
+    const rootID = graph.thread?.session_id;
+    if (!rootID) return events.slice();
+    return events.filter((event) => {
+      if (!event.session_id || event.session_id === rootID) return true;
+      if (event.type === "worker") return true;
+      return false;
+    });
+  })();
   const events = eventsForHumanView(graph);
   if (!events.length) {
-    list.append(inlineState("No canonical events recorded for this Thread."));
+    list.append(inlineState(
+      state.timelineMode === "errors"
+        ? "No failed events in this Thread."
+        : "No canonical events recorded for this Thread.",
+    ));
     hideOutlineScrubber();
     return;
   }
+
+  // Compact markers numbered in full-session order for stable labels.
+  const compactIndex = new Map();
+  let compactN = 0;
+  for (const event of allScoped) {
+    if (event.type === "compact") {
+      compactIndex.set(event.event_id, compactN);
+      compactN += 1;
+    }
+  }
+  state._compactIndex = compactIndex;
 
   const turns = deriveTurns(events);
   for (const turn of turns) list.append(renderTurn(turn, graph));
@@ -880,61 +1113,43 @@ function hideOutlineScrubber() {
 function hideOutlineTooltip() {
   const tip = $("#outline-tooltip");
   if (tip) {
-    tip.hidden = true;
     tip.classList.remove("is-visible");
+    // Keep in DOM for exit transition; hide after fade.
+    window.clearTimeout(state.outline.tipHideTimer);
+    state.outline.tipHideTimer = window.setTimeout(() => {
+      if (tip && !tip.classList.contains("is-visible")) tip.hidden = true;
+    }, 180);
   }
   state.outline.hoverIndex = -1;
-  document.querySelectorAll(".outline-mark.is-hover").forEach((n) => n.classList.remove("is-hover"));
-  $("#outline-scrubber")?.classList.remove("is-hovering");
 }
 
-function outlineLabelForNode(node) {
-  if (!node) return "Section";
-  if (node.classList.contains("user-bubble")) {
-    return clipOutlineText(node.querySelector(".user-text")?.textContent || "User message");
-  }
-  if (node.classList.contains("worked-for")) {
-    return clipOutlineText(node.querySelector(".worked-label")?.textContent || "Show Work");
-  }
-  if (node.matches("h1, h2, h3, h4")) {
-    return clipOutlineText(node.textContent || "Heading");
-  }
-  if (node.classList.contains("assistant-answer") || node.classList.contains("assistant-note")) {
-    const heading = node.querySelector("h1, h2, h3, h4");
-    if (heading) return clipOutlineText(heading.textContent || "Answer");
-    return clipOutlineText(node.querySelector(".message-content")?.textContent || "Assistant");
-  }
-  if (node.classList.contains("tool-event") || node.classList.contains("execution-card")) {
-    return clipOutlineText(node.querySelector(".tool-summary-copy")?.textContent || "Tool");
-  }
-  if (node.classList.contains("work-cluster")) {
-    return clipOutlineText(node.querySelector("summary")?.textContent || "Work");
-  }
-  return clipOutlineText(node.textContent || "Section");
-}
-
-function clipOutlineText(value, max = 120) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  if (!text) return "Section";
+function clipOutlineText(value, max = 220) {
+  // Keep line breaks for Amp-style multi-line tooltip cards.
+  const text = String(value || "").replace(/\r\n/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!text) return "";
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 function outlinePreviewForNode(node) {
   if (!node) return "";
   if (node.classList.contains("user-bubble")) {
-    return clipOutlineText(node.querySelector(".user-text")?.textContent || "", 220);
+    return clipOutlineText(node.querySelector(".user-text")?.textContent || "", 260);
   }
   if (node.matches("h1, h2, h3, h4")) {
-    const parent = node.closest(".message-content");
+    const heading = (node.textContent || "").trim();
     const next = node.nextElementSibling;
-    const body = next?.textContent || parent?.textContent || "";
-    return clipOutlineText(body, 220);
+    const body = next?.textContent || "";
+    return clipOutlineText([heading, body].filter(Boolean).join("\n"), 260);
   }
   if (node.classList.contains("assistant-answer") || node.classList.contains("assistant-note")) {
-    return clipOutlineText(node.querySelector(".message-content")?.textContent || "", 220);
+    return clipOutlineText(node.querySelector(".message-content")?.textContent || "", 260);
   }
   if (node.classList.contains("tool-event") || node.classList.contains("execution-card")) {
-    return clipOutlineText(node.querySelector(".tool-body, .tool-summary-copy")?.textContent || "", 220);
+    return clipOutlineText(node.querySelector(".tool-summary-copy")?.textContent || "", 200);
+  }
+  if (node.classList.contains("worked-for")) {
+    // Prefer surrounding human text over the "Worked for" chrome label.
+    return "";
   }
   return clipOutlineText(node.textContent || "", 220);
 }
@@ -944,28 +1159,31 @@ function collectOutlineNodes() {
   if (!list) return [];
   const nodes = [];
   const seen = new Set();
-  const push = (node, kind) => {
+  const push = (node, kind, priority) => {
     if (!node || seen.has(node)) return;
     seen.add(node);
     if (!node.id) {
       node.id = `outline-${kind}-${nodes.length}-${Math.random().toString(36).slice(2, 7)}`;
     }
-    nodes.push({ node, kind, label: outlineLabelForNode(node), preview: outlinePreviewForNode(node) });
+    const preview = outlinePreviewForNode(node);
+    if (!preview && kind === "work") return; // skip empty work chrome
+    nodes.push({
+      node,
+      kind,
+      priority,
+      label: clipOutlineText(preview.split("\n")[0] || kind, 80),
+      preview,
+    });
   };
 
-  for (const el of list.querySelectorAll(".user-bubble")) push(el, "user");
-  for (const el of list.querySelectorAll("details.worked-for")) push(el, "work");
+  // Priority matches Amp tooltip preference: user messages > answers > headings > notes > tools
+  for (const el of list.querySelectorAll(".user-bubble")) push(el, "user", 0);
+  for (const el of list.querySelectorAll(".assistant-answer")) push(el, "answer", 1);
   for (const el of list.querySelectorAll(".assistant-answer .message-content h1, .assistant-answer .message-content h2, .assistant-answer .message-content h3")) {
-    push(el, "heading");
+    push(el, "heading", 2);
   }
-  for (const el of list.querySelectorAll(".assistant-answer")) {
-    // Only add whole answer if it has no headings already collected as children.
-    if (!el.querySelector("h1, h2, h3")) push(el, "answer");
-  }
-  for (const el of list.querySelectorAll(".assistant-note")) push(el, "note");
-  for (const el of list.querySelectorAll(".tool-event, .execution-card, .work-cluster")) push(el, "tool");
-
-  // Stable document order by vertical position after layout.
+  for (const el of list.querySelectorAll(".assistant-note")) push(el, "note", 3);
+  for (const el of list.querySelectorAll(".tool-event, .execution-card")) push(el, "tool", 4);
   return nodes;
 }
 
@@ -973,6 +1191,7 @@ function rebuildOutlineMarks() {
   const scrubber = $("#outline-scrubber");
   const marksRoot = $("#outline-marks");
   const scroller = $("#conversation-scroll");
+  const track = $("#outline-track");
   if (!scrubber || !marksRoot || !scroller) return;
 
   if (state.view !== "thread" || !state.currentID || scroller.scrollHeight <= scroller.clientHeight + 24) {
@@ -981,153 +1200,211 @@ function rebuildOutlineMarks() {
   }
 
   const items = collectOutlineNodes();
-  if (items.length < 2) {
+  if (!items.length && scroller.scrollHeight <= scroller.clientHeight + 24) {
     hideOutlineScrubber();
     return;
   }
 
+  // Cache absolute tops once — binary search later, no getBoundingClientRect per frame.
   const scrollerRect = scroller.getBoundingClientRect();
   const contentH = Math.max(1, scroller.scrollHeight - 1);
-  const majors = [];
+  state.outline.contentH = contentH;
+  const anchors = [];
   for (const item of items) {
     const rect = item.node.getBoundingClientRect();
-    const absoluteTop = rect.top - scrollerRect.top + scroller.scrollTop;
-    const ratio = Math.min(1, Math.max(0, absoluteTop / contentH));
-    majors.push({ ...item, ratio, top: absoluteTop, major: true });
-  }
-  majors.sort((a, b) => a.ratio - b.ratio);
-  const filtered = [];
-  for (const mark of majors) {
-    const prev = filtered[filtered.length - 1];
-    if (prev && Math.abs(prev.ratio - mark.ratio) < 0.008) continue;
-    filtered.push(mark);
-  }
-  state.outline.marks = filtered;
-
-  // Amp density: fill track with micro ticks, then overlay interactive majors.
-  const microCount = Math.min(120, Math.max(24, Math.round(scroller.scrollHeight / 900)));
-  marksRoot.replaceChildren();
-  for (let i = 0; i < microCount; i += 1) {
-    const ratio = microCount === 1 ? 0 : i / (microCount - 1);
-    // Skip micros that sit on a major (avoid double bars).
-    if (filtered.some((m) => Math.abs(m.ratio - ratio) < 0.012)) continue;
-    const micro = document.createElement("span");
-    micro.className = "outline-mark is-micro";
-    micro.style.top = `${ratio * 100}%`;
-    micro.setAttribute("aria-hidden", "true");
-    marksRoot.append(micro);
-  }
-
-  filtered.forEach((mark, index) => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "outline-mark is-major";
-    btn.dataset.kind = mark.kind;
-    btn.dataset.index = String(index);
-    btn.style.top = `${mark.ratio * 100}%`;
-    btn.setAttribute("aria-label", mark.label);
-    btn.addEventListener("mouseenter", () => showOutlineTooltip(index, btn));
-    btn.addEventListener("mouseleave", () => {
-      if (!state.outline.dragging) hideOutlineTooltip();
+    const top = rect.top - scrollerRect.top + scroller.scrollTop;
+    anchors.push({
+      top,
+      ratio: Math.min(1, Math.max(0, top / contentH)),
+      preview: item.preview,
+      label: item.label,
+      kind: item.kind,
+      priority: item.priority,
+      node: item.node,
     });
-    btn.addEventListener("focus", () => showOutlineTooltip(index, btn));
-    btn.addEventListener("blur", hideOutlineTooltip);
-    btn.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      jumpToOutlineMark(index);
-    });
-    marksRoot.append(btn);
-  });
+  }
+  anchors.sort((a, b) => a.top - b.top);
+  state.outline.anchors = anchors;
+  state.outline.marks = anchors;
+
+  const trackH = Math.max(1, track?.clientHeight || scroller.clientHeight - 28);
+  state.outline.trackH = trackH;
+  const spacing = 6.5;
+  const microCount = Math.min(140, Math.max(48, Math.round(trackH / spacing)));
+  // Rebuild static ticks only when count changes (avoid DOM churn on every select).
+  if (marksRoot.childElementCount !== microCount) {
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < microCount; i += 1) {
+      const ratio = microCount === 1 ? 0 : i / (microCount - 1);
+      const micro = document.createElement("span");
+      micro.className = "outline-mark";
+      micro.style.top = `${ratio * 100}%`;
+      frag.append(micro);
+    }
+    marksRoot.replaceChildren(frag);
+  }
 
   scrubber.hidden = false;
-  updateOutlineThumb();
+  paintOutlinePlayhead();
 }
 
-function showOutlineTooltip(index, markEl) {
+function contentAtRatio(ratio) {
+  const anchors = state.outline.anchors;
+  if (!anchors.length) return { label: "", preview: "…", node: null };
+  const contentH = state.outline.contentH || 1;
+  const targetY = ratio * contentH;
+  // Binary search nearest anchor by top.
+  let lo = 0;
+  let hi = anchors.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (anchors[mid].top < targetY) lo = mid + 1;
+    else hi = mid;
+  }
+  let best = anchors[lo];
+  if (lo > 0) {
+    const prev = anchors[lo - 1];
+    if (Math.abs(prev.top - targetY) < Math.abs(best.top - targetY)) best = prev;
+  }
+  // Prefer a nearby higher-priority (user/answer) anchor within 120px.
+  const window = 120;
+  for (const a of anchors) {
+    if (Math.abs(a.top - targetY) > window) continue;
+    if ((a.priority ?? 9) < (best.priority ?? 9)) best = a;
+  }
+  return {
+    label: best.label,
+    preview: best.preview || best.label || "…",
+    mark: best,
+    node: best.node,
+  };
+}
+
+function extractOutlineFileMeta(text) {
+  const raw = String(text || "");
+  const pathMatch = raw.match(/(?:[\w.-]+\/)+[\w.-]+\.[a-zA-Z0-9]{1,8}\b/);
+  if (pathMatch) return pathMatch[0].split("/").pop() || pathMatch[0];
+  const bare = raw.match(/\b[\w.-]+\.(?:md|ts|tsx|js|mjs|css|json|go|py|toml|yml|yaml)\b/);
+  return bare ? bare[0] : "";
+}
+
+function showOutlinePreviewAtRatio(ratio, clientY, { forceText = false } = {}) {
   const tip = $("#outline-tooltip");
   const scrubber = $("#outline-scrubber");
-  const mark = state.outline.marks[index];
-  if (!tip || !scrubber || !mark) return;
-  state.outline.hoverIndex = index;
-  document.querySelectorAll(".outline-mark.is-hover").forEach((n) => n.classList.remove("is-hover"));
-  markEl?.classList.add("is-hover");
+  if (!tip || !scrubber) return;
 
-  tip.replaceChildren();
-  const title = document.createElement("strong");
-  title.textContent = mark.label;
-  tip.append(title);
-  if (mark.preview && mark.preview !== mark.label) {
-    const body = document.createElement("p");
-    body.textContent = mark.preview;
-    tip.append(body);
+  const trackH = state.outline.trackH || $("#outline-track")?.clientHeight || 1;
+  let y;
+  if (typeof clientY === "number") {
+    const scrubTop = scrubber.getBoundingClientRect().top;
+    y = clientY - scrubTop;
+  } else {
+    y = ratio * trackH;
   }
-  const track = $("#outline-track");
-  const trackRect = track?.getBoundingClientRect();
-  const scrubRect = scrubber.getBoundingClientRect();
-  if (trackRect) {
-    const y = trackRect.top + mark.ratio * trackRect.height - scrubRect.top;
-    tip.style.top = `${y}px`;
-  }
+  y = Math.min(trackH - 16, Math.max(16, y));
+  // Amp: tooltip locked to pointer — no lag / no spring.
+  tip.style.top = `${y}px`;
+
+  window.clearTimeout(state.outline.tipHideTimer);
   tip.hidden = false;
-  // Force reflow so transition plays.
-  void tip.offsetWidth;
   tip.classList.add("is-visible");
   scrubber.classList.add("is-hovering");
+
+  const now = performance.now();
+  if (!forceText && now - state.outline.tipThrottle < 32) return;
+  state.outline.tipThrottle = now;
+
+  const { preview, mark, node } = contentAtRatio(ratio);
+  const full = clipOutlineText(preview || "…", 320);
+  const lines = full.split("\n").map((l) => l.trim()).filter(Boolean);
+  const titleText = lines[0] || "…";
+  const bodyText = lines.slice(1).join("\n") || lines[0] || "…";
+  const fileMeta = extractOutlineFileMeta(full)
+    || ($("#detail-title")?.textContent || "").trim().slice(0, 40);
+
+  let titleEl = tip.querySelector(".outline-tip-title");
+  let bodyEl = tip.querySelector(".outline-tip-body");
+  let fileEl = tip.querySelector(".outline-tip-file");
+  if (!titleEl || !bodyEl) {
+    tip.replaceChildren();
+    titleEl = document.createElement("strong");
+    titleEl.className = "outline-tip-title";
+    bodyEl = document.createElement("p");
+    bodyEl.className = "outline-tip-body";
+    tip.append(titleEl, bodyEl);
+  }
+  const tipKey = `${titleText}\n${bodyText}\n${fileMeta}`;
+  if (tipKey !== state.outline.lastTipText) {
+    titleEl.textContent = titleText;
+    if (lines.length <= 1) {
+      titleEl.hidden = true;
+      bodyEl.textContent = titleText;
+    } else {
+      titleEl.hidden = false;
+      bodyEl.textContent = bodyText;
+    }
+    if (fileMeta) {
+      if (!fileEl) {
+        fileEl = document.createElement("div");
+        fileEl.className = "outline-tip-file";
+        fileEl.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path fill="none" stroke="currentColor" stroke-width="1.7" d="M14 2v6h6"/></svg><span></span>`;
+        tip.append(fileEl);
+      }
+      fileEl.hidden = false;
+      fileEl.querySelector("span").textContent = fileMeta;
+    } else if (fileEl) {
+      fileEl.hidden = true;
+    }
+    state.outline.lastTipText = tipKey;
+  }
+  state.outline.hoverIndex = mark ? state.outline.anchors.indexOf(mark) : -1;
+  void node;
 }
 
-function jumpToOutlineMark(index) {
-  const scroller = $("#conversation-scroll");
-  const mark = state.outline.marks[index];
-  if (!scroller || !mark?.node) return;
-  const scrollerRect = scroller.getBoundingClientRect();
-  const nodeRect = mark.node.getBoundingClientRect();
-  const top = nodeRect.top - scrollerRect.top + scroller.scrollTop - 24;
-  scroller.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
-  mark.node.classList.remove("outline-target-flash");
-  void mark.node.offsetWidth;
-  mark.node.classList.add("outline-target-flash");
-  setTimeout(() => mark.node.classList.remove("outline-target-flash"), 800);
-  updateOutlineThumb();
-}
-
-function updateOutlineThumb() {
+/**
+ * Amp mid-5s consecutive frames: playhead + focus band stick to pointer 1:1.
+ * Motion comes from CONTENT scrolling (drag + inertia), not springy chrome.
+ * No scaleY stretch, no laggy float.
+ */
+function paintOutlinePlayhead(opts = {}) {
   const scroller = $("#conversation-scroll");
   const thumb = $("#outline-thumb");
-  const track = $("#outline-track");
+  const focus = $("#outline-focus-band");
   const scrubber = $("#outline-scrubber");
-  if (!scroller || !thumb || !track || !scrubber || scrubber.hidden) return;
+  const track = $("#outline-track");
+  if (!scroller || !thumb || !scrubber || scrubber.hidden) return;
 
-  const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-  const trackH = track.clientHeight || 1;
-  // Playhead follows reading position (upper third), as a short dash — not a scrollbar pill.
-  const readY = scroller.scrollTop + scroller.clientHeight * 0.22;
+  const trackH = track?.clientHeight || state.outline.trackH || 1;
+  state.outline.trackH = trackH;
   const contentH = Math.max(1, scroller.scrollHeight - 1);
-  const playRatio = Math.min(1, Math.max(0, readY / contentH));
-  thumb.style.height = "2.5px";
-  thumb.style.top = `${playRatio * trackH}px`;
+  state.outline.contentH = contentH;
 
-  // Light up nearest major tick; when close enough, hide dash so only tick is “current”.
-  let best = -1;
-  let bestDist = Infinity;
-  state.outline.marks.forEach((mark, index) => {
-    const dist = Math.abs(mark.top - readY);
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = index;
+  const hovering = scrubber.classList.contains("is-hovering") || state.outline.dragging;
+  const readY = scroller.scrollTop + scroller.clientHeight * 0.18;
+  const scrollRatio = Math.min(1, Math.max(0, readY / contentH));
+
+  let playRatio = scrollRatio;
+  if (typeof opts.hoverRatio === "number") {
+    playRatio = opts.hoverRatio;
+  } else if (hovering && state.outline.hoverClientY != null && track) {
+    const rect = track.getBoundingClientRect();
+    if (rect.height > 0) {
+      playRatio = Math.min(1, Math.max(0, (state.outline.hoverClientY - rect.top) / rect.height));
     }
-  });
-  const snapPx = Math.max(48, scroller.clientHeight * 0.08);
-  const snapped = best >= 0 && bestDist <= snapPx;
-  scrubber.classList.toggle("has-active-major", snapped);
-  document.querySelectorAll(".outline-mark.is-major").forEach((node) => {
-    const index = Number(node.dataset.index);
-    node.classList.toggle("is-active", snapped && index === best);
-  });
-  if (!state.outline.dragging && state.outline.hoverIndex < 0) {
-    scrubber.classList.remove("is-hovering");
   }
-  void max; // scroll extent used for drag path elsewhere
+
+  const y = playRatio * trackH;
+  if (Math.abs(y - state.outline.lastPlayY) < 0.15 && opts.hoverRatio == null && !hovering) return;
+  state.outline.lastPlayY = y;
+
+  // Direct GPU transforms — 1:1 with target (Amp is not springy here).
+  const t = `translate3d(0, ${y}px, 0) translateY(-50%)`;
+  thumb.style.transform = t;
+  if (focus) focus.style.transform = `translate3d(0, ${y}px, 0)`;
+}
+
+function updateOutlineThumb(opts = {}) {
+  paintOutlinePlayhead(opts);
 }
 
 function renderTurn(turn, graph) {
@@ -1147,41 +1424,49 @@ function renderTurn(turn, graph) {
   }
   for (const note of outsideNotes) card.append(renderAssistantNote(note));
 
-  const activityItems = [];
+  const workItems = [];
+  const alwaysVisible = [];
   let sawTask = false;
   for (const note of insideNotes) {
-    activityItems.push({ kind: "message", event: note });
+    workItems.push({ kind: "message", event: note });
   }
   for (const item of turn.activity) {
+    // Worker/Agent/compact/error stay on the main path (not buried in Show Work).
+    if (item.kind === "execution" || item.kind === "system") {
+      alwaysVisible.push(item);
+      continue;
+    }
     if (item.kind === "tool" && shouldCollapseHousekeeping(item.event)) {
       if (sawTask) continue;
       sawTask = true;
     }
-    activityItems.push(item);
+    workItems.push(item);
   }
-  // Keep work stream chronological: notes + tools interleaved by started_at.
-  activityItems.sort((a, b) => {
-    const ta = Date.parse(a.event?.started_at) || 0;
-    const tb = Date.parse(b.event?.started_at) || 0;
-    return ta - tb;
-  });
+  const byTime = (a, b) => (Date.parse(a.event?.started_at) || 0) - (Date.parse(b.event?.started_at) || 0);
+  workItems.sort(byTime);
+  alwaysVisible.sort(byTime);
 
-  if (activityItems.length || turn.durationMs > 0) {
-    card.append(renderWorkedFor(turn, activityItems, graph));
+  // Surface executions/compacts before collapsed tool work.
+  for (const item of alwaysVisible) {
+    card.append(renderActivityItem(item, graph));
+  }
+
+  if (workItems.length || (turn.durationMs > 0 && !alwaysVisible.length)) {
+    card.append(renderWorkedFor(turn, workItems, graph));
   }
 
   for (const answer of turn.finalAnswers || []) {
     card.append(renderAssistantAnswer(answer));
   }
 
-  if (!turn.user && !(turn.finalAnswers || []).length && !activityItems.length) {
+  if (!turn.user && !(turn.finalAnswers || []).length && !workItems.length && !alwaysVisible.length) {
     card.append(inlineState("Empty turn"));
   }
   return card;
 }
 
 function shouldCollapseHousekeeping(event) {
-  return housekeepingTools.has(shortTool(event.tool_name));
+  return isHousekeepingTool(event.tool_name) || housekeepingTools.has(shortTool(event.tool_name));
 }
 
 function renderActivityItem(item, graph) {
@@ -1594,26 +1879,48 @@ function renderExecution(event, graph) {
   details.className = `execution-card tool-event${failed ? " failed" : ""}`;
   details.id = eventAnchor(event.event_id);
   details.dataset.eventId = event.event_id || "";
+  // Failed cards open by default so they cannot be mistaken for “never ran”.
+  if (failed) details.open = true;
 
   const kind = event.role === "agent" ? "Agent" : "Worker";
   const objective = firstLine(event.raw?.objective || event.summary || `${kind} invocation`);
   const summary = document.createElement("summary");
-  // Amp-like system row: not mono for agents, muted label + detail
   summary.className = "tool-summary execution-summary";
   const heading = document.createElement("span");
   heading.className = "tool-summary-copy execution-copy";
   const name = document.createElement("strong");
   name.textContent = kind;
   const description = document.createElement("span");
-  const model = compactModel(event.raw?.resolved_model || event.model || event.raw?.requested_model);
-  description.textContent = [objective, model, event.effort || event.raw?.resolved_effort].filter(Boolean).join(" · ");
+  const requested = compactModel(event.raw?.requested_model);
+  const resolved = compactModel(event.raw?.resolved_model || event.model);
+  const modelBits = [];
+  if (requested && resolved && requested !== resolved) modelBits.push(`${requested}→${resolved}`);
+  else if (resolved || requested) modelBits.push(resolved || requested);
+  const duration = Number(event.duration_ms);
+  description.textContent = [
+    objective,
+    ...modelBits,
+    event.effort || event.raw?.resolved_effort,
+    stateLabel(event.status),
+    Number.isFinite(duration) && duration > 0 ? formatDuration(duration) : "",
+  ].filter(Boolean).join(" · ");
   description.title = description.textContent;
   heading.append(name, description);
-  summary.append(heading);
+
+  const statusChip = document.createElement("span");
+  statusChip.className = `status-chip status-${String(event.status || "unknown").toLowerCase().replace(/[^a-z0-9_-]+/g, "-")}`;
+  statusChip.textContent = stateLabel(event.status);
+  summary.append(heading, statusChip);
   details.append(summary);
 
   const body = document.createElement("div");
   body.className = "tool-body";
+  if (failed && (event.summary || event.content)) {
+    const failNote = document.createElement("p");
+    failNote.className = "execution-fail-note";
+    failNote.textContent = firstLine(event.summary || event.content || "Failed");
+    body.append(failNote);
+  }
   if (event.content && event.content !== "[INTERNAL METADATA REDACTED]") {
     const content = document.createElement("div");
     content.className = "execution-result";
@@ -1636,11 +1943,16 @@ function renderExecution(event, graph) {
 function renderSystemEvent(event) {
   const article = document.createElement("article");
   const failed = event.type === "error" || ["failed", "error"].includes(String(event.status || "").toLowerCase());
-  article.className = `activity-item${failed ? " failed" : ""}`;
+  article.className = `activity-item${failed ? " failed" : ""}${event.type === "compact" ? " compact-marker" : ""}`;
   article.id = eventAnchor(event.event_id);
   const header = document.createElement("header");
   const label = document.createElement("strong");
-  label.textContent = event.type === "compact" ? "Compact" : event.type || "Event";
+  if (event.type === "compact") {
+    const idx = state._compactIndex?.get(event.event_id) ?? 0;
+    label.textContent = formatCompactLabel(event, idx);
+  } else {
+    label.textContent = event.type === "error" ? "Error" : event.type || "Event";
+  }
   const time = document.createElement("time");
   time.textContent = formatTime(event.started_at);
   header.append(label, time);
@@ -1935,11 +2247,31 @@ function renderUsage(usage) {
     ? `Updated ${formatDate(totals.updated_at)} · root and descendants`
     : "No numeric usage record is available; unknown values remain unknown.";
 
+  // Honest attribution banner when graph participants include models missing from usage.
+  const modelsInUsage = new Set((usage.models || []).map((row) => String(row.model || "")));
+  const participantModels = (state.current?.participants || [])
+    .map((p) => compactModel(p.model))
+    .filter((m) => m && m !== "<synthetic>");
+  const missing = [...new Set(participantModels)].filter((m) => m && !modelsInUsage.has(m) && !modelsInUsage.has(`claude-${m}`));
+  if (missing.length || ((usage.models || []).length === 1 && participantModels.length > 1)) {
+    const banner = document.createElement("p");
+    banner.className = "usage-attribution-banner";
+    banner.textContent = "Historical under-attribution: usage may only show the supervisor model (e.g. Sol). Child/agent models appear in participants/execution when recorded; do not treat missing rows as “never ran”.";
+    container.append(banner);
+  }
+
+  const defs = document.createElement("p");
+  defs.className = "usage-definitions";
+  defs.textContent = "Active duration excludes idle before first model activity. Subscription ≠ invoice amount. Unpriced costs show Price pending (never $0).";
+  container.append(defs);
+
+  const cacheRate = cacheHitRate(totals);
   const summary = document.createElement("dl");
   summary.className = "usage-summary";
   for (const [label, value] of [
     ["Total tokens", usageNumber(totals.total_tokens, totals.updated_at)],
     ["Requests", usageNumber(totals.requests, totals.updated_at)],
+    ["Cache hit rate", cacheRate == null ? "Unknown" : `${Math.round(cacheRate * 100)}%`],
     ["Active duration", formatOptionalDuration(totals.active_duration_ms)],
     ["Worker compute", formatOptionalDuration(totals.worker_compute_duration_ms)],
     ["Cost", formatCost(totals)],
@@ -1949,10 +2281,28 @@ function renderUsage(usage) {
     term.textContent = label;
     const detail = document.createElement("dd");
     detail.textContent = value;
+    if (label === "Cost" && value === "Price pending") detail.className = "pending-cost";
     item.append(term, detail);
     summary.append(item);
   }
   container.append(summary);
+
+  // Supervisor vs workers share when roles exist
+  const roles = usage.roles || [];
+  if (roles.length) {
+    const sup = roles.find((r) => String(r.role).toLowerCase() === "supervisor");
+    const workerish = roles.filter((r) => /worker|agent|specialist/i.test(String(r.role || "")));
+    const supTok = Number(sup?.total_tokens) || 0;
+    const workTok = workerish.reduce((n, r) => n + (Number(r.total_tokens) || 0), 0);
+    if (supTok + workTok > 0) {
+      const bar = document.createElement("div");
+      bar.className = "usage-role-bar";
+      const supPct = Math.round((supTok / (supTok + workTok)) * 100);
+      bar.innerHTML = `<div class="usage-role-bar-track"><span class="sup" style="width:${supPct}%"></span></div>
+        <p class="section-copy">Supervisor ${supPct}% · Workers/agents ${100 - supPct}% (of attributed tokens)</p>`;
+      container.append(bar);
+    }
+  }
 
   for (const [title, rows, dimension] of [
     ["Models", usage.models || [], "model"],
@@ -2148,11 +2498,17 @@ function usageNumber(value, observedAt) {
 }
 
 function formatCost(value) {
-  if ((value.cost_status === "reported" || value.cost_status === "partially_reported") && typeof value.reported_cost_usd === "number") {
+  if (!value || typeof value !== "object") return honestCostLabel(value);
+  if ((value.cost_status === "reported" || value.cost_status === "partially_reported")
+    && typeof value.reported_cost_usd === "number") {
     const suffix = value.cost_status === "partially_reported" ? " partial" : "";
     return `$${value.reported_cost_usd.toFixed(4)}${suffix}`;
   }
-  return value.cost_status === "unpriced" ? "Unpriced" : "Unknown";
+  if (value.cost_status === "reported" && typeof value.cost_usd === "number") {
+    return honestCostLabel(value);
+  }
+  // Never display $0 for unpriced / unknown
+  return "Price pending";
 }
 
 function formatDate(value) {

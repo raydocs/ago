@@ -10,8 +10,8 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/styles.css?r=ampweb5" />
-    <script type="module" src="/app.js?r=ampweb5"></script>
+    <link rel="stylesheet" href="/styles.css?r=panel1" />
+    <script type="module" src="/app.js?r=panel1"></script>
   </head>
   <body>
     <a class="skip-link" href="#detail-panel">Skip to content</a>
@@ -120,8 +120,19 @@
               <!-- Amp-like outline scrubber: scroll, animate, jump -->
               <nav id="outline-scrubber" class="outline-scrubber" hidden aria-label="Thread outline">
                 <div class="outline-track" id="outline-track">
+                  <!-- Static hairlines (never mutated per scroll frame) -->
+                  <div class="outline-marks" id="outline-marks" aria-hidden="true"></div>
+                  <!-- Moving focus band: only transform updates (GPU) -->
+                  <div class="outline-focus-band" id="outline-focus-band" aria-hidden="true">
+                    <span class="focus-tick ft-m3"></span>
+                    <span class="focus-tick ft-m2"></span>
+                    <span class="focus-tick ft-m1"></span>
+                    <span class="focus-tick ft-0"></span>
+                    <span class="focus-tick ft-p1"></span>
+                    <span class="focus-tick ft-p2"></span>
+                    <span class="focus-tick ft-p3"></span>
+                  </div>
                   <div class="outline-playhead outline-thumb" id="outline-thumb" aria-hidden="true"></div>
-                  <div class="outline-marks" id="outline-marks"></div>
                 </div>
                 <div class="outline-tooltip" id="outline-tooltip" hidden role="tooltip"></div>
               </nav>
@@ -132,6 +143,16 @@
                     <div id="participant-strip" class="participant-strip" hidden></div>
                     <p id="detail-project" class="thread-meta-line" hidden></p>
                     <div id="detail-meta" class="detail-meta" hidden></div>
+                    <div id="thread-badges" class="thread-badges" hidden></div>
+                    <div id="execution-strip" class="execution-strip" hidden></div>
+                    <div class="timeline-toolbar" id="timeline-toolbar" hidden>
+                      <span class="timeline-toolbar-label">Timeline</span>
+                      <div class="timeline-mode-group" role="tablist" aria-label="Timeline mode">
+                        <button type="button" class="timeline-mode-btn is-active" data-mode="decision" role="tab" aria-selected="true">Decision</button>
+                        <button type="button" class="timeline-mode-btn" data-mode="full" role="tab" aria-selected="false">Full</button>
+                        <button type="button" class="timeline-mode-btn" data-mode="errors" role="tab" aria-selected="false">Errors</button>
+                      </div>
+                    </div>
                     <div id="event-list" class="turn-list"></div>
                     <section id="artifacts-section" class="artifacts-section" hidden>
                       <header class="section-header"><h2>Files</h2></header>

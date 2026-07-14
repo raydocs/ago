@@ -412,206 +412,273 @@ body.rail-collapsed .rail-peek { display: inline-flex; }
   min-height: 0;
   height: 100%;
   overflow: auto;
-  padding: 18px 0 24px;
-  scroll-behavior: smooth;
+  padding: 18px 0 32px;
+  /* Amp scrub/momentum must be 1:1 with pointer — no CSS smooth fighting rAF */
+  scroll-behavior: auto;
 }
+/* Centered conversation; outline lives on the far left of the main pane */
 .conversation-column {
   width: min(100%, var(--convo));
   margin: 0 auto;
-  padding: 0 28px;
+  padding: 0 24px;
+  position: relative;
 }
 
-/* ── Amp outline scrubber: dense ticks + sliding playhead dash (no black pill) ── */
+/* ── Amp outline scrubber (perf: static ticks + transform-only movers) ── */
 .outline-scrubber {
   position: absolute;
-  left: 2px; top: 10px; bottom: 10px;
-  width: 22px;
-  z-index: 4;
+  left: 6px;
+  top: 12px;
+  bottom: 12px;
+  width: 20px;
+  z-index: 5;
   display: flex;
   align-items: stretch;
-  justify-content: center;
+  justify-content: flex-start;
   pointer-events: none;
+  contain: layout style;
 }
 .outline-scrubber:not([hidden]) { pointer-events: auto; }
 .outline-track {
   position: relative;
-  width: 18px;
-  margin: 2px 0;
+  width: 20px;
+  margin: 0;
   cursor: pointer;
   touch-action: none;
+  contain: strict;
 }
-/* no continuous bar — Amp is pure ticks */
 .outline-marks {
   position: absolute;
   inset: 0;
+  pointer-events: none;
 }
+/* Static hairlines — never class-toggled during scroll */
 .outline-mark {
   position: absolute;
-  left: 50%;
-  width: 9px;
-  height: 1.5px;
-  transform: translate(-50%, -50%) scaleX(0.92);
-  border: 0;
-  padding: 0;
-  border-radius: 1px;
-  background: color-mix(in srgb, var(--ink) 16%, transparent);
-  cursor: pointer;
-  opacity: 0.55;
-  transition:
-    width 180ms var(--ease),
-    height 180ms var(--ease),
-    background 180ms var(--ease),
-    opacity 180ms var(--ease),
-    transform 200ms var(--ease),
-    box-shadow 180ms var(--ease);
-  will-change: transform, width, opacity;
-}
-.outline-mark.is-micro {
-  width: 7px;
+  left: 2px;
+  width: 6px;
   height: 1px;
-  opacity: 0.28;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0.5px;
+  background: rgba(30, 32, 30, 0.22);
+  transform: translateY(-50%);
+  transform-origin: left center;
   pointer-events: none;
-  background: color-mix(in srgb, var(--ink) 14%, transparent);
 }
-.outline-mark.is-major {
-  width: 11px;
-  height: 1.5px;
-  opacity: 0.7;
-  background: color-mix(in srgb, var(--ink) 28%, transparent);
-  pointer-events: auto;
+@media (prefers-color-scheme: dark) {
+  .outline-mark { background: rgba(238, 241, 234, 0.26); }
 }
-.outline-mark[data-kind="user"].is-major {
-  width: 12px;
-  opacity: 0.78;
-}
-.outline-mark[data-kind="heading"].is-major {
-  width: 12px;
-  height: 2px;
-  opacity: 0.8;
-}
-.outline-mark:hover,
-.outline-mark.is-hover {
-  width: 15px !important;
-  height: 2.5px !important;
-  opacity: 1 !important;
-  background: color-mix(in srgb, var(--ink) 55%, transparent) !important;
-  transform: translate(-50%, -50%) scaleX(1);
-}
-.outline-mark.is-active {
-  width: 16px !important;
-  height: 2.5px !important;
-  opacity: 1 !important;
-  background: var(--ink) !important;
-  transform: translate(-50%, -50%) scaleX(1);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--surface) 80%, transparent);
+/*
+ * Amp consecutive frames: focus cluster is 1:1 with cursor (no spring).
+ * Longer ticks only grow to the RIGHT; spacing matches hairline grid (~6.5px).
+ */
+.outline-focus-band {
+  position: absolute;
+  left: 2px;
+  top: 0;
+  width: 18px;
+  height: 1px;
+  pointer-events: none;
   z-index: 2;
+  will-change: transform;
+  transform: translate3d(0, 0, 0);
+  opacity: 0;
+  transition: opacity 90ms linear;
 }
-/* Sliding playhead: short dash only (Amp), never a tall black thumb */
+/* Only show focus cluster while interacting (Amp idle = plain hairlines) */
+.outline-scrubber.is-hovering .outline-focus-band,
+.outline-scrubber.is-dragging .outline-focus-band {
+  opacity: 1;
+}
+.focus-tick {
+  position: absolute;
+  left: 0;
+  height: 1.5px;
+  border-radius: 0.5px;
+  background: rgba(30, 32, 30, 0.4);
+  transform: translateY(-50%);
+  transform-origin: left center;
+}
+/* ~6.5px grid matching micro ticks; length increases toward center, only to the right */
+.focus-tick.ft-m3 { top: -19.5px; width: 9px; opacity: 0.65; }
+.focus-tick.ft-m2 { top: -13px; width: 11px; opacity: 0.78; }
+.focus-tick.ft-m1 { top: -6.5px; width: 13px; opacity: 0.9; }
+.focus-tick.ft-0 { top: 0; width: 15px; height: 2px; opacity: 1; background: rgba(30, 32, 30, 0.5); }
+.focus-tick.ft-p1 { top: 6.5px; width: 13px; opacity: 0.9; }
+.focus-tick.ft-p2 { top: 13px; width: 11px; opacity: 0.78; }
+.focus-tick.ft-p3 { top: 19.5px; width: 9px; opacity: 0.65; }
+@media (prefers-color-scheme: dark) {
+  .focus-tick { background: rgba(238, 241, 234, 0.42); }
+  .focus-tick.ft-0 { background: rgba(238, 241, 234, 0.58); }
+}
+/* Playhead: 1:1 transform, left-anchored, solid black when active */
 .outline-thumb,
 .outline-playhead {
   position: absolute;
-  left: 50%;
-  width: 14px;
+  left: 2px;
+  top: 0;
+  width: 15px;
   height: 2.5px;
-  min-height: 0;
-  transform: translate(-50%, -50%);
-  border-radius: 2px;
-  background: var(--ink);
-  box-shadow: none;
+  border-radius: 1px;
+  background: #111;
   pointer-events: none;
-  z-index: 3;
-  opacity: 0.92;
-  transition: top 70ms linear, opacity 160ms var(--ease), width 160ms var(--ease);
+  z-index: 4;
+  will-change: transform;
+  transform: translate3d(0, 0, 0) translateY(-50%);
+  transform-origin: left center;
+  opacity: 0;
+  transition: opacity 80ms linear;
 }
-.outline-scrubber.is-dragging .outline-thumb,
-.outline-scrubber.is-dragging .outline-playhead {
-  width: 16px;
-  height: 3px;
-  transition: none;
+/* Idle scroll: dim playhead still tracks so “上下” is visible without hover */
+.outline-scrubber:not(.is-hovering):not(.is-dragging) .outline-thumb {
+  opacity: 0.55;
+  width: 11px;
+  height: 2px;
+  background: rgba(20, 22, 20, 0.45);
 }
 .outline-scrubber.is-hovering .outline-thumb,
-.outline-scrubber.is-hovering .outline-playhead {
-  width: 15px;
+.outline-scrubber.is-hovering .outline-playhead,
+.outline-scrubber.is-dragging .outline-thumb,
+.outline-scrubber.is-dragging .outline-playhead {
+  opacity: 1;
+  width: 16px;
+  height: 2.5px;
+  background: #0a0a0a;
 }
-/* When a major mark is active, hide playhead so only the tick “lights up” */
-.outline-scrubber.has-active-major .outline-thumb,
-.outline-scrubber.has-active-major .outline-playhead {
-  opacity: 0;
+@media (prefers-color-scheme: dark) {
+  .outline-thumb,
+  .outline-playhead { background: #eef1ea; }
+  .outline-scrubber:not(.is-hovering):not(.is-dragging) .outline-thumb {
+    background: rgba(238, 241, 234, 0.5);
+  }
 }
+@media (prefers-color-scheme: dark) {
+  .outline-thumb,
+  .outline-playhead { background: rgba(238, 241, 234, 0.45); }
+  .outline-scrubber.is-hovering .outline-thumb,
+  .outline-scrubber.is-hovering .outline-playhead,
+  .outline-scrubber.is-dragging .outline-thumb,
+  .outline-scrubber.is-dragging .outline-playhead {
+    background: #eef1ea;
+  }
+}
+/* Structured floating card */
 .outline-tooltip {
   position: absolute;
-  left: 22px;
+  left: 18px;
   top: 0;
-  z-index: 6;
-  max-width: min(300px, 40vw);
-  padding: 10px 12px;
+  z-index: 8;
+  width: min(260px, 34vw);
+  max-width: min(260px, 34vw);
+  padding: 10px 12px 9px;
   border-radius: 12px;
-  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
-  background: color-mix(in srgb, var(--surface) 96%, transparent);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(20, 22, 20, 0.07);
+  background: #fff;
   box-shadow:
-    0 12px 32px rgba(11, 13, 11, 0.1),
-    0 0 0 1px color-mix(in srgb, var(--line) 70%, transparent);
-  color: var(--ink-2);
+    0 2px 4px rgba(20, 22, 20, 0.04),
+    0 10px 28px rgba(20, 22, 20, 0.1);
+  color: #2a2c2a;
   font-size: 12.5px;
-  line-height: 18px;
+  line-height: 17px;
+  letter-spacing: -0.01em;
   pointer-events: none;
-  transform: translate3d(4px, -50%, 0) scale(0.96);
+  /* Amp: card appears quickly, position locked to pointer (no spring chase) */
+  transform: translate3d(0, -50%, 0);
   opacity: 0;
-  filter: blur(2px);
-  transition:
-    opacity 160ms var(--ease),
-    transform 200ms var(--ease),
-    filter 160ms var(--ease);
+  will-change: top, opacity;
+  transition: opacity 90ms linear;
+}
+@media (prefers-color-scheme: dark) {
+  .outline-tooltip {
+    background: var(--surface);
+    color: var(--ink-2);
+    border-color: var(--line);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.4);
+  }
+  .outline-thumb,
+  .outline-playhead,
+  .outline-scrubber.is-hovering .outline-thumb,
+  .outline-scrubber.is-hovering .outline-playhead {
+    background: #eef1ea;
+  }
 }
 .outline-tooltip.is-visible {
   opacity: 1;
-  filter: blur(0);
-  transform: translate3d(0, -50%, 0) scale(1);
 }
-.outline-tooltip strong {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 0;
-  color: var(--ink);
+.outline-scrubber.is-dragging .outline-tooltip {
+  transition: none;
+}
+.outline-tooltip .outline-tip-title {
+  display: block;
+  margin: 0 0 4px;
+  color: #141614;
   font-size: 12.5px;
   font-weight: 600;
+  line-height: 17px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.outline-tooltip strong::before {
-  content: "";
-  width: 6px;
-  height: 6px;
-  border-radius: 99px;
-  background: var(--ink);
-  flex: 0 0 auto;
-  opacity: 0.85;
-}
-.outline-tooltip p {
-  margin: 6px 0 0;
-  color: var(--ink-3);
+.outline-tooltip .outline-tip-body {
+  margin: 0;
+  color: #3d3f3d;
   display: -webkit-box;
   -webkit-line-clamp: 4;
   -webkit-box-orient: vertical;
   overflow: hidden;
   white-space: pre-wrap;
+  word-break: break-word;
+  transition: opacity 60ms linear;
+}
+.outline-tooltip .outline-tip-body.is-swapping {
+  opacity: 0.35;
+}
+.outline-tooltip .outline-tip-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 0;
+  color: #6a6d69;
+  font-size: 12px;
+  line-height: 16px;
+  min-width: 0;
+}
+.outline-tooltip .outline-tip-file svg {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  opacity: 0.75;
+}
+.outline-tooltip .outline-tip-file span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+@media (prefers-color-scheme: dark) {
+  .outline-tooltip .outline-tip-title { color: var(--ink); }
+  .outline-tooltip .outline-tip-body { color: var(--ink-2); }
+  .outline-tooltip .outline-tip-file { color: var(--ink-3); }
 }
 .outline-target-flash {
-  animation: outline-flash 720ms var(--ease);
+  animation: outline-flash 700ms var(--ease);
 }
 @keyframes outline-flash {
-  0% { background-color: color-mix(in srgb, var(--ink) 6%, transparent); }
+  0% { background-color: rgba(20, 22, 20, 0.04); }
   100% { background-color: transparent; }
 }
 @media (max-width: 960px) {
   .outline-scrubber { display: none; }
+  .conversation-column { padding: 0 14px; }
+}
+/* When rail collapsed, scrubber stays on main pane left edge */
+body.rail-collapsed .outline-scrubber {
+  left: 10px;
 }
 @media (prefers-reduced-motion: reduce) {
-  .outline-mark,
   .outline-thumb,
   .outline-playhead,
   .outline-tooltip {
@@ -661,6 +728,132 @@ body.rail-collapsed .rail-peek { display: inline-flex; }
 .composer-hint {
   margin: 6px auto 0; max-width: var(--convo);
   text-align: center; color: var(--ink-4); font-size: 11px;
+}
+
+/* ── Timeline toolbar / execution strip (panel handoff P1–P2) ── */
+.thread-badges {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin: 0 0 10px;
+}
+.thread-badge {
+  display: inline-flex; align-items: center;
+  min-height: 22px; padding: 0 8px; border-radius: 999px;
+  font-size: 11.5px; font-weight: 600;
+  border: 1px solid var(--line);
+  background: var(--surface-2); color: var(--ink-2);
+}
+.thread-badge.badge-sticky { border-color: color-mix(in srgb, var(--amber) 40%, var(--line)); color: var(--amber); }
+.thread-badge.badge-handoff { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); color: var(--accent); }
+
+.execution-strip {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+}
+.execution-strip-summary {
+  margin: 0 0 8px;
+  font-size: 12.5px; font-weight: 600; color: var(--ink);
+}
+.execution-strip-list {
+  display: flex; flex-wrap: wrap; gap: 6px;
+}
+.execution-chip {
+  display: inline-flex; align-items: center;
+  max-width: 100%;
+  min-height: 26px; padding: 0 9px; border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 12px; line-height: 16px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.execution-chip:hover { background: var(--surface-3); color: var(--ink); }
+.execution-chip.is-failed {
+  border-color: color-mix(in srgb, var(--red) 35%, var(--line));
+  color: var(--red);
+}
+
+.timeline-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin: 0 0 14px;
+}
+.timeline-toolbar-label {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--ink-4);
+}
+.timeline-mode-group {
+  display: inline-flex; gap: 2px; padding: 2px;
+  border-radius: 9px; background: var(--surface-2); border: 1px solid var(--line);
+}
+.timeline-mode-btn {
+  min-height: 26px; padding: 0 10px; border-radius: 7px;
+  color: var(--ink-3); font-size: 12.5px; font-weight: 500;
+}
+.timeline-mode-btn:hover { color: var(--ink); }
+.timeline-mode-btn.is-active {
+  background: var(--surface); color: var(--ink); font-weight: 600;
+  box-shadow: 0 0 0 1px var(--line);
+}
+
+.status-chip {
+  flex: 0 0 auto;
+  margin-left: 8px;
+  min-height: 18px; padding: 0 6px; border-radius: 999px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.02em;
+  border: 1px solid var(--line); color: var(--ink-3); background: var(--surface);
+}
+.status-chip.status-failed,
+.status-chip.status-error,
+.status-chip.status-blocked,
+.status-chip.status-cancelled {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 30%, var(--line));
+  background: color-mix(in srgb, var(--red) 8%, var(--surface));
+}
+.status-chip.status-completed,
+.status-chip.status-async_launched {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 28%, var(--line));
+}
+.execution-fail-note {
+  margin: 0 0 6px;
+  color: var(--red);
+  font-size: 12.5px; line-height: 18px;
+}
+.compact-marker {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px dashed var(--line-strong);
+  background: var(--pre-bg);
+}
+.compact-marker header {
+  display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
+}
+.compact-marker strong { font-size: 12.5px; }
+.usage-attribution-banner {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--amber) 35%, var(--line));
+  background: color-mix(in srgb, var(--amber) 8%, var(--surface));
+  color: var(--ink-2);
+  font-size: 12.5px; line-height: 18px;
+}
+.usage-definitions {
+  margin: 0 0 12px;
+  color: var(--ink-4);
+  font-size: 12px; line-height: 17px;
+}
+.usage-role-bar { margin: 0 0 14px; }
+.usage-role-bar-track {
+  height: 8px; border-radius: 999px; overflow: hidden;
+  background: var(--surface-3); border: 1px solid var(--line);
+}
+.usage-role-bar-track .sup {
+  display: block; height: 100%;
+  background: color-mix(in srgb, var(--accent) 55%, var(--surface-2));
 }
 
 /* ── Conversation (Amp public + app hybrid) ── */

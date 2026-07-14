@@ -45,3 +45,16 @@ test("Amp web shell chrome is present in HTML", async () => {
   // Chat-bubble style row icon (Amp web), not only document.
   assert.match(html, /M21 15a2 2 0 0 1-2 2H7l-4 4V5/);
 });
+
+test("panel handoff chrome: timeline modes + execution strip", async () => {
+  const { html, javascript } = await frontendSources();
+  assert.match(html, /id="execution-strip"/);
+  assert.match(html, /id="timeline-toolbar"/);
+  assert.match(html, /data-mode="decision"/);
+  assert.match(html, /data-mode="full"/);
+  assert.match(html, /data-mode="errors"/);
+  assert.match(javascript, /filterEventsByMode/);
+  assert.match(javascript, /summarizeExecutions/);
+  assert.match(javascript, /timelineMode/);
+  assert.match(javascript, /Price pending/);
+});
