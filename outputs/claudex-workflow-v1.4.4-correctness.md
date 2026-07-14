@@ -24,4 +24,22 @@ Responds to Codex audit `claudex-workflow-v1.4.3-codex-audit-for-grok.md`.
 
 ## Canaries (required)
 
-See install verification section in release notes / CI command output.
+| Canary | Result |
+|---|---|
+| C-handoff-unknown-mcp | **PASS** — `mcp__filesystem__write_file` deny after compact=3 |
+| C-handoff-bash | **PASS** — `pwd & touch`, `ls <(touch)`, `ls` all deny |
+| C-git-destructive | **PASS** — `git reset --hard` / `git push --force` deny |
+| C-t3-compact-reset | **PASS** — tokens/bytes reset after PostCompact; soft no handoff |
+| C-t6-exact-turns | **PASS** — `num_turns` parse; cumulative 20 → MaxTurns 4 |
+| C-t7-ledger-fixture | **PASS** — real RouteRecord `outcome.status=accepted` counted |
+| C-t4-partial-path | **PASS** — UI+unknown backend path rejects |
+| C-t12-race | **PASS** — `go test -race` supervisorgate/mcpserver/routeeval |
+| C-from-handoff | **PASS** (wrapper) — `claudex --from-handoff` implemented; full interactive e2e not run |
+
+## Release
+
+- commit: `1f29658`
+- tag: `v1.4.4`
+- remote: `origin/master` pushed
+- artifact: `outputs/claudex-flow-1.4.4.sha256`, `outputs/runtime-contract-1.4.4.json`
+
