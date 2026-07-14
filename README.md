@@ -1,6 +1,6 @@
 # claudex-flow
 
-`claudex-flow` v1.3.2 是为 Claude Code 实现的 **Amp-style Agent Mode**。它不是“为整项任务挑一个模型”，而是一个有主线程、持久 Worker、能力代理、零模型 prompt route hint、历史 Thread 搜索/读取、证据回注、路由结果账本、独立 Luna compact lane 与云端 Thread 记录的运行时。
+`claudex-flow` v1.4.4 是为 Claude Code 实现的 **Amp-style Agent Mode**。它不是“为整项任务挑一个模型”，而是一个有主线程、持久 Worker、能力代理、零模型 prompt route hint、**Supervisor 工具预算与 Root 生命周期闸门**、历史 Thread 搜索/读取、证据回注、路由结果账本、独立 Luna compact lane 与云端 Thread 记录的运行时。
 
 v0.5 的优化目标不是增加 Agent 数量，而是降低**验收通过所需的总成本和关键路径时间**：先冻结验收契约，Sol 能单路径完成时直接做；只有一个独立切片能避免 Supervisor 重复实现时才启动 Worker。
 
@@ -157,6 +157,28 @@ Dashboard：<https://claudex-threads.ppop.workers.dev>
 `PostToolUse` 与 `PostToolUseFailure` 还接入一个零模型 watchdog。若工具已经返回、但主 Thread transcript 连续 5 分钟没有任何增长，Claude Code 的 `asyncRewake` 会向同一 turn 注入一次 `CLAUDEX_STALL_REWAKE`：Supervisor 先核对副作用状态，只继续未完成的 gate，不重放部署或写入。正常推理一旦产生 transcript 增量，watchdog 会立即退出。
 
 每个 tool result 最多触发一次恢复；记录保存在 `~/.config/claudex/stall-watch/events.jsonl`。这个机制不会回溯已经发生在安装前的停滞，也不会自动重启或杀掉 Claude Code。
+
+## Supervisor gate (v1.4.2)
+
+`supervisor-gate` 是零模型硬约束，装在 `PreToolUse` / `PostToolUse` / `PostToolUseFailure` / `PostCompact` / `UserPromptSubmit`：
+
+| 闸门 | Root 预算 | Gate 预算 | 行为 |
+|---|---|---|---|
+| Playwright | 12 | 4 | 任一超额 deny |
+| Screenshots | 8 | 3 | 同上 |
+| 相同验证指纹 | 3 | 3 | 同上 |
+| 高成本施工 | soft 8 / hard 24 | soft 4 / hard 8 | soft 后 **sticky deny** 直到 `ack_reroute` |
+| Root 生命周期 | 3×compact / 4h / ~8MiB | — | handoff：拒 Write/Edit/Agent/Task/Skill/mutating Bash |
+
+v1.4.2（T1，patch 升版）：
+
+- MCP：`declare_gate` / `close_gate` / `ack_reroute` / `gate_status`（控制工具在 sticky 下仍 allow）；
+- **Root 总预算永不随 gate 重置**；每 gate 子预算仅在 `declare_gate` 时清零；
+- 防刷：最多 8 gates/Root、gate_id 唯一、acceptance hash 不得与上一 gate 相同；
+- 用户 `/gate-override reason=... paths=a,b`（10m/3 次；模型不可自授）；
+- v1.4.1 flock / handoff Bash 白名单 / path-first admission 保留。
+
+Child Worker session（`CLAUDE_CODE_CHILD_SESSION=1`）跳过该闸门。状态：`~/.config/claudex/supervisor-gate/`。
 
 ## Worker 状态机
 

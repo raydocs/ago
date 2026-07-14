@@ -95,14 +95,14 @@ func (s *Server) startWorker(ctx context.Context, _ *mcp.CallToolRequest, in Wor
 		ParentSessionID: parentSessionID,
 		Tools:           workerTools(in.Write),
 		JSONSchema:      workerJSONSchema,
-		MaxTurns:        10,
+		MaxTurns:        workerInvokeMaxTurns(0),
 		Timeout:         time.Duration(admission.DeadlineMS) * time.Millisecond,
 	})
 	s.recordRouteModelCall(in.RouteID, "worker_start", workerModel, workerEffort, result, w.startAttempts > 1)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	s.applyResult(w, result)
+	s.applyResult(w, result, workerInvokeMaxTurns(0))
 	if violation := s.changedPathViolation(w, result.ChangedPaths); violation != "" {
 		w.state = "blocked"
 		w.failureClass = failureScopeViolation
@@ -196,6 +196,10 @@ func (s *Server) resumeWorker(ctx context.Context, _ *mcp.CallToolRequest, in Wo
 	if w.turn >= 1+maxWorkerResumes {
 		return nil, WorkerOutput{}, fmt.Errorf("worker %s resume budget exhausted: max %d resumes", w.id, maxWorkerResumes)
 	}
+	maxTurns := workerInvokeMaxTurns(w.cumulativeModelTurns)
+	if maxTurns <= 0 {
+		return nil, WorkerOutput{}, fmt.Errorf("worker %s cumulative model turns %d exhausted (cap %d); split the slice instead of raising MaxTurns", w.id, w.cumulativeModelTurns, maxCumulativeWorkerModelTurns)
+	}
 	if err := s.acquireLease(w); err != nil {
 		return nil, WorkerOutput{}, err
 	}
@@ -225,11 +229,11 @@ func (s *Server) resumeWorker(ctx context.Context, _ *mcp.CallToolRequest, in Wo
 		ResumeSession:   w.sessionID,
 		Tools:           workerTools(w.write),
 		JSONSchema:      workerJSONSchema,
-		MaxTurns:        10,
+		MaxTurns:        maxTurns,
 		Timeout:         time.Duration(w.deadlineMS) * time.Millisecond,
 	})
 	s.recordRouteModelCall(w.admission.RouteID, "worker_resume", workerModel, workerEffort, result, false)
-	s.applyResult(w, result)
+	s.applyResult(w, result, maxTurns)
 	if violation := s.changedPathViolation(w, result.ChangedPaths); violation != "" {
 		w.state, w.failureClass, w.error, w.retryEligible = "blocked", failureScopeViolation, violation, false
 		w.report = blockedReport(violation, result.ChangedPaths)
@@ -287,14 +291,30 @@ func (s *Server) closeWorker(_ context.Context, _ *mcp.CallToolRequest, in Worke
 	return nil, workerStatusLocked(w), nil
 }
 
-func (s *Server) applyResult(w *workerState, result claude.Result) {
+func (s *Server) applyResult(w *workerState, result claude.Result, requestedMaxTurns int) {
 	w.durationMS += result.DurationMS
 	w.toolUses = mergeToolUses(w.toolUses, result.ToolUses)
 	w.usage = addTokenUsage(w.usage, tokenUsage(result.Usage))
 	w.identity = executionIdentity(workerModel, workerEffort, result)
+	turns, quality := result.AccountedTurns(requestedMaxTurns)
+	w.cumulativeModelTurns += turns
+	w.turnAccountingQuality = quality
 	if result.SessionID != "" {
 		w.sessionID = result.SessionID
 	}
+}
+
+// workerInvokeMaxTurns keeps per-invoke MaxTurns ≤ 10 and never exceeds remaining cumulative budget.
+func workerInvokeMaxTurns(cumulative int) int {
+	const perInvoke = 10
+	remaining := maxCumulativeWorkerModelTurns - cumulative
+	if remaining <= 0 {
+		return 0
+	}
+	if remaining < perInvoke {
+		return remaining
+	}
+	return perInvoke
 }
 
 func blockedReport(summary string, changed []string) WorkerReport {
@@ -610,7 +630,9 @@ func decodeWorkerReport(result claude.Result) (WorkerReport, error) {
 func workerOutputLocked(w *workerState) WorkerOutput {
 	return WorkerOutput{
 		SliceID: w.sliceID, Admission: w.admission, StartAttempts: w.startAttempts, WorkerID: w.id,
-		Identity: w.identity, SessionID: w.sessionID, Turn: w.turn, State: w.state, Report: w.report,
+		Identity: w.identity, SessionID: w.sessionID, Turn: w.turn,
+		CumulativeModelTurns: w.cumulativeModelTurns, TurnAccountingQuality: w.turnAccountingQuality,
+		State: w.state, Report: w.report,
 		ToolUses: cloneToolUses(w.toolUses), Usage: w.usage, DurationMS: w.durationMS,
 		FailureClass: w.failureClass, RetryEligible: w.retryEligible, Error: w.error,
 	}

@@ -17,6 +17,8 @@ import (
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	root := t.TempDir()
+	// Isolate durable lane-health file so tests do not share ~/.config state.
+	t.Setenv("CLAUDEX_LANE_HEALTH_PATH", filepath.Join(root, "lane-health.json"))
 	return &Server{
 		root:            root,
 		workers:         map[string]*workerState{},
@@ -212,7 +214,8 @@ func TestRouteTaskUsesLiveLaneQuarantineWithoutFallback(t *testing.T) {
 		t.Fatalf("health evidence not exposed: %#v", plan.Surface.LaneHealth)
 	}
 
-	// A successful explicit health canary clears the quarantine in the same MCP session.
+	// Same-session healthy record restores the lane. Durable quarantine requires
+	// explicit lane-health clear --canary-pass outside this process.
 	s.recordLaneHealthy("search_external")
 	_, recovered, err := s.routeTask(context.Background(), nil, router.RouteRequest{Objective: "Research today's current vendor announcement.", Kind: router.KindRealtime})
 	if err != nil {
@@ -575,7 +578,7 @@ func TestModelMismatchAndScopeViolationAreObservableAndNotRetryable(t *testing.T
 		}
 		in := qualifiedInput()
 		in.Write = true
-		in.Paths = []string{"allowed"}
+		in.Paths = []string{"internal/threadusage/parse.go"}
 		_, out, err := s.startWorker(context.Background(), nil, in)
 		if err != nil {
 			t.Fatal(err)

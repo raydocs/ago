@@ -54,11 +54,15 @@ type Result struct {
 	ToolUses       map[string]int  `json:"tool_uses"`
 	ChangedPaths   []string        `json:"changed_paths,omitempty"`
 	Usage          Usage           `json:"usage"`
-	DurationMS     int64           `json:"duration_ms"`
-	RawJSONL       string          `json:"-"`
-	Stderr         string          `json:"stderr,omitempty"`
-	ExitError      string          `json:"exit_error,omitempty"`
-	Success        bool            `json:"success"`
+	// NumTurns is the Claude result.num_turns field when present (exact).
+	NumTurns int `json:"num_turns,omitempty"`
+	// TurnAccountingQuality: exact | upper_bound | unknown
+	TurnAccountingQuality string `json:"turn_accounting_quality,omitempty"`
+	DurationMS            int64  `json:"duration_ms"`
+	RawJSONL              string `json:"-"`
+	Stderr                string `json:"stderr,omitempty"`
+	ExitError             string `json:"exit_error,omitempty"`
+	Success               bool   `json:"success"`
 }
 
 type Usage struct {
@@ -250,6 +254,11 @@ func parseJSONL(raw []byte, result *Result) {
 			if usage, ok := event["usage"].(map[string]any); ok {
 				result.Usage = usageFromMap(usage)
 			}
+			// Prefer exact num_turns from the SDK result event.
+			if n := intFromAny(event["num_turns"]); n > 0 {
+				result.NumTurns = n
+				result.TurnAccountingQuality = "exact"
+			}
 		}
 		if sessionID, ok := event["session_id"].(string); ok && sessionID != "" {
 			result.SessionID = sessionID
@@ -296,9 +305,32 @@ func int64FromAny(value any) int64 {
 		return n
 	case int:
 		return int64(n)
+	case json.Number:
+		v, _ := n.Int64()
+		return v
 	default:
 		return 0
 	}
+}
+
+func intFromAny(value any) int {
+	return int(int64FromAny(value))
+}
+
+// AccountedTurns returns how many model turns to charge against a cumulative budget.
+// Prefers exact num_turns; otherwise returns requestedMaxTurns as a conservative
+// upper bound. Never silently treats tool-use counts as model turns.
+func (r Result) AccountedTurns(requestedMaxTurns int) (turns int, quality string) {
+	if r.NumTurns > 0 || r.TurnAccountingQuality == "exact" {
+		if r.NumTurns <= 0 {
+			return 0, "exact"
+		}
+		return r.NumTurns, "exact"
+	}
+	if requestedMaxTurns > 0 {
+		return requestedMaxTurns, "upper_bound"
+	}
+	return 0, "unknown"
 }
 
 func uniqueSorted(values []string) []string {

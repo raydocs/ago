@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION="${1:-1.3.2}"
+VERSION="${1:-1.4.4}"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
 EXPECTED="$HOME/orca/projects/x"
 TARGET="$HOME/.local/bin/claudex-flow"

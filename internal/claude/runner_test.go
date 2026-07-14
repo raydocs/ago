@@ -8,10 +8,32 @@ import (
 )
 
 func TestParseJSONL(t *testing.T) {
-	raw := []byte("{\"type\":\"assistant\",\"session_id\":\"session-1\",\"message\":{\"model\":\"claude-opus-4-8[1m]\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Write\",\"input\":{\"file_path\":\"/tmp/a\"}}]}}\n{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"completed\",\"session_id\":\"session-1\",\"result\":\"{\\\"status\\\":\\\"completed\\\"}\",\"structured_output\":{\"status\":\"completed\"},\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3,\"output_tokens\":4}}\n")
+	raw := []byte("{\"type\":\"assistant\",\"session_id\":\"session-1\",\"message\":{\"model\":\"claude-opus-4-8[1m]\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Write\",\"input\":{\"file_path\":\"/tmp/a\"}}]}}\n{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"completed\",\"num_turns\":3,\"session_id\":\"session-1\",\"result\":\"{\\\"status\\\":\\\"completed\\\"}\",\"structured_output\":{\"status\":\"completed\"},\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3,\"output_tokens\":4}}\n")
 	r := Result{ToolUses: map[string]int{}}
 	parseJSONL(raw, &r)
-	if r.SessionID != "session-1" || r.ResolvedModel != "claude-opus-4-8[1m]" || r.Text == "" || string(r.Structured) != `{"status":"completed"}` || r.ToolUses["Write"] != 1 || len(r.ChangedPaths) != 1 || r.Usage.InputTokens != 10 || r.Usage.CacheReadTokens != 3 || r.Subtype != "success" || r.IsError {
+	if r.SessionID != "session-1" || r.ResolvedModel != "claude-opus-4-8[1m]" || r.Text == "" || string(r.Structured) != `{"status":"completed"}` || r.ToolUses["Write"] != 1 || len(r.ChangedPaths) != 1 || r.Usage.InputTokens != 10 || r.Usage.CacheReadTokens != 3 || r.Subtype != "success" || r.IsError || r.NumTurns != 3 || r.TurnAccountingQuality != "exact" {
+		t.Fatalf("parsed %#v", r)
+	}
+}
+
+func TestAccountedTurnsPrefersExactNumTurns(t *testing.T) {
+	r := Result{NumTurns: 3, TurnAccountingQuality: "exact", ToolUses: map[string]int{"Read": 9}}
+	turns, quality := r.AccountedTurns(10)
+	if turns != 3 || quality != "exact" {
+		t.Fatalf("got turns=%d quality=%s", turns, quality)
+	}
+	r = Result{}
+	turns, quality = r.AccountedTurns(10)
+	if turns != 10 || quality != "upper_bound" {
+		t.Fatalf("missing num_turns should upper-bound by MaxTurns: turns=%d quality=%s", turns, quality)
+	}
+}
+
+func TestParseJSONLErrorMaxTurnsIncludesNumTurns(t *testing.T) {
+	raw := []byte(`{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":10,"terminal_reason":"Reached max turns","result":"Reached max turns"}` + "\n")
+	r := Result{ToolUses: map[string]int{}}
+	parseJSONL(raw, &r)
+	if r.NumTurns != 10 || r.TurnAccountingQuality != "exact" || r.Subtype != "error_max_turns" {
 		t.Fatalf("parsed %#v", r)
 	}
 }

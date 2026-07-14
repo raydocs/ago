@@ -1,0 +1,92 @@
+#!/bin/sh
+set -eu
+
+export CLAUDEX_THREAD_MODEL="gpt-5.6-sol"
+export CLAUDEX_THREAD_EFFORT="xhigh"
+export CLAUDEX_THREAD_ROLE="supervisor"
+
+# Parse --from-handoff PATH (user explicit only; hooks never spawn Claude).
+_claudex_handoff=""
+_claudex_out_args=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --from-handoff)
+      shift
+      _claudex_handoff="${1:-}"
+      [ -n "$_claudex_handoff" ] || { echo "claudex: --from-handoff requires a path" >&2; exit 2; }
+      shift
+      ;;
+    --from-handoff=*)
+      _claudex_handoff="${1#--from-handoff=}"
+      shift
+      ;;
+    *)
+      # Preserve remaining args by rebuilding positional parameters later.
+      _claudex_out_args="$_claudex_out_args $1"
+      # Use a safer approach: collect into a temp file of null-separated? 
+      # Simpler: stop special parsing after first non-option for handoff only.
+      # Rebuild using set -- for known simple cases by storing in array-like vars.
+      break
+      ;;
+  esac
+done
+
+# If we broke on first non-handoff arg, remaining "$@ " still starts at that arg.
+# Re-scan resume binding from remaining args.
+_claudex_expect_resume=0
+for _claudex_arg in "$@"; do
+  if [ "$_claudex_expect_resume" -eq 1 ]; then
+    export CLAUDEX_THREAD_ROOT_SESSION_ID="$_claudex_arg"
+    _claudex_expect_resume=0
+    break
+  fi
+  case "$_claudex_arg" in
+    --resume) _claudex_expect_resume=1 ;;
+    --resume=*) export CLAUDEX_THREAD_ROOT_SESSION_ID="${_claudex_arg#--resume=}"; break ;;
+  esac
+done
+unset _claudex_expect_resume _claudex_arg
+
+export MCP_TOOL_TIMEOUT=120000
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90
+export CLAUDEX_STALL_TIMEOUT_SECONDS=300
+
+if [ -n "$_claudex_handoff" ]; then
+  case "$_claudex_handoff" in
+    /*) ;;
+    *) _claudex_handoff="$PWD/$_claudex_handoff" ;;
+  esac
+  if [ ! -f "$_claudex_handoff" ]; then
+    echo "claudex: handoff file not found: $_claudex_handoff" >&2
+    exit 2
+  fi
+  # Seed first user message from capsule; never auto-spawn — user invoked this CLI.
+  exec claude \
+    --settings "$HOME/.config/claudex/settings.json" \
+    --mcp-config "$HOME/.config/claudex/mcp.json" \
+    --append-system-prompt-file "$HOME/.config/claudex/orchestrator.md" \
+    --model gpt-5.6-sol \
+    --effort xhigh \
+    --dangerously-skip-permissions \
+    "$@" \
+    "Continue from Claude X handoff capsule at ${_claudex_handoff}.
+
+Re-anchor from current files and runtime state before acting.
+Do not resume construction on the previous Root.
+Read the capsule fully, then take only the next bounded gate.
+
+--- handoff capsule ---
+$(cat "$_claudex_handoff")
+--- end handoff ---
+"
+fi
+
+exec claude \
+  --settings "$HOME/.config/claudex/settings.json" \
+  --mcp-config "$HOME/.config/claudex/mcp.json" \
+  --append-system-prompt-file "$HOME/.config/claudex/orchestrator.md" \
+  --model gpt-5.6-sol \
+  --effort xhigh \
+  --dangerously-skip-permissions \
+  "$@"

@@ -28,3 +28,12 @@ When compacting this project, preserve one concise recovery capsule containing o
 - unresolved material risks or user-only blockers.
 
 Drop raw logs, superseded plans, repeated discussion, speculative alternatives, hidden reasoning, and completed intermediate steps that no longer affect execution. Never turn an unverified claim into a fact during compaction. After compaction, re-anchor from current files and runtime state before continuing.
+
+# Supervisor gate (v1.4)
+
+Runtime enforces zero-model budgets on the Root Supervisor:
+
+- Playwright/browser tools and screenshots are capped per Root; identical verification fingerprints max out at 3.
+- After enough high-cost tools, a re-route check requires restating gate, acceptance remainder, and Worker ownership.
+- After 3 compacts, 4h Root age, or ~8 MiB transcript, construction tools are denied until a handoff capsule is written and a new Root is started.
+- Worker admission rejects composite multi-domain slices (e.g. migration+API+UI+usage); split domains instead of raising MaxTurns.

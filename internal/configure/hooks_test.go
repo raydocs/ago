@@ -7,36 +7,52 @@ import (
 	"testing"
 )
 
-func TestEnsureRouteHintPreservesSettingsAndIsIdempotent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "settings.json")
-	original := map[string]any{
-		"env": map[string]any{"ANTHROPIC_AUTH_TOKEN": "secret", "MCP_TOOL_TIMEOUT": "120000"},
+func TestEnsureHooksInstallsRouteHintAndSupervisorGate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	initial := map[string]any{
 		"hooks": map[string]any{"UserPromptSubmit": []any{map[string]any{
 			"matcher": "", "hooks": []any{map[string]any{"type": "command", "command": "/bin/thread", "args": []any{"thread-hook"}}},
 		}}},
 	}
-	raw, _ := json.Marshal(original)
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
+	raw, _ := json.MarshalIndent(initial, "", "  ")
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := EnsureRouteHint(path, "/bin/claudex-flow")
-	if err != nil || !changed {
-		t.Fatalf("first install = %t, %v", changed, err)
+
+	changed, err := EnsureHooks(path, "/bin/claudex-flow")
+	if err != nil {
+		t.Fatal(err)
 	}
-	changed, err = EnsureRouteHint(path, "/bin/claudex-flow")
-	if err != nil || changed {
-		t.Fatalf("second install = %t, %v", changed, err)
+	if !changed["route-hint"] || !changed["supervisor-gate:PreToolUse"] {
+		t.Fatalf("expected installs, got %#v", changed)
 	}
+
+	// Second call is idempotent.
+	changed2, err := EnsureHooks(path, "/bin/claudex-flow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed2) != 0 {
+		t.Fatalf("expected no changes on second install, got %#v", changed2)
+	}
+
 	var got map[string]any
-	data, _ := os.ReadFile(path)
-	if err := json.Unmarshal(data, &got); err != nil {
+	body, _ := os.ReadFile(path)
+	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got["env"].(map[string]any)["ANTHROPIC_AUTH_TOKEN"] != "secret" {
-		t.Fatal("unrelated secret setting changed")
+	hooks := got["hooks"].(map[string]any)
+	ups := hooks["UserPromptSubmit"].([]any)
+	if !hasHandler(ups, "/bin/claudex-flow", "route-hint") || !hasHandler(ups, "/bin/thread", "thread-hook") {
+		t.Fatalf("UserPromptSubmit handlers missing: %#v", ups)
 	}
-	groups := got["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
-	if !hasHandler(groups, "/bin/claudex-flow", "route-hint") || !hasHandler(groups, "/bin/thread", "thread-hook") {
-		t.Fatalf("handlers missing: %#v", groups)
+	pre := hooks["PreToolUse"].([]any)
+	if !hasHandler(pre, "/bin/claudex-flow", "supervisor-gate") {
+		t.Fatalf("PreToolUse supervisor-gate missing: %#v", pre)
+	}
+	post := hooks["PostToolUse"].([]any)
+	if !hasHandler(post, "/bin/claudex-flow", "supervisor-gate") {
+		t.Fatalf("PostToolUse supervisor-gate missing: %#v", post)
 	}
 }

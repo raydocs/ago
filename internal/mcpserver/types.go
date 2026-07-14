@@ -20,6 +20,8 @@ const (
 	defaultDeadlineMS  = int64(600_000)
 	minDeadlineMS      = int64(30_000)
 	maxDeadlineMS      = int64(600_000)
+	// T6: hard cumulative model-turn estimate across start+resume (per-invoke MaxTurns stays 10).
+	maxCumulativeWorkerModelTurns = 24
 )
 
 type CapabilityNeed struct {
@@ -68,14 +70,23 @@ type WorkerStartInput struct {
 	Paths                []string `json:"paths,omitempty" jsonschema:"Exclusive write scopes. Required when write is true."`
 }
 
+// SuggestedSlice is a zero-model template for splitting a composite packet (T4).
+type SuggestedSlice struct {
+	SliceID       string   `json:"slice_id"`
+	Paths         []string `json:"paths,omitempty"`
+	DoneCondition string   `json:"done_condition,omitempty"`
+	Note          string   `json:"note,omitempty"`
+}
+
 type WorkerAdmission struct {
-	Route                string   `json:"route"`
-	RouteID              string   `json:"route_id,omitempty"`
-	SliceID              string   `json:"slice_id"`
-	MarginalContribution string   `json:"marginal_contribution,omitempty"`
-	DeadlineMS           int64    `json:"deadline_ms"`
-	Result               string   `json:"result"`
-	RejectionReasons     []string `json:"rejection_reasons"`
+	Route                string           `json:"route"`
+	RouteID              string           `json:"route_id,omitempty"`
+	SliceID              string           `json:"slice_id"`
+	MarginalContribution string           `json:"marginal_contribution,omitempty"`
+	DeadlineMS           int64            `json:"deadline_ms"`
+	Result               string           `json:"result"`
+	RejectionReasons     []string         `json:"rejection_reasons"`
+	SuggestedSlices      []SuggestedSlice `json:"suggested_slices,omitempty"`
 }
 
 type WorkerResumeInput struct {
@@ -162,21 +173,23 @@ type ExecutionIdentity struct {
 }
 
 type WorkerOutput struct {
-	SliceID       string            `json:"slice_id"`
-	Admission     WorkerAdmission   `json:"admission"`
-	StartAttempts int               `json:"start_attempts"`
-	WorkerID      string            `json:"worker_id"`
-	Identity      ExecutionIdentity `json:"identity"`
-	SessionID     string            `json:"session_id,omitempty"`
-	Turn          int               `json:"turn"`
-	State         string            `json:"state"`
-	Report        WorkerReport      `json:"report"`
-	ToolUses      map[string]int    `json:"tool_uses,omitempty"`
-	Usage         TokenUsage        `json:"usage"`
-	DurationMS    int64             `json:"duration_ms"`
-	FailureClass  string            `json:"failure_class,omitempty"`
-	RetryEligible bool              `json:"retry_eligible"`
-	Error         string            `json:"error,omitempty"`
+	SliceID              string            `json:"slice_id"`
+	Admission            WorkerAdmission   `json:"admission"`
+	StartAttempts        int               `json:"start_attempts"`
+	WorkerID             string            `json:"worker_id"`
+	Identity             ExecutionIdentity `json:"identity"`
+	SessionID            string            `json:"session_id,omitempty"`
+	Turn                   int               `json:"turn"`
+	CumulativeModelTurns   int               `json:"cumulative_model_turns,omitempty"`
+	TurnAccountingQuality  string            `json:"turn_accounting_quality,omitempty"`
+	State                  string            `json:"state"`
+	Report               WorkerReport      `json:"report"`
+	ToolUses             map[string]int    `json:"tool_uses,omitempty"`
+	Usage                TokenUsage        `json:"usage"`
+	DurationMS           int64             `json:"duration_ms"`
+	FailureClass         string            `json:"failure_class,omitempty"`
+	RetryEligible        bool              `json:"retry_eligible"`
+	Error                string            `json:"error,omitempty"`
 }
 
 type SpecialistOutput struct {

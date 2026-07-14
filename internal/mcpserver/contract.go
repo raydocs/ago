@@ -11,7 +11,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const ContractVersion = "claudex-workflow.v1.3"
+const ContractVersion = "claudex-workflow.v1.4.4"
 
 type RuntimeContract struct {
 	Version           string   `json:"version"`
@@ -39,6 +39,10 @@ func Contract() RuntimeContract {
 			"consult_native_claude",
 			"close_worker",
 			"workflow_status",
+			"declare_gate",
+			"close_gate",
+			"ack_reroute",
+			"gate_status",
 			"runtime_contract",
 		},
 		WorkerStartFields: workerStartFields(),

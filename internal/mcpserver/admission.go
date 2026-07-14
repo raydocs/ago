@@ -65,10 +65,102 @@ func evaluateWorkerAdmission(in WorkerStartInput) WorkerAdmission {
 	if in.Write && !hasExplicitPath(in.Paths) {
 		admission.RejectionReasons = append(admission.RejectionReasons, "write workers require explicit non-overlapping paths")
 	}
+	if reason := compositeSliceReason(detectSliceDomains(in)); reason != "" {
+		admission.RejectionReasons = append(admission.RejectionReasons, reason)
+		admission.SuggestedSlices = suggestSlices(in)
+	}
+	// T4: write workers should prefer a single verifier command.
+	if in.Write && multiCommandDone(in.DoneCondition) {
+		admission.RejectionReasons = append(admission.RejectionReasons, "done_condition chains multiple commands (&&, ||, ;, |, or newlines); use one primary verifier per slice")
+	}
 	if len(admission.RejectionReasons) > 0 {
 		admission.Result = admissionRejected
 	}
 	return admission
+}
+
+func suggestSlices(in WorkerStartInput) []SuggestedSlice {
+	byDomain := map[string][]string{}
+	for _, p := range in.Paths {
+		d := domainFromPath(p)
+		if d == "" {
+			d = "other"
+		}
+		byDomain[d] = append(byDomain[d], p)
+	}
+	if len(byDomain) == 0 {
+		return []SuggestedSlice{{
+			SliceID: in.SliceID + "-a", DoneCondition: "narrow one independent verifier",
+			Note: "template only: restate objective for a single domain",
+		}}
+	}
+	out := make([]SuggestedSlice, 0, len(byDomain))
+	i := 0
+	for d, paths := range byDomain {
+		i++
+		done := "go test ./..."
+		switch d {
+		case domainUI:
+			done = "node --test thread-app/test/frontend-contract.test.mjs"
+		case domainAPI:
+			done = "cd thread-app && npm run typecheck"
+		case domainSchema:
+			done = "wrangler d1 migrations list (dry review) or schema unit test"
+		case domainUsage:
+			done = "go test ./internal/threadusage"
+		case domainParsing:
+			done = "go test ./internal/threadgraph"
+		case domainDeploy:
+			done = "wrangler deploy --dry-run if supported"
+		}
+		out = append(out, SuggestedSlice{
+			SliceID: fmt.Sprintf("%s-%s-%d", sanitizeID(in.SliceID), shortDomain(d), i),
+			Paths: paths, DoneCondition: done,
+			Note: "zero-model template; re-admit with one domain only",
+		})
+	}
+	return out
+}
+
+func shortDomain(d string) string {
+	switch d {
+	case domainSchema:
+		return "schema"
+	case domainAPI:
+		return "api"
+	case domainUI:
+		return "ui"
+	case domainUsage:
+		return "usage"
+	case domainDeploy:
+		return "deploy"
+	case domainParsing:
+		return "parse"
+	default:
+		return "other"
+	}
+}
+
+func sanitizeID(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "slice"
+	}
+	return s
+}
+
+func multiCommandDone(done string) bool {
+	d := strings.TrimSpace(done)
+	if d == "" {
+		return false
+	}
+	if strings.Count(d, "&&") > 0 || strings.Count(d, "||") > 0 {
+		return true
+	}
+	if strings.Contains(d, ";") || strings.Contains(d, "|") || strings.Contains(d, "\n") {
+		return true
+	}
+	return false
 }
 
 func hasExplicitPath(paths []string) bool {
@@ -81,5 +173,13 @@ func hasExplicitPath(paths []string) bool {
 }
 
 func admissionError(admission WorkerAdmission) error {
-	return fmt.Errorf("worker slice %q admission rejected: %s", admission.SliceID, strings.Join(admission.RejectionReasons, "; "))
+	msg := fmt.Sprintf("worker slice %q admission rejected: %s", admission.SliceID, strings.Join(admission.RejectionReasons, "; "))
+	if len(admission.SuggestedSlices) > 0 {
+		parts := make([]string, 0, len(admission.SuggestedSlices))
+		for _, s := range admission.SuggestedSlices {
+			parts = append(parts, s.SliceID+":"+strings.Join(s.Paths, ","))
+		}
+		msg += " | suggested_slices=" + strings.Join(parts, "; ")
+	}
+	return fmt.Errorf("%s", msg)
 }

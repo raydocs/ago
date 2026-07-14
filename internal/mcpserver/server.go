@@ -68,6 +68,9 @@ type workerState struct {
 	identity      ExecutionIdentity
 	failureClass  string
 	retryEligible bool
+	// T6: model turns accumulated across start+resume (MaxTurns per invoke stays ≤10).
+	cumulativeModelTurns   int
+	turnAccountingQuality  string // exact | upper_bound | unknown
 }
 
 type sliceState struct {
@@ -166,6 +169,26 @@ func Run(ctx context.Context, version, settings string) error {
 		Description: "Inspect worker threads, states, turns, budgets, concurrency, and current-session lane health/quarantine evidence without invoking a model.",
 		Annotations: &mcp.ToolAnnotations{Title: "Workflow status", ReadOnlyHint: readOnly},
 	}, s.workflowStatus)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "declare_gate",
+		Description: "Zero-model: open one Supervisor gate with frozen acceptance and stop_condition. Resets per-gate tool budgets only; Root budgets never reset. Requires unique gate_id, closed previous gate, changed acceptance hash, max 8 gates/Root. Always allowed under sticky re-route.",
+		Annotations: &mcp.ToolAnnotations{Title: "Declare supervisor gate", ReadOnlyHint: false},
+	}, s.declareGate)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "close_gate",
+		Description: "Zero-model: close or abandon the open Supervisor gate. Does not reset Root budgets or clear sticky without ack_reroute.",
+		Annotations: &mcp.ToolAnnotations{Title: "Close supervisor gate", ReadOnlyHint: false},
+	}, s.closeGate)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ack_reroute",
+		Description: "Zero-model: clear sticky re-route after restating remaining_acceptance and worker_decision (none|start|resume) for the open gate. Required before more high-cost construction tools once sticky is armed.",
+		Annotations: &mcp.ToolAnnotations{Title: "Acknowledge re-route check", ReadOnlyHint: false},
+	}, s.ackReroute)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "gate_status",
+		Description: "Zero-model: read Root/gate counters, sticky state, handoff flag, and budgets for the bound Root session.",
+		Annotations: &mcp.ToolAnnotations{Title: "Supervisor gate status", ReadOnlyHint: readOnly},
+	}, s.gateStatusTool)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "runtime_contract",
 		Description: "Return the zero-model Claude X runtime contract, available tools, profiles, and exact start_worker fields.",

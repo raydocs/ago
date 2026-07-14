@@ -22,6 +22,7 @@ import (
 	"claudexflow/internal/routehint"
 	"claudexflow/internal/router"
 	"claudexflow/internal/stallwatch"
+	"claudexflow/internal/supervisorgate"
 	"claudexflow/internal/threadfind"
 	"claudexflow/internal/threadsync"
 	"claudexflow/internal/workflow"
@@ -65,10 +66,10 @@ func main() {
 		}
 		return
 	case "configure-hooks":
-		var changed bool
-		changed, err = configure.EnsureRouteHint(defaultSettings(), defaultBinary())
+		var changed map[string]bool
+		changed, err = configure.EnsureHooks(defaultSettings(), defaultBinary())
 		if err == nil {
-			err = printJSON(map[string]any{"changed": changed, "route_hint": "installed"})
+			err = printJSON(map[string]any{"changed": changed, "hooks": "route-hint+supervisor-gate"})
 		}
 	case "route-hint":
 		if os.Getenv("CLAUDE_CODE_CHILD_SESSION") == "1" {
@@ -79,6 +80,17 @@ func main() {
 		if err == nil && len(output) > 0 {
 			_, err = os.Stdout.Write(append(output, '\n'))
 		}
+	case "supervisor-gate":
+		supervisorGate()
+		return
+	case "gate-status":
+		err = gateStatus(os.Args[2:])
+	case "route-promote":
+		err = routePromote(os.Args[2:])
+	case "orchestrator-stats":
+		err = orchestratorStats(os.Args[2:])
+	case "lane-health":
+		err = laneHealthCmd(os.Args[2:])
 	case "mcp":
 		err = mcpserver.Run(ctx, version, defaultSettings())
 	case "thread-hook":
@@ -134,8 +146,13 @@ Commands:
   route-eval                run a predeclared zero-model route policy suite
   contract                  print the compiled workflow contract
   contract-guard            fail fast when orchestrator/runtime contracts drift
-  configure-hooks           idempotently install root zero-model route hint
+  configure-hooks           idempotently install route-hint + supervisor-gate hooks
   route-hint                internal zero-model UserPromptSubmit route hint
+  supervisor-gate           zero-model Pre/Post tool budgets, re-route, Root handoff
+  gate-status               show Root supervisor-gate counters (zero-model)
+  route-promote             dry-run / explicit-confirm route default promotion marker
+  orchestrator-stats        measure orchestrator.md size (T13; no rewrite)
+  lane-health               show/clear durable lane quarantine (explicit canary clear)
   mcp                       run the Claude X specialist MCP server over stdio
   thread-hook               ingest one Claude Code hook event from stdin
   thread-sync               retry locally spooled cloud events
@@ -189,6 +206,108 @@ func stallWatch(ctx context.Context) {
 	if out.State == "stalled" {
 		fmt.Fprintln(os.Stderr, out.Message)
 		os.Exit(2)
+	}
+}
+
+func supervisorGate() {
+	stateDir := strings.TrimSpace(os.Getenv("CLAUDEX_SUPERVISOR_GATE_DIR"))
+	if stateDir == "" {
+		stateDir = supervisorgate.DefaultStateDir()
+	}
+	_, output, err := supervisorgate.Run(os.Stdin, supervisorgate.Config{StateDir: stateDir})
+	if err != nil {
+		// Fail open on internal errors so Claude is not frozen; never silent.
+		fmt.Fprintln(os.Stderr, "CLAUDEX_GATE_INTERNAL_FAILURE:", err)
+		return
+	}
+	if len(output) > 0 {
+		_, _ = os.Stdout.Write(append(output, '\n'))
+	}
+}
+
+func gateStatus(args []string) error {
+	fs := flag.NewFlagSet("gate-status", flag.ContinueOnError)
+	session := fs.String("session", "", "Claude Root session_id")
+	stateDir := fs.String("state-dir", "", "override supervisor-gate state dir")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*session) == "" {
+		return fmt.Errorf("--session is required")
+	}
+	dir := strings.TrimSpace(*stateDir)
+	if dir == "" {
+		dir = strings.TrimSpace(os.Getenv("CLAUDEX_SUPERVISOR_GATE_DIR"))
+	}
+	status, err := supervisorgate.LoadStatus(dir, *session)
+	if err != nil {
+		return err
+	}
+	return printJSON(status)
+}
+
+func routePromote(args []string) error {
+	fs := flag.NewFlagSet("route-promote", flag.ContinueOnError)
+	family := fs.String("family", "", "manual family tag")
+	path := fs.String("outcomes", "", "route-outcomes.jsonl path")
+	confirm := fs.Bool("confirm", false, "write pending marker only if eligible; never auto-merges router")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !*confirm {
+		dry, err := routeeval.DryRunPromote(*path, *family)
+		if err != nil {
+			return err
+		}
+		return printJSON(dry)
+	}
+	marker, err := routeeval.ConfirmPromote(*path, *family, true)
+	if err != nil {
+		return err
+	}
+	return printJSON(map[string]any{"marker": marker, "auto_promote": false})
+}
+
+func orchestratorStats(args []string) error {
+	path := defaultOrchestrator()
+	if len(args) > 0 && strings.TrimSpace(args[0]) != "" {
+		path = args[0]
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return printJSON(map[string]any{
+		"path": path, "bytes": len(raw), "lines": strings.Count(string(raw), "\n") + 1,
+		"approx_tokens_bytes_div_4": len(raw) / 4,
+		"note":                     "T13 measurement only; do not split until Contract markers still load",
+	})
+}
+
+func laneHealthCmd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: lane-health clear --tool NAME --canary-pass")
+	}
+	switch args[0] {
+	case "clear":
+		fs := flag.NewFlagSet("lane-health clear", flag.ContinueOnError)
+		tool := fs.String("tool", "", "lane tool name, e.g. start_worker")
+		canary := fs.Bool("canary-pass", false, "required: only clear after an explicit health canary")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if !*canary {
+			return fmt.Errorf("--canary-pass is required; durable quarantine is not auto-cleared")
+		}
+		if strings.TrimSpace(*tool) == "" {
+			return fmt.Errorf("--tool is required")
+		}
+		if err := mcpserver.ClearDurableLane(*tool); err != nil {
+			return err
+		}
+		return printJSON(map[string]any{"cleared": *tool, "canary_pass": true})
+	default:
+		return fmt.Errorf("unknown lane-health subcommand %q", args[0])
 	}
 }
 
@@ -462,6 +581,12 @@ func doctor() error {
 		if !hasCommandHook(settings, "UserPromptSubmit", guardCommand, []string{"route-hint"}) {
 			settingsFailures = append(settingsFailures, "UserPromptSubmit route-hint is missing")
 			failures = append(failures, "UserPromptSubmit zero-model route hint is missing")
+		}
+		for _, event := range []string{"PreToolUse", "PostToolUse", "PostToolUseFailure", "PostCompact", "UserPromptSubmit", "StopFailure"} {
+			if !hasCommandHook(settings, event, guardCommand, []string{"supervisor-gate"}) {
+				settingsFailures = append(settingsFailures, event+" supervisor-gate is missing")
+				failures = append(failures, event+" supervisor-gate is missing")
+			}
 		}
 		for _, event := range []string{"PreCompact", "PostCompact"} {
 			if !hasCommandHook(settings, event, guardCommand, []string{"thread-hook"}) {

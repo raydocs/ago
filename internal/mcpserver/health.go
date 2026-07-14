@@ -34,6 +34,8 @@ func (s *Server) recordLaneHealth(health router.LaneHealth) {
 		s.laneHealth = map[string]router.LaneHealth{}
 	}
 	s.laneHealth[health.Tool] = health
+	// T12: persist auth/model-mismatch style unavailability across MCP restarts.
+	persistDurableLaneHealth(health)
 }
 
 func (s *Server) liveLaneHealth() []router.LaneHealth {
@@ -43,6 +45,13 @@ func (s *Server) liveLaneHealth() []router.LaneHealth {
 		values[tool] = health
 	}
 	s.mu.Unlock()
+	// Durable quarantine only fills tools missing from this MCP session memory.
+	// Explicit session healthy/canary state always wins within the process.
+	for _, h := range loadDurableLaneHealth() {
+		if _, ok := values[h.Tool]; !ok {
+			values[h.Tool] = h
+		}
+	}
 
 	if s.workerStarts.Load() >= maxWorkerThreads || s.workerTurns.Load() >= maxWorkerTurns {
 		values["start_worker"] = router.LaneHealth{Tool: "start_worker", Status: "unavailable", FailureClass: "budget_exhausted", Reason: "current MCP session Worker budget is exhausted"}
