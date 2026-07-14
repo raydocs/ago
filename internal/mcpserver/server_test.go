@@ -17,18 +17,19 @@ import (
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	root := t.TempDir()
-	// Isolate durable lane-health file so tests do not share ~/.config state.
+	// Isolate durable lane-health + open-routes so tests do not pollute ~/.config.
 	t.Setenv("CLAUDEX_LANE_HEALTH_PATH", filepath.Join(root, "lane-health.json"))
 	return &Server{
-		root:            root,
-		workers:         map[string]*workerState{},
-		leases:          map[string]string{},
-		attemptedSlices: map[string]int{},
-		preparingSlices: map[string]bool{},
-		sliceInputs:     map[string]WorkerStartInput{},
-		routes:          map[string]*RouteRecord{},
-		routeLedgerPath: filepath.Join(root, "route-outcomes.jsonl"),
-		slots:           make(chan struct{}, maxConcurrentRuns),
+		root:                   root,
+		workers:                map[string]*workerState{},
+		leases:                 map[string]string{},
+		attemptedSlices:        map[string]int{},
+		preparingSlices:        map[string]bool{},
+		sliceInputs:            map[string]WorkerStartInput{},
+		routes:                 map[string]*RouteRecord{},
+		routeLedgerPath:        filepath.Join(root, "route-outcomes.jsonl"),
+		openRoutesPathOverride: filepath.Join(root, "open-routes.json"),
+		slots:                  make(chan struct{}, maxConcurrentRuns),
 	}
 }
 
