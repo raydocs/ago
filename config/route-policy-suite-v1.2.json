@@ -1,0 +1,172 @@
+{
+  "version": "claudex-route-policy.v1.2",
+  "purpose": "Freeze the intended Amp-style Claude X routing policy before any costly end-to-end model comparison.",
+  "accounting_unit": "relative_resource_intensity",
+  "non_inferiority_rule": "Every case must preserve its frozen acceptance boundary, choose the expected qualified lane, and never silently substitute a quarantined capability.",
+  "adoption_threshold": "All 11 zero-model policy cases, including marginal-contribution admission and Read Thread routing, must pass. This suite alone cannot promote a durable model-quality or cost default.",
+  "cases": [
+    {
+      "id": "serial-localized-fix",
+      "family": "serial implementation",
+      "request": {
+        "objective": "Fix a localized parser bug in the known file."
+      },
+      "expected_action": "supervisor_direct",
+      "expected_model": "gpt-5.6-sol",
+      "expected_worker_admissible": false
+    },
+    {
+      "id": "isolated-worker-slice",
+      "family": "bounded implementation",
+      "request": {
+        "objective": "Implement the isolated parser package and run go test.",
+        "acceptance_criteria": [
+          "Parser fixture passes.",
+          "No unrelated paths change."
+        ],
+        "verification_target": "go test ./parser",
+        "worker_marginal_contribution": "Own the isolated parser implementation so the supervisor only verifies it.",
+        "independent_slices": 1,
+        "checkability": "objective"
+      },
+      "expected_action": "bounded_worker",
+      "expected_model": "grok-4.5",
+      "expected_tool": "start_worker",
+      "expected_worker_admissible": true
+    },
+    {
+      "id": "shared-state-direct",
+      "family": "coupled implementation",
+      "request": {
+        "objective": "Refactor the shared workflow state and tests.",
+        "acceptance_criteria": [
+          "All workflow tests pass."
+        ],
+        "verification_target": "go test ./internal/workflow",
+        "worker_marginal_contribution": "Own one genuinely disjoint implementation slice.",
+        "independent_slices": 2,
+        "shared_mutable_state": true,
+        "checkability": "objective"
+      },
+      "expected_action": "supervisor_direct",
+      "expected_model": "gpt-5.6-sol",
+      "expected_worker_admissible": false
+    },
+    {
+      "id": "current-external-research",
+      "family": "current external evidence",
+      "request": {
+        "objective": "Research today's current vendor announcement.",
+        "kind": "realtime"
+      },
+      "expected_action": "specialist_capability",
+      "expected_model": "grok-4.5",
+      "expected_tool": "search_external",
+      "expected_worker_admissible": false
+    },
+    {
+      "id": "explicit-url-digest",
+      "family": "known URL extraction",
+      "request": {
+        "objective": "Extract the model table from https://ampcode.com/models"
+      },
+      "expected_action": "specialist_capability",
+      "expected_model": "gemini-3.5-flash",
+      "expected_tool": "digest_urls",
+      "expected_worker_admissible": false
+    },
+    {
+      "id": "repository-exploration",
+      "family": "repository discovery",
+      "request": {
+        "objective": "Locate repository dependencies and map the smallest implementation surface.",
+        "kind": "explore"
+      },
+      "expected_action": "specialist_capability",
+      "expected_model": "gpt-5.6-terra",
+      "expected_tool": "explore_repository",
+      "expected_worker_admissible": false
+    },
+    {
+      "id": "long-context-consult",
+      "family": "long context",
+      "request": {
+        "objective": "Review a 1M-token repository context.",
+        "kind": "long-context"
+      },
+      "expected_action": "specialist_capability",
+      "expected_model": "sonnet[1m]",
+      "expected_tool": "consult_native_claude",
+      "expected_worker_admissible": false
+    },
+    {
+      "id": "prior-thread-read",
+      "family": "cross-thread context retrieval",
+      "request": {
+        "objective": "Read https://claudex-threads.ppop.workers.dev/#/thread/thread-123 and extract the exact accepted verification.",
+        "kind": "read-thread"
+      },
+      "expected_action": "specialist_capability",
+      "expected_model": "glm-5.2",
+      "expected_tool": "read_thread",
+      "expected_worker_admissible": false
+    },
+    {
+      "id": "high-risk-direct",
+      "family": "high semantic risk",
+      "request": {
+        "objective": "Make an irreversible production architecture choice.",
+        "kind": "hard",
+        "risk": "high"
+      },
+      "expected_action": "supervisor_direct",
+      "expected_model": "gpt-5.6-sol",
+      "expected_worker_admissible": false
+    },
+    {
+      "id": "quarantined-research-blocked",
+      "family": "runtime capability failure",
+      "request": {
+        "objective": "Research today's current vendor announcement.",
+        "kind": "realtime",
+        "lane_health": [
+          {
+            "tool": "search_external",
+            "status": "unavailable",
+            "failure_class": "auth_configuration",
+            "reason": "observed gateway auth failure"
+          }
+        ]
+      },
+      "expected_action": "capability_blocked",
+      "expected_model": "grok-4.5",
+      "expected_tool": "search_external",
+      "expected_worker_admissible": false
+    },
+    {
+      "id": "quarantined-optional-worker-direct",
+      "family": "runtime worker failure",
+      "request": {
+        "objective": "Implement the isolated parser package and run go test.",
+        "acceptance_criteria": [
+          "Parser fixture passes."
+        ],
+        "verification_target": "go test ./parser",
+        "worker_marginal_contribution": "Own the isolated parser implementation so the supervisor only verifies it.",
+        "independent_slices": 1,
+        "checkability": "objective",
+        "lane_health": [
+          {
+            "tool": "start_worker",
+            "status": "unavailable",
+            "failure_class": "model_mismatch",
+            "reason": "observed resolved-model mismatch"
+          }
+        ]
+      },
+      "expected_action": "supervisor_direct",
+      "expected_model": "gpt-5.6-sol",
+      "expected_worker_admissible": false
+    }
+  ]
+}
