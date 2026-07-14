@@ -57,6 +57,8 @@ test("panel handoff chrome: timeline modes + execution strip", async () => {
   assert.match(javascript, /summarizeExecutions/);
   assert.match(javascript, /timelineMode/);
   assert.match(javascript, /Price pending/);
+  // P6: modes live in Details drawer, not mid-page hero chrome
+  assert.match(html, /id="thread-metadata"[\s\S]*id="timeline-toolbar"/);
 });
 
 test("panel P4/P5: gate badges, observed models, progressive turns", async () => {
@@ -68,6 +70,19 @@ test("panel P4/P5: gate badges, observed models, progressive turns", async () =>
   assert.match(javascript, /Observed executors/);
   assert.match(javascript, /TURN_RENDER_CHUNK/);
   assert.match(javascript, /badge-gate/);
-  assert.match(javascript, /APP_VERSION = "0\.3\.1"/);
-  assert.match(html, /\?r=panel2/);
+  assert.match(javascript, /APP_VERSION = "0\.3\.2"/);
+  assert.match(html, /\?r=p6v1/);
+});
+
+test("panel P6 visual: Work strip collapse, topbar flags, no mid-page mode control", async () => {
+  const { html, javascript } = await frontendSources();
+  assert.match(javascript, /work-strip/);
+  assert.match(javascript, /Work · /);
+  assert.match(javascript, /topbar-flag/);
+  assert.match(html, /class="topbar-flags"/);
+  // Modes only in Details drawer; badges sit in main topbar.
+  assert.ok(html.indexOf('id="thread-metadata"') < html.indexOf('id="timeline-toolbar"'));
+  assert.ok(html.indexOf('id="main-topbar"') < html.indexOf('id="thread-badges"'));
+  assert.ok(html.indexOf('id="thread-badges"') < html.indexOf('id="event-list"'));
+  assert.match(javascript, /return "—"/);
 });

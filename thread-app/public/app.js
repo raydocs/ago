@@ -17,7 +17,7 @@ import {
   shortToolName,
 } from "./timeline-model.mjs";
 
-const APP_VERSION = "0.3.1";
+const APP_VERSION = "0.3.2";
 const TURN_RENDER_CHUNK = 8;
 const state = {
   threads: [],
@@ -687,8 +687,7 @@ function renderDetail(graph) {
   renderThreadBadges(graph);
   renderExecutionStrip(graph);
   syncTimelineModeUI();
-  const toolbar = $("#timeline-toolbar");
-  if (toolbar) toolbar.hidden = false;
+  // Timeline modes live in Details drawer only (P6 visual: no mid-page segmented control).
   renderTurns(graph);
   renderArtifacts(graph.artifacts || []);
   renderUsage(graph.usage || {});
@@ -717,17 +716,17 @@ function renderThreadBadges(graph) {
   if (!host) return;
   host.replaceChildren();
   // Degrade-friendly: no events / no matches → hide quietly (never throw).
+  // P6: short topbar meta (dot + word), not mid-page pill wall.
   let flags = [];
   try {
     const events = Array.isArray(graph?.events) ? graph.events : [];
     const detected = detectHandoffSticky(events);
-    if (detected.sticky) flags.push(["Sticky · ack required", "badge-sticky"]);
-    if (detected.handoff) flags.push(["Handoff", "badge-handoff"]);
+    if (detected.sticky) flags.push(["Sticky", "badge-sticky", "Sticky · ack required"]);
+    if (detected.handoff) flags.push(["Handoff", "badge-handoff", "Handoff required"]);
     if (detected.hasGate) {
-      if (detected.gateOpen && !detected.gateClose) flags.push(["Gate · open", "badge-gate"]);
-      else if (detected.gateClose && !detected.gateOpen) flags.push(["Gate · cleared", "badge-gate"]);
-      else if (detected.gateOpen && detected.gateClose) flags.push(["Gate", "badge-gate"]);
-      else flags.push(["Gate", "badge-gate"]);
+      if (detected.gateOpen && !detected.gateClose) flags.push(["Gate", "badge-gate", "Gate · open"]);
+      else if (detected.gateClose && !detected.gateOpen) flags.push(["Gate", "badge-gate", "Gate · cleared"]);
+      else flags.push(["Gate", "badge-gate", "Gate"]);
     }
   } catch {
     flags = [];
@@ -737,10 +736,11 @@ function renderThreadBadges(graph) {
     return;
   }
   host.hidden = false;
-  for (const [label, cls] of flags) {
+  for (const [label, cls, title] of flags) {
     const chip = document.createElement("span");
-    chip.className = `thread-badge ${cls}`;
+    chip.className = `topbar-flag ${cls}`;
     chip.textContent = label;
+    if (title) chip.title = title;
     host.append(chip);
   }
 }
@@ -757,15 +757,21 @@ function renderExecutionStrip(graph) {
   }
   host.hidden = false;
   host.replaceChildren();
-  const line = document.createElement("div");
-  line.className = "execution-strip-summary";
+
+  // P6: Amp-like collapsed Work line; chips only after expand.
+  const details = document.createElement("details");
+  details.className = "work-strip";
+  const summaryEl = document.createElement("summary");
+  const label = document.createElement("span");
+  label.className = "work-strip-label";
   const parts = [];
   if (summary.workers) parts.push(`${summary.workers} worker${summary.workers === 1 ? "" : "s"}`);
   if (summary.agents) parts.push(`${summary.agents} agent${summary.agents === 1 ? "" : "s"}`);
   if (summary.failed) parts.push(`${summary.failed} failed`);
   if (summary.totalMs > 0) parts.push(formatDuration(summary.totalMs));
-  line.textContent = parts.join(" · ") || "Executions";
-  host.append(line);
+  label.textContent = parts.length ? `Work · ${parts.join(" · ")}` : "Work";
+  summaryEl.append(label);
+  details.append(summaryEl);
 
   const list = document.createElement("div");
   list.className = "execution-strip-list";
@@ -773,14 +779,16 @@ function renderExecutionStrip(graph) {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = `execution-chip${item.failed ? " is-failed" : ""}`;
-    const status = stateLabel(item.status);
     const model = compactModel(item.model);
+    const durationText = item.duration_ms != null && Number(item.duration_ms) > 0
+      ? formatDuration(item.duration_ms)
+      : "";
     chip.textContent = [
       item.kind === "agent" ? "Agent" : "Worker",
       model,
       item.effort,
-      status,
-      item.duration_ms != null ? formatDuration(item.duration_ms) : "",
+      stateLabel(item.status),
+      durationText,
     ].filter(Boolean).join(" · ");
     chip.title = item.summary || chip.textContent;
     if (item.event_id) {
@@ -788,7 +796,8 @@ function renderExecutionStrip(graph) {
     }
     list.append(chip);
   }
-  host.append(list);
+  details.append(list);
+  host.append(details);
 }
 
 function metaItem(text, technical = false) {
@@ -1906,13 +1915,12 @@ function fieldBlock(label, value) {
 }
 
 function renderExecution(event, graph) {
+  // P6: single quiet line + thin left rail for failed — not a status-chip wall.
   const details = document.createElement("details");
   const failed = ["failed", "error", "blocked", "cancelled"].includes(String(event.status || "").toLowerCase());
   details.className = `execution-card tool-event${failed ? " failed" : ""}`;
   details.id = eventAnchor(event.event_id);
   details.dataset.eventId = event.event_id || "";
-  // Failed cards open by default so they cannot be mistaken for “never ran”.
-  if (failed) details.open = true;
 
   const kind = event.role === "agent" ? "Agent" : "Worker";
   const objective = firstLine(event.raw?.objective || event.summary || `${kind} invocation`);
@@ -1938,11 +1946,7 @@ function renderExecution(event, graph) {
   ].filter(Boolean).join(" · ");
   description.title = description.textContent;
   heading.append(name, description);
-
-  const statusChip = document.createElement("span");
-  statusChip.className = `status-chip status-${String(event.status || "unknown").toLowerCase().replace(/[^a-z0-9_-]+/g, "-")}`;
-  statusChip.textContent = stateLabel(event.status);
-  summary.append(heading, statusChip);
+  summary.append(heading);
   details.append(summary);
 
   const body = document.createElement("div");
@@ -2364,15 +2368,18 @@ function renderUsage(usage) {
 }
 
 function observedModelsSection(observed, missing = []) {
+  // P6: secondary collapsed block — honest, not competing with primary tables.
   const section = document.createElement("section");
-  section.className = "usage-section observed-models";
-  const heading = document.createElement("h3");
-  heading.textContent = "Observed executors";
-  section.append(heading);
+  section.className = "usage-section observed-models is-secondary";
+  const details = document.createElement("details");
+  details.className = "observed-models-fold";
+  const summary = document.createElement("summary");
+  summary.textContent = `Observed executors · ${observed.length}`;
+  details.append(summary);
   const note = document.createElement("p");
   note.className = "section-copy";
   note.textContent = "From participants and worker/agent cards. Not usage_records — no token counts invented.";
-  section.append(note);
+  details.append(note);
   const list = document.createElement("ul");
   list.className = "observed-model-list";
   const missingSet = new Set(missing);
@@ -2390,7 +2397,8 @@ function observedModelsSection(observed, missing = []) {
     item.append(model, meta);
     list.append(item);
   }
-  section.append(list);
+  details.append(list);
+  section.append(details);
   return section;
 }
 
@@ -2619,11 +2627,16 @@ function relativeTime(value) {
 }
 
 function formatOptionalDuration(value) {
-  return typeof value === "number" && Number.isFinite(value) ? formatDuration(value) : "Unknown";
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "—";
+  return formatDuration(value);
 }
 
 function formatDuration(milliseconds) {
-  const ms = Math.max(0, Number(milliseconds || 0));
+  // P6: unknown / zero duration reads as em dash, not "0ms" dashboard noise.
+  if (milliseconds == null || milliseconds === "") return "—";
+  const raw = Number(milliseconds);
+  if (!Number.isFinite(raw) || raw <= 0) return "—";
+  const ms = Math.max(0, raw);
   if (ms < 1000) return `${Math.round(ms)}ms`;
   const seconds = Math.round(ms / 1000);
   if (seconds < 60) return `${seconds}s`;

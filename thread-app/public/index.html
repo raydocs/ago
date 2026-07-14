@@ -10,8 +10,8 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/styles.css?r=panel2" />
-    <script type="module" src="/app.js?r=panel2"></script>
+    <link rel="stylesheet" href="/styles.css?r=p6v1" />
+    <script type="module" src="/app.js?r=p6v1"></script>
   </head>
   <body>
     <a class="skip-link" href="#detail-panel">Skip to content</a>
@@ -103,6 +103,8 @@
             </div>
             <div class="main-topbar-right">
               <span id="sync-state-main" class="sr-only"></span>
+              <!-- P6: flags live as quiet topbar meta, not mid-page pills -->
+              <div id="thread-badges" class="topbar-flags" hidden></div>
               <span id="topbar-user" class="topbar-user"></span>
               <span class="topbar-sep" aria-hidden="true">·</span>
               <span id="topbar-effort" class="topbar-effort"></span>
@@ -143,16 +145,7 @@
                     <div id="participant-strip" class="participant-strip" hidden></div>
                     <p id="detail-project" class="thread-meta-line" hidden></p>
                     <div id="detail-meta" class="detail-meta" hidden></div>
-                    <div id="thread-badges" class="thread-badges" hidden></div>
                     <div id="execution-strip" class="execution-strip" hidden></div>
-                    <div class="timeline-toolbar" id="timeline-toolbar" hidden>
-                      <span class="timeline-toolbar-label">Timeline</span>
-                      <div class="timeline-mode-group" role="tablist" aria-label="Timeline mode">
-                        <button type="button" class="timeline-mode-btn is-active" data-mode="decision" role="tab" aria-selected="true">Decision</button>
-                        <button type="button" class="timeline-mode-btn" data-mode="full" role="tab" aria-selected="false">Full</button>
-                        <button type="button" class="timeline-mode-btn" data-mode="errors" role="tab" aria-selected="false">Errors</button>
-                      </div>
-                    </div>
                     <div id="event-list" class="turn-list"></div>
                     <section id="artifacts-section" class="artifacts-section" hidden>
                       <header class="section-header"><h2>Files</h2></header>
@@ -201,6 +194,15 @@
         <section>
           <p class="eyebrow">Thread</p>
           <dl id="metadata-list" class="metadata-list"></dl>
+        </section>
+        <!-- P6: timeline modes tucked in Details (not a mid-page segmented control) -->
+        <section class="timeline-toolbar" id="timeline-toolbar">
+          <p class="eyebrow">Timeline</p>
+          <div class="timeline-mode-group" role="tablist" aria-label="Timeline mode">
+            <button type="button" class="timeline-mode-btn is-active" data-mode="decision" role="tab" aria-selected="true">Decision</button>
+            <button type="button" class="timeline-mode-btn" data-mode="full" role="tab" aria-selected="false">Full</button>
+            <button type="button" class="timeline-mode-btn" data-mode="errors" role="tab" aria-selected="false">Errors</button>
+          </div>
         </section>
         <section>
           <p class="eyebrow">Participants</p>
