@@ -72,13 +72,19 @@ func promptTokensFromTranscriptLine(line []byte) (int64, bool) {
 		return 0, false
 	}
 	var total int64
-	for _, key := range []string{"input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"} {
-		if v, ok := asInt64Any(usage[key]); ok {
-			total += v
-		}
+	if v, ok := asInt64Any(usage["input_tokens"]); ok {
+		total += v
 	}
-	// Nested cache_creation (5m/1h) when aggregate field absent.
-	if creation, ok := usage["cache_creation"].(map[string]any); ok {
+	if v, ok := asInt64Any(usage["cache_read_input_tokens"]); ok {
+		total += v
+	}
+	// Prefer aggregate cache_creation_input_tokens. Only expand nested
+	// cache_creation.ephemeral_* when the aggregate field is absent — real
+	// transcripts often carry both with the same mass (double-count → false
+	// context-pressure hard trip).
+	if v, ok := asInt64Any(usage["cache_creation_input_tokens"]); ok {
+		total += v
+	} else if creation, ok := usage["cache_creation"].(map[string]any); ok {
 		if v, ok := asInt64Any(creation["ephemeral_5m_input_tokens"]); ok {
 			total += v
 		}

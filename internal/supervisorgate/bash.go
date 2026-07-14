@@ -122,28 +122,18 @@ func gitSegmentDestructive(seg string) bool {
 	if len(fields) == 0 {
 		return false
 	}
-	// Only the primary command word counts (skip FOO=bar env assignments).
-	// This avoids false positives on `echo git reset --hard`.
-	cmdIdx := -1
-	for i, f := range fields {
-		if strings.Contains(f, "=") && !strings.HasPrefix(f, "-") && filepath.Base(f) != "git" {
-			// env assignment like FOO=1
-			if !strings.HasPrefix(f, "=") && strings.IndexByte(f, '=') > 0 {
-				continue
-			}
-		}
-		cmdIdx = i
-		break
-	}
-	if cmdIdx < 0 {
+	// Strip leading VAR=value assignments, then peel env/command wrappers so
+	// `env git reset --hard` and `command git push -f` cannot bypass the gate.
+	fields = stripLeadingAssignments(fields)
+	fields = unwrapExecWrappers(fields)
+	if len(fields) == 0 {
 		return false
 	}
-	base := filepath.Base(fields[cmdIdx])
+	base := filepath.Base(fields[0])
 	if base != "git" && base != "git.exe" {
 		return false
 	}
-	args := fields[cmdIdx+1:]
-	sub, rest := parseGitArgv(args)
+	sub, rest := parseGitArgv(fields[1:])
 	switch sub {
 	case "reset":
 		for _, a := range rest {
@@ -169,6 +159,91 @@ func gitSegmentDestructive(seg string) bool {
 		}
 	}
 	return false
+}
+
+func stripLeadingAssignments(fields []string) []string {
+	i := 0
+	for i < len(fields) {
+		f := fields[i]
+		// FOO=bar style; not -flag=value and not git itself.
+		eq := strings.IndexByte(f, '=')
+		if eq > 0 && !strings.HasPrefix(f, "-") && filepath.Base(f) != "git" && filepath.Base(f) != "git.exe" {
+			i++
+			continue
+		}
+		break
+	}
+	return fields[i:]
+}
+
+// unwrapExecWrappers peels env(1) and bash `command` wrappers (possibly nested).
+func unwrapExecWrappers(fields []string) []string {
+	for len(fields) > 0 {
+		base := filepath.Base(fields[0])
+		switch base {
+		case "env":
+			// env [-i] [-u name]... [NAME=value]... utility [argument...]
+			rest := fields[1:]
+			for len(rest) > 0 {
+				f := rest[0]
+				if f == "-i" || f == "-" || f == "--ignore-environment" || f == "--" {
+					rest = rest[1:]
+					continue
+				}
+				if f == "-u" || f == "--unset" || f == "-P" || f == "-S" || f == "-C" || f == "--chdir" || f == "--split-string" {
+					if len(rest) >= 2 {
+						rest = rest[2:]
+					} else {
+						rest = rest[1:]
+					}
+					continue
+				}
+				if strings.HasPrefix(f, "--unset=") || strings.HasPrefix(f, "--chdir=") || strings.HasPrefix(f, "-u") && len(f) > 2 {
+					rest = rest[1:]
+					continue
+				}
+				if strings.HasPrefix(f, "-") && f != "-" {
+					// unknown env flag (single token); skip conservatively
+					rest = rest[1:]
+					continue
+				}
+				eq := strings.IndexByte(f, '=')
+				if eq > 0 {
+					rest = rest[1:]
+					continue
+				}
+				break // utility
+			}
+			if len(rest) == 0 || len(rest) >= len(fields) {
+				return fields // no utility / no progress
+			}
+			fields = rest
+			continue
+		case "command":
+			// command [-pVv] name [arg ...]
+			rest := fields[1:]
+			for len(rest) > 0 {
+				f := rest[0]
+				if f == "-p" || f == "-v" || f == "-V" {
+					rest = rest[1:]
+					continue
+				}
+				if strings.HasPrefix(f, "-") {
+					rest = rest[1:]
+					continue
+				}
+				break
+			}
+			if len(rest) == 0 {
+				return fields
+			}
+			fields = rest
+			continue
+		default:
+			return fields
+		}
+	}
+	return fields
 }
 
 // parseGitArgv skips git global options and returns (subcommand, remaining args).

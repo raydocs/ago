@@ -16,7 +16,7 @@ Responds to Codex follow-up audit `claudex-workflow-v1.4.4-codex-followup.md`.
 | T4 admission | **fixed**: unknown-only single structural package admits; known+unknown rejects; no fabricated API+UI for lone `internal/pkg` paths |
 | T5 strict Agent | opt-in retained |
 | T6 turns | **fixed**: aggregate `turn_accounting_quality` is worst-of (`unknown > upper_bound > exact`); exact cannot upgrade prior upper_bound |
-| T7 promote | **fixed**: major human_correction / child failed_calls / duration-token cohort non-inferiority gates before `eligible_for_manual_promote_review` |
+| T7 promote | **improved / partial**: schema + major-correction / child-failure / cohort stability gates before `eligible_for_manual_promote_review`; still requires human `--confirm`. Real RouteRecord often lacks explicit `family` (falls back to `plan.kind`); non-inferiority is **within-cohort stability**, not a strict A/B vs alternate route baseline |
 | T8 Luna | procedure only (unchanged) |
 | T9/T10 | **not completed / deferred** |
 | T11 | **fixed**: argv-style destructive git (`git -C`, any-position `--force`/`-f`/`--hard`) |

@@ -170,6 +170,12 @@ func TestBashIsDestructiveGitArgvVariants(t *testing.T) {
 		"git push origin main -f",
 		"/usr/bin/git --no-pager -C /tmp reset --hard",
 		"git push --force-with-lease=main origin main",
+		"env git reset --hard HEAD",
+		"/usr/bin/env git push origin main --force",
+		"command git reset --hard HEAD",
+		"env -i PATH=/usr/bin git -C . reset --hard",
+		"command -p git push origin main -f",
+		"FOO=1 env git reset --hard HEAD",
 	}
 	for _, cmd := range deny {
 		if !bashIsDestructiveGit(json.RawMessage(`{"command":` + jsonString(cmd) + `}`)) {
@@ -180,12 +186,28 @@ func TestBashIsDestructiveGitArgvVariants(t *testing.T) {
 		"git status",
 		"git push origin main",
 		"git reset --soft HEAD~1",
-		"echo git reset --hard", // not a git argv invocation as first field after chain? Actually whole segment is echo...
+		"echo git reset --hard",
+		"env echo git reset --hard",
 	}
 	for _, cmd := range allow {
 		if bashIsDestructiveGit(json.RawMessage(`{"command":` + jsonString(cmd) + `}`)) {
 			t.Fatalf("expected allow: %q", cmd)
 		}
+	}
+}
+
+func TestPromptTokensDoNotDoubleCountCacheCreation(t *testing.T) {
+	// Aggregate + nested present with same mass → count aggregate once (6000 not 9000).
+	line := []byte(`{"message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":2000,"cache_creation_input_tokens":3000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":3000},"output_tokens":1}}}`)
+	n, ok := promptTokensFromTranscriptLine(line)
+	if !ok || n != 6000 {
+		t.Fatalf("got n=%d ok=%v want 6000 (input+cache_read+aggregate creation only)", n, ok)
+	}
+	// Nested-only path still works when aggregate absent.
+	nestedOnly := []byte(`{"message":{"usage":{"input_tokens":100,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20},"output_tokens":1}}}`)
+	n2, ok2 := promptTokensFromTranscriptLine(nestedOnly)
+	if !ok2 || n2 != 130 {
+		t.Fatalf("nested-only got n=%d ok=%v want 130", n2, ok2)
 	}
 }
 
