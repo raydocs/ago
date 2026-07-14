@@ -9,13 +9,16 @@ import {
   summarizeExecutions,
   formatCompactLabel,
   detectHandoffSticky,
+  collectObservedModels,
+  underAttributedModels,
   cacheHitRate,
   honestCostLabel,
   isHousekeepingTool,
   shortToolName,
 } from "./timeline-model.mjs";
 
-const APP_VERSION = "0.3.0";
+const APP_VERSION = "0.3.1";
+const TURN_RENDER_CHUNK = 8;
 const state = {
   threads: [],
   currentID: null,
@@ -713,11 +716,22 @@ function renderThreadBadges(graph) {
   const host = $("#thread-badges");
   if (!host) return;
   host.replaceChildren();
-  const events = Array.isArray(graph.events) ? graph.events : [];
-  const { sticky, handoff } = detectHandoffSticky(events);
-  const flags = [];
-  if (sticky) flags.push(["Sticky · ack required", "badge-sticky"]);
-  if (handoff) flags.push(["Handoff", "badge-handoff"]);
+  // Degrade-friendly: no events / no matches → hide quietly (never throw).
+  let flags = [];
+  try {
+    const events = Array.isArray(graph?.events) ? graph.events : [];
+    const detected = detectHandoffSticky(events);
+    if (detected.sticky) flags.push(["Sticky · ack required", "badge-sticky"]);
+    if (detected.handoff) flags.push(["Handoff", "badge-handoff"]);
+    if (detected.hasGate) {
+      if (detected.gateOpen && !detected.gateClose) flags.push(["Gate · open", "badge-gate"]);
+      else if (detected.gateClose && !detected.gateOpen) flags.push(["Gate · cleared", "badge-gate"]);
+      else if (detected.gateOpen && detected.gateClose) flags.push(["Gate", "badge-gate"]);
+      else flags.push(["Gate", "badge-gate"]);
+    }
+  } catch {
+    flags = [];
+  }
   if (!flags.length) {
     host.hidden = true;
     return;
@@ -1058,6 +1072,7 @@ function eventsForHumanView(graph) {
 function renderTurns(graph) {
   const list = $("#event-list");
   list.replaceChildren();
+  const token = ++state.renderToken;
   const allScoped = (() => {
     const events = Array.isArray(graph.events) ? graph.events : [];
     const rootID = graph.thread?.session_id;
@@ -1073,7 +1088,9 @@ function renderTurns(graph) {
     list.append(inlineState(
       state.timelineMode === "errors"
         ? "No failed events in this Thread."
-        : "No canonical events recorded for this Thread.",
+        : state.timelineMode === "full"
+          ? "No canonical events recorded for this Thread."
+          : "No decision-path events for this Thread. Try Full mode.",
     ));
     hideOutlineScrubber();
     return;
@@ -1090,13 +1107,28 @@ function renderTurns(graph) {
   }
   state._compactIndex = compactIndex;
 
+  // Progressive paint for d791-scale threads (P5): keep first paint interactive.
   const turns = deriveTurns(events);
-  for (const turn of turns) list.append(renderTurn(turn, graph));
-  // Outline positions need layout; measure on next frame.
-  requestAnimationFrame(() => {
-    rebuildOutlineMarks();
-    updateOutlineThumb();
-  });
+  let index = 0;
+  const paintChunk = () => {
+    if (token !== state.renderToken) return;
+    const frag = document.createDocumentFragment();
+    const end = Math.min(index + TURN_RENDER_CHUNK, turns.length);
+    for (; index < end; index += 1) {
+      frag.append(renderTurn(turns[index], graph));
+    }
+    list.append(frag);
+    if (index < turns.length) {
+      requestAnimationFrame(paintChunk);
+      return;
+    }
+    requestAnimationFrame(() => {
+      if (token !== state.renderToken) return;
+      rebuildOutlineMarks();
+      updateOutlineThumb();
+    });
+  };
+  paintChunk();
 }
 
 /* ── Amp outline scrubber ── */
@@ -1943,13 +1975,23 @@ function renderExecution(event, graph) {
 function renderSystemEvent(event) {
   const article = document.createElement("article");
   const failed = event.type === "error" || ["failed", "error"].includes(String(event.status || "").toLowerCase());
-  article.className = `activity-item${failed ? " failed" : ""}${event.type === "compact" ? " compact-marker" : ""}`;
+  const isGate = event.type === "gate" || event.type === "workflow";
+  article.className = [
+    "activity-item",
+    failed ? "failed" : "",
+    event.type === "compact" ? "compact-marker" : "",
+    isGate ? "gate-marker" : "",
+  ].filter(Boolean).join(" ");
   article.id = eventAnchor(event.event_id);
   const header = document.createElement("header");
   const label = document.createElement("strong");
   if (event.type === "compact") {
     const idx = state._compactIndex?.get(event.event_id) ?? 0;
     label.textContent = formatCompactLabel(event, idx);
+  } else if (event.type === "gate") {
+    label.textContent = `Gate · ${event.status || "event"}`;
+  } else if (event.type === "workflow") {
+    label.textContent = `Workflow · ${event.status || "event"}`;
   } else {
     label.textContent = event.type === "error" ? "Error" : event.type || "Event";
   }
@@ -1958,6 +2000,7 @@ function renderSystemEvent(event) {
   header.append(label, time);
   const content = document.createElement("p");
   content.className = "execution-result";
+  // Gate cloud payloads should stay class/counts only — show summary as-is, no prompt dump.
   content.textContent = event.content || event.summary || "Recorded event";
   article.append(header, content);
   return article;
@@ -2247,23 +2290,30 @@ function renderUsage(usage) {
     ? `Updated ${formatDate(totals.updated_at)} · root and descendants`
     : "No numeric usage record is available; unknown values remain unknown.";
 
-  // Honest attribution banner when graph participants include models missing from usage.
-  const modelsInUsage = new Set((usage.models || []).map((row) => String(row.model || "")));
-  const participantModels = (state.current?.participants || [])
-    .map((p) => compactModel(p.model))
-    .filter((m) => m && m !== "<synthetic>");
-  const missing = [...new Set(participantModels)].filter((m) => m && !modelsInUsage.has(m) && !modelsInUsage.has(`claude-${m}`));
-  if (missing.length || ((usage.models || []).length === 1 && participantModels.length > 1)) {
+  // Observed models from participants/worker cards (honest, non-usage).
+  const observed = collectObservedModels(
+    state.current?.participants || [],
+    state.current?.events || [],
+  );
+  const missing = underAttributedModels(observed, usage.models || []);
+  if (missing.length || ((usage.models || []).length <= 1 && observed.length > 1)) {
     const banner = document.createElement("p");
     banner.className = "usage-attribution-banner";
-    banner.textContent = "Historical under-attribution: usage may only show the supervisor model (e.g. Sol). Child/agent models appear in participants/execution when recorded; do not treat missing rows as “never ran”.";
+    const listed = missing.slice(0, 8).join(", ");
+    banner.textContent = listed
+      ? `Historical under-attribution: usage rows omit ${listed}. Those models appear under Observed executors / execution cards — do not treat missing usage rows as “never ran”.`
+      : "Historical under-attribution: usage may only show the supervisor model. Child/agent models appear in Observed executors when recorded; do not treat missing rows as “never ran”.";
     container.append(banner);
   }
 
   const defs = document.createElement("p");
   defs.className = "usage-definitions";
-  defs.textContent = "Active duration excludes idle before first model activity. Subscription ≠ invoice amount. Unpriced costs show Price pending (never $0).";
+  defs.textContent = "Active duration excludes idle before first model activity. Subscription ≠ invoice amount. Unpriced costs show Price pending (never $0). Observed executors are not billed tokens.";
   container.append(defs);
+
+  if (observed.length) {
+    container.append(observedModelsSection(observed, missing));
+  }
 
   const cacheRate = cacheHitRate(totals);
   const summary = document.createElement("dl");
@@ -2311,6 +2361,37 @@ function renderUsage(usage) {
   ]) {
     container.append(usageTable(title, rows, dimension));
   }
+}
+
+function observedModelsSection(observed, missing = []) {
+  const section = document.createElement("section");
+  section.className = "usage-section observed-models";
+  const heading = document.createElement("h3");
+  heading.textContent = "Observed executors";
+  section.append(heading);
+  const note = document.createElement("p");
+  note.className = "section-copy";
+  note.textContent = "From participants and worker/agent cards. Not usage_records — no token counts invented.";
+  section.append(note);
+  const list = document.createElement("ul");
+  list.className = "observed-model-list";
+  const missingSet = new Set(missing);
+  for (const row of observed) {
+    const item = document.createElement("li");
+    item.className = missingSet.has(row.model) ? "is-missing-usage" : "";
+    const model = document.createElement("strong");
+    model.textContent = row.model;
+    const meta = document.createElement("span");
+    meta.textContent = [
+      (row.roles || []).join("/"),
+      (row.sources || []).join("+"),
+      missingSet.has(row.model) ? "not in usage" : "",
+    ].filter(Boolean).join(" · ");
+    item.append(model, meta);
+    list.append(item);
+  }
+  section.append(list);
+  return section;
 }
 
 function usageTable(title, rows, dimension) {

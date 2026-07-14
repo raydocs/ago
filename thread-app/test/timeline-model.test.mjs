@@ -5,6 +5,8 @@ import {
   summarizeExecutions,
   formatCompactLabel,
   detectHandoffSticky,
+  collectObservedModels,
+  underAttributedModels,
   cacheHitRate,
   honestCostLabel,
   isHousekeepingTool,
@@ -53,10 +55,61 @@ test("formatCompactLabel and handoff detection", () => {
   assert.match(formatCompactLabel({ summary: "auto compact" }, 0), /Compact #1/);
   const flags = detectHandoffSticky([
     { summary: "CLAUDEX_ROOT_HANDOFF capsule ready" },
-    { content: "STICKY re-route ack required" },
+    { content: "sticky re-route ack required" },
   ]);
   assert.equal(flags.handoff, true);
   assert.equal(flags.sticky, true);
+});
+
+test("detectHandoffSticky ignores CSS position sticky and casual handoff docs", () => {
+  const flags = detectHandoffSticky([
+    { type: "tool_result", content: ".topbar { position: sticky; z-index: 20; }" },
+    { type: "message", summary: "read claudex-thread-app-handoff.md" },
+    { type: "worker", summary: "Map handoff implementation drift" },
+  ]);
+  assert.equal(flags.sticky, false);
+  assert.equal(flags.handoff, false);
+  assert.equal(flags.hasGate, false);
+});
+
+test("detectHandoffSticky gate events degrade-friendly", () => {
+  const empty = detectHandoffSticky([]);
+  assert.equal(empty.hasGate, false);
+  assert.equal(empty.sticky, false);
+  const gated = detectHandoffSticky([
+    { type: "gate", status: "active", summary: "gate:open" },
+    { type: "gate", status: "cleared", summary: "gate:cleared" },
+  ]);
+  assert.equal(gated.hasGate, true);
+  assert.equal(gated.gateOpen, true);
+  assert.equal(gated.gateClose, true);
+  // Decision mode keeps gate rows
+  const decision = filterEventsByMode([{ type: "gate", status: "open" }, { type: "tool_call", tool_name: "TaskCreate" }], "decision");
+  assert.equal(decision.some((e) => e.type === "gate"), true);
+  assert.equal(decision.some((e) => e.tool_name === "TaskCreate"), false);
+});
+
+test("collectObservedModels and underAttributedModels stay honest", () => {
+  const observed = collectObservedModels(
+    [
+      { role: "supervisor", model: "gpt-5.6-sol" },
+      { role: "agent", model: "claude-sonnet-5" },
+      { role: "assistant", model: "<synthetic>" },
+    ],
+    [
+      { type: "worker", role: "agent", model: "claude-opus-4-8[1m]" },
+      { type: "message", model: "ignored" },
+    ],
+  );
+  assert.deepEqual(observed.map((r) => r.model).sort(), [
+    "claude-opus-4-8[1m]",
+    "claude-sonnet-5",
+    "gpt-5.6-sol",
+  ]);
+  const missing = underAttributedModels(observed, [{ model: "gpt-5.6-sol" }]);
+  assert.ok(missing.includes("claude-sonnet-5"));
+  assert.ok(missing.includes("claude-opus-4-8[1m]"));
+  assert.equal(missing.includes("gpt-5.6-sol"), false);
 });
 
 test("honestCostLabel never fakes zero dollars", () => {

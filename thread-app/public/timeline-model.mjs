@@ -49,13 +49,14 @@ export function filterEventsByMode(events, mode = "decision") {
       return false;
     });
   }
-  // decision: messages, workers, compact, errors, non-housekeeping tools
+  // decision: messages, workers, compact, errors, gate/workflow, non-housekeeping tools
   // (tool results paired with calls are still dropped later by deriveTurns)
   return list.filter((event) => {
     if (event.type === "message") return true;
     if (event.type === "worker") return true;
     if (event.type === "compact") return true;
     if (event.type === "error") return true;
+    if (event.type === "gate" || event.type === "workflow") return true;
     if (isFailedStatus(event.status)) return true;
     if (event.type === "tool_call") {
       if (isHousekeepingTool(event.tool_name)) return false;
@@ -122,16 +123,118 @@ export function formatCompactLabel(event, index = 0) {
   return bits.join(" · ");
 }
 
+/**
+ * Infer sticky / handoff / gate flags from events.
+ * Degrades to all-false when nothing matches — never throws.
+ * Avoid matching CSS `position: sticky` or casual "handoff" docs.
+ */
 export function detectHandoffSticky(events) {
   const list = Array.isArray(events) ? events : [];
   let sticky = false;
   let handoff = false;
+  let gateOpen = false;
+  let gateClose = false;
+  let gateEvents = 0;
+
   for (const event of list) {
-    const blob = `${event.summary || ""} ${event.content || ""}`;
-    if (/CLAUDEX_ROOT_HANDOFF|HANDOFF_REQUIRED|handoff_required/i.test(blob)) handoff = true;
-    if (/CLAUDEX_STICKY|STICKY|sticky re-?route/i.test(blob)) sticky = true;
+    try {
+      const type = String(event?.type || "").toLowerCase();
+      if (type === "gate" || type === "workflow") {
+        gateEvents += 1;
+        const status = String(event?.status || "").toLowerCase();
+        if (status === "active" || status === "open" || status === "required") gateOpen = true;
+        if (status === "cleared" || status === "close" || status === "closed") gateClose = true;
+      }
+
+      const blob = [
+        event?.summary,
+        event?.content,
+        event?.raw?.class,
+        event?.raw?.kind,
+        event?.status,
+      ].filter(Boolean).join(" ");
+      if (!blob) continue;
+
+      // Explicit runtime markers only — not docs titled *handoff*.md
+      if (/CLAUDEX_ROOT_HANDOFF|\bHANDOFF_REQUIRED\b|\bhandoff_required\b/i.test(blob)) {
+        handoff = true;
+      }
+      // Avoid CSS `position: sticky` (common in tool_result dumps)
+      if (
+        /CLAUDEX_STICKY/i.test(blob)
+        || /\bsticky[_ -]?re-?route\b/i.test(blob)
+        || /\bsticky\b[^\n]{0,48}\back(?:nowledg(?:e|ment))? required\b/i.test(blob)
+      ) {
+        sticky = true;
+      }
+      if (/\bgate:(open|close|active|cleared)\b/i.test(blob) || /CLAUDEX_GATE_/i.test(blob)) {
+        gateEvents += 1;
+        if (/gate:open|gate:active|CLAUDEX_GATE_OPEN|required/i.test(blob)) gateOpen = true;
+        if (/gate:close|gate:cleared|CLAUDEX_GATE_CLEAR/i.test(blob)) gateClose = true;
+      }
+    } catch {
+      // degrade-friendly: skip malformed events
+    }
   }
-  return { sticky, handoff };
+
+  return {
+    sticky,
+    handoff,
+    gateOpen,
+    gateClose,
+    hasGate: gateEvents > 0,
+    gateEvents,
+  };
+}
+
+/**
+ * Models observed on participants / worker cards (not usage_records).
+ * Used to surface under-attribution honestly without inventing tokens.
+ */
+export function collectObservedModels(participants = [], events = []) {
+  const map = new Map();
+  const upsert = (model, role, source) => {
+    const m = String(model || "").trim();
+    if (!m || m === "<synthetic>") return;
+    let row = map.get(m);
+    if (!row) {
+      row = { model: m, roles: new Set(), sources: new Set() };
+      map.set(m, row);
+    }
+    if (role) row.roles.add(String(role));
+    if (source) row.sources.add(source);
+  };
+
+  for (const p of Array.isArray(participants) ? participants : []) {
+    upsert(p?.model, p?.role, "participant");
+  }
+  for (const event of Array.isArray(events) ? events : []) {
+    if (event?.type !== "worker") continue;
+    const model = event.model || event.raw?.resolved_model || event.raw?.requested_model;
+    upsert(model, event.role || "worker", "execution");
+  }
+
+  return [...map.values()]
+    .map((row) => ({
+      model: row.model,
+      roles: [...row.roles].sort(),
+      sources: [...row.sources].sort(),
+    }))
+    .sort((a, b) => a.model.localeCompare(b.model));
+}
+
+/**
+ * Models present in observed executors but missing from usage.models.
+ */
+export function underAttributedModels(observed, usageModels = []) {
+  const billed = new Set(
+    (Array.isArray(usageModels) ? usageModels : [])
+      .map((row) => String(row?.model || row || "").trim())
+      .filter(Boolean),
+  );
+  return (Array.isArray(observed) ? observed : [])
+    .map((row) => row.model)
+    .filter((model) => model && !billed.has(model));
 }
 
 export function cacheHitRate(row) {

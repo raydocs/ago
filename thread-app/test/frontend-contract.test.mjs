@@ -58,3 +58,16 @@ test("panel handoff chrome: timeline modes + execution strip", async () => {
   assert.match(javascript, /timelineMode/);
   assert.match(javascript, /Price pending/);
 });
+
+test("panel P4/P5: gate badges, observed models, progressive turns", async () => {
+  const { html, javascript } = await frontendSources();
+  assert.match(html, /id="thread-badges"/);
+  assert.match(javascript, /detectHandoffSticky/);
+  assert.match(javascript, /collectObservedModels/);
+  assert.match(javascript, /underAttributedModels/);
+  assert.match(javascript, /Observed executors/);
+  assert.match(javascript, /TURN_RENDER_CHUNK/);
+  assert.match(javascript, /badge-gate/);
+  assert.match(javascript, /APP_VERSION = "0\.3\.1"/);
+  assert.match(html, /\?r=panel2/);
+});

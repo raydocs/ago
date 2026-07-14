@@ -744,6 +744,7 @@ body.rail-collapsed .outline-scrubber {
 }
 .thread-badge.badge-sticky { border-color: color-mix(in srgb, var(--amber) 40%, var(--line)); color: var(--amber); }
 .thread-badge.badge-handoff { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); color: var(--accent); }
+.thread-badge.badge-gate { border-color: color-mix(in srgb, var(--ink-3) 35%, var(--line)); color: var(--ink-2); }
 
 .execution-strip {
   margin: 0 0 12px;
@@ -832,6 +833,16 @@ body.rail-collapsed .outline-scrubber {
   display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
 }
 .compact-marker strong { font-size: 12.5px; }
+.gate-marker {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--line));
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+.gate-marker header {
+  display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
+}
+.gate-marker strong { font-size: 12.5px; }
 .usage-attribution-banner {
   margin: 0 0 10px;
   padding: 8px 10px;
@@ -855,10 +866,45 @@ body.rail-collapsed .outline-scrubber {
   display: block; height: 100%;
   background: color-mix(in srgb, var(--accent) 55%, var(--surface-2));
 }
+.observed-model-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.observed-model-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 12px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  font-size: 12.5px;
+}
+.observed-model-list li strong {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-weight: 600;
+  color: var(--ink);
+}
+.observed-model-list li span { color: var(--ink-4); }
+.observed-model-list li.is-missing-usage {
+  border-color: color-mix(in srgb, var(--amber) 35%, var(--line));
+}
 
 /* ── Conversation (Amp public + app hybrid) ── */
 .turn-list { display: flex; flex-direction: column; gap: 16px; }
-.turn-card { display: flex; flex-direction: column; gap: 12px; }
+.turn-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* P5: skip offscreen layout work on large threads (d791-scale) */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
+}
 
 .user-bubble {
   align-self: flex-end;
