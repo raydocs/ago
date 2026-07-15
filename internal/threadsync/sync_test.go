@@ -367,3 +367,37 @@ func TestCollectSpoolsAndFlushes(t *testing.T) {
 		t.Fatalf("flush sent=%d pending=%d err=%v", sent, pending, err)
 	}
 }
+
+func TestCleanupEphemeralSecurityKeyIsTerminalAndFailClosed(t *testing.T) {
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, "logs", "security")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(dir, ".security-key")
+	if err := os.WriteFile(key, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cleanupEphemeralSecurityKey(map[string]any{"hook_event_name": "PostToolUse", "cwd": cwd})
+	if _, err := os.Stat(key); err != nil {
+		t.Fatalf("non-terminal hook removed key: %v", err)
+	}
+	cleanupEphemeralSecurityKey(map[string]any{"hook_event_name": "Stop", "cwd": cwd})
+	if _, err := os.Stat(filepath.Join(cwd, "logs")); !os.IsNotExist(err) {
+		t.Fatalf("terminal hook did not remove empty plumbing tree: %v", err)
+	}
+
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(key, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "audit.log"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cleanupEphemeralSecurityKey(map[string]any{"hook_event_name": "SessionEnd", "cwd": cwd})
+	if _, err := os.Stat(key); err != nil {
+		t.Fatalf("cleanup touched directory with real logs: %v", err)
+	}
+}

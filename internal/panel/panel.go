@@ -19,7 +19,7 @@ type Outcome struct {
 // Run executes the explicit high-cost mode: two independent answers and one
 // judge. It is never called by the normal workflow path.
 func Run(ctx context.Context, settings, workDir, task string, timeout time.Duration) Outcome {
-	models := []struct{ model, effort string }{{"gpt-5.6-sol", "xhigh"}, {"gemini-3.1-pro", "high"}}
+	models := []struct{ model, effort string }{{"gpt-5.6-sol", "high"}, {"gemini-3.1-pro", "high"}}
 	results := make([]claude.Result, len(models))
 	var wg sync.WaitGroup
 	for i, m := range models {

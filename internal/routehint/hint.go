@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 
+	"claudexflow/internal/fastpath"
 	"claudexflow/internal/router"
 )
 
@@ -42,6 +43,11 @@ func Build(reader io.Reader) ([]byte, error) {
 	}
 	if in.HookEventName != "UserPromptSubmit" || strings.TrimSpace(in.Prompt) == "" {
 		return nil, nil
+	}
+	if contract, ok := fastpath.Parse(in.Prompt); ok {
+		return json.Marshal(hookOutput{HookSpecificOutput: specificOutput{
+			HookEventName: "UserPromptSubmit", AdditionalContext: fastpath.Context(contract),
+		}})
 	}
 	plan, err := router.PlanRoute(router.RouteRequest{Objective: in.Prompt})
 	if err != nil || plan.Action != router.ActionCapability || plan.SelectedLane.Tool == "" {

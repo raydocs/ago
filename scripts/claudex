@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# claudex — supervisor launcher for Claude X.
-# Parses all args (handoff may appear anywhere). --from-handoff forbids --resume/--continue.
+# claudex — lean supervisor launcher for Claude X.
+# Root: GPT-5.6 Sol with launch-time dynamic effort. Worker/search: Grok 4.5 high.
 set -euo pipefail
 
 export CLAUDEX_THREAD_MODEL="${CLAUDEX_THREAD_MODEL:-gpt-5.6-sol}"
-export CLAUDEX_THREAD_EFFORT="${CLAUDEX_THREAD_EFFORT:-xhigh}"
 export CLAUDEX_THREAD_ROLE="${CLAUDEX_THREAD_ROLE:-supervisor}"
+export CLAUDEX_WORKFLOW_STRICT="${CLAUDEX_WORKFLOW_STRICT:-1}"
+export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-grok-4.5}"
+export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-3}"
+export CLAUDE_CODE_ENABLE_TASKS="${CLAUDE_CODE_ENABLE_TASKS:-false}"
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-false}"
 export MCP_TOOL_TIMEOUT="${MCP_TOOL_TIMEOUT:-120000}"
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-272000}"
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
@@ -13,7 +18,13 @@ export CLAUDEX_STALL_TIMEOUT_SECONDS="${CLAUDEX_STALL_TIMEOUT_SECONDS:-300}"
 
 _claudex_handoff=""
 _claudex_has_resume=0
+_claudex_has_model=0
+_claudex_has_effort=0
+_claudex_has_tools=0
+_claudex_has_setting_sources=0
+_claudex_has_permission=0
 _claudex_out=()
+_claudex_prompt_probe=()
 
 while (($#)); do
   case "$1" in
@@ -38,7 +49,6 @@ while (($#)); do
       _claudex_has_resume=1
       _claudex_out+=("$1")
       shift
-      # Optional session id value for --resume SESSION
       if (($#)) && [[ "$1" != -* ]]; then
         export CLAUDEX_THREAD_ROOT_SESSION_ID="$1"
         _claudex_out+=("$1")
@@ -53,7 +63,77 @@ while (($#)); do
       _claudex_out+=("$1")
       shift
       ;;
+    --model)
+      _claudex_has_model=1
+      _claudex_out+=("$1")
+      shift
+      if (($# == 0)); then echo "claudex: --model requires a value" >&2; exit 2; fi
+      export CLAUDEX_THREAD_MODEL="$1"
+      _claudex_out+=("$1")
+      shift
+      ;;
+    --model=*)
+      _claudex_has_model=1
+      export CLAUDEX_THREAD_MODEL="${1#--model=}"
+      _claudex_out+=("$1")
+      shift
+      ;;
+    --effort)
+      _claudex_has_effort=1
+      _claudex_out+=("$1")
+      shift
+      if (($# == 0)); then echo "claudex: --effort requires a value" >&2; exit 2; fi
+      export CLAUDEX_THREAD_EFFORT="$1"
+      _claudex_out+=("$1")
+      shift
+      ;;
+    --effort=*)
+      _claudex_has_effort=1
+      export CLAUDEX_THREAD_EFFORT="${1#--effort=}"
+      _claudex_out+=("$1")
+      shift
+      ;;
+    --tools)
+      _claudex_has_tools=1
+      _claudex_out+=("$1")
+      shift
+      if (($# == 0)); then echo "claudex: --tools requires a value" >&2; exit 2; fi
+      _claudex_out+=("$1")
+      shift
+      ;;
+    --tools=*)
+      _claudex_has_tools=1
+      _claudex_out+=("$1")
+      shift
+      ;;
+    --setting-sources)
+      _claudex_has_setting_sources=1
+      _claudex_out+=("$1")
+      shift
+      if (($# == 0)); then echo "claudex: --setting-sources requires a value" >&2; exit 2; fi
+      _claudex_out+=("$1")
+      shift
+      ;;
+    --setting-sources=*)
+      _claudex_has_setting_sources=1
+      _claudex_out+=("$1")
+      shift
+      ;;
+    --permission-mode)
+      _claudex_has_permission=1
+      _claudex_out+=("$1")
+      shift
+      if (($# == 0)); then echo "claudex: --permission-mode requires a value" >&2; exit 2; fi
+      _claudex_out+=("$1")
+      shift
+      ;;
+    --permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
+      _claudex_has_permission=1
+      _claudex_out+=("$1")
+      shift
+      ;;
     *)
+      _claudex_prompt_probe+=("$1")
       _claudex_out+=("$1")
       shift
       ;;
@@ -71,6 +151,60 @@ _settings="${CLAUDEX_SETTINGS:-$HOME/.config/claudex/settings.json}"
 _mcp="${CLAUDEX_MCP_CONFIG:-$HOME/.config/claudex/mcp.json}"
 _orch="${CLAUDEX_ORCHESTRATOR:-$HOME/.config/claudex/orchestrator.md}"
 
+# Claude Code fixes effort for one Root process, so "dynamic" means resolving
+# the cheapest safe level before launch and routing child workstreams separately.
+if [[ "$_claudex_has_effort" -eq 0 ]]; then
+  _effort_policy="${CLAUDEX_THREAD_EFFORT:-auto}"
+  case "$_effort_policy" in
+    medium|high|xhigh) _resolved_effort="$_effort_policy" ;;
+    auto)
+      _probe=" ${_claudex_prompt_probe[*]-} "
+      if [[ "$_probe" =~ (security|oauth|authentication|authorization|payment|production|migration|architecture|irreversible|data[[:space:]_-]*loss|race[[:space:]_-]*condition|concurrency|sandbox|permission|安全|认证|权限|支付|生产|迁移|架构|不可逆|数据丢失|竞态) ]]; then
+        _resolved_effort="xhigh"
+      elif [[ "$_probe" =~ (small|tiny|trivial|quick|read-only|readonly|typo|single-file|one[[:space:]_-]*file|小型|简单|只读|单文件|快速|文案|拼写) ]]; then
+        _resolved_effort="medium"
+      else
+        _resolved_effort="high"
+      fi
+      ;;
+    *) echo "claudex: CLAUDEX_THREAD_EFFORT must be auto, medium, high, or xhigh" >&2; exit 2 ;;
+  esac
+  export CLAUDEX_THREAD_EFFORT="$_resolved_effort"
+fi
+
+_launch=(
+  --settings "$_settings"
+  --strict-mcp-config
+  --mcp-config "$_mcp"
+  --append-system-prompt-file "$_orch"
+)
+if [[ "$_claudex_has_setting_sources" -eq 0 ]]; then
+  # Keep project/local instructions, but exclude unrelated user plugins/hooks.
+  _launch+=(--setting-sources "project,local")
+fi
+if [[ "$_claudex_has_model" -eq 0 ]]; then
+  _launch+=(--model "${CLAUDEX_THREAD_MODEL}")
+fi
+if [[ "$_claudex_has_effort" -eq 0 ]]; then
+  _launch+=(--effort "${CLAUDEX_THREAD_EFFORT}")
+fi
+if [[ "$_claudex_has_tools" -eq 0 ]]; then
+  _launch+=(--tools "${CLAUDEX_TOOLS:-Read,Grep,Glob,Bash,Edit,Write}")
+fi
+if [[ "$_claudex_has_permission" -eq 0 ]]; then
+  case "${CLAUDEX_PERMISSION_MODE:-auto}" in
+    bypassPermissions) _launch+=(--dangerously-skip-permissions) ;;
+    auto|acceptEdits|manual|dontAsk|plan) _launch+=(--permission-mode "${CLAUDEX_PERMISSION_MODE:-auto}") ;;
+    *) echo "claudex: unsupported CLAUDEX_PERMISSION_MODE" >&2; exit 2 ;;
+  esac
+fi
+
+if [[ "${CLAUDEX_ROUTE_RECEIPT:-1}" == "1" ]]; then
+  printf 'claudex route: root=%s/%s worker=grok-4.5/high strict=%s lean_tools=%s\n' \
+    "$CLAUDEX_THREAD_MODEL" "$CLAUDEX_THREAD_EFFORT" "$CLAUDEX_WORKFLOW_STRICT" \
+    "${CLAUDEX_TOOLS:-Read,Grep,Glob,Bash,Edit,Write}" >&2
+fi
+
 if [[ -n "$_claudex_handoff" ]]; then
   case "$_claudex_handoff" in
     /*) ;;
@@ -80,17 +214,7 @@ if [[ -n "$_claudex_handoff" ]]; then
     echo "claudex: handoff file not found: $_claudex_handoff" >&2
     exit 2
   fi
-  # Seed first user message from capsule; never auto-spawn — user invoked this CLI.
-  # Do not pass --resume/--continue (already rejected above).
-  exec claude \
-    --settings "$_settings" \
-    --mcp-config "$_mcp" \
-    --append-system-prompt-file "$_orch" \
-    --model "${CLAUDEX_THREAD_MODEL}" \
-    --effort "${CLAUDEX_THREAD_EFFORT}" \
-    --dangerously-skip-permissions \
-    "$@" \
-    "Continue from Claude X handoff capsule at ${_claudex_handoff}.
+  exec claude "${_launch[@]}" "$@" "Continue from Claude X handoff capsule at ${_claudex_handoff}.
 
 Re-anchor from current files and runtime state before acting.
 Do not resume construction on the previous Root.
@@ -102,11 +226,4 @@ $(cat "$_claudex_handoff")
 "
 fi
 
-exec claude \
-  --settings "$_settings" \
-  --mcp-config "$_mcp" \
-  --append-system-prompt-file "$_orch" \
-  --model "${CLAUDEX_THREAD_MODEL}" \
-  --effort "${CLAUDEX_THREAD_EFFORT}" \
-  --dangerously-skip-permissions \
-  "$@"
+exec claude "${_launch[@]}" "$@"

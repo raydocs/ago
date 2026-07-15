@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic redaction fixtures used only by sanitizer tests"
+regexTarget = "match"
+regexes = [
+  '''Authorization: Bearer secret-token-value''',
+  '''top-secret''',
+  '''api_key=abc123456789''',
+  '''sk-abcdefghijklmnop''',
+  '''aabbccddeeff00112233445566778899''',
+  '''aabbccddeeff00112233445566778899\.ExampleToken1234'''
+]

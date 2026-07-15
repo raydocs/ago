@@ -11,7 +11,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const ContractVersion = "claudex-workflow.v1.4.6"
+const ContractVersion = "claudex-workflow.v1.7.9"
 
 type RuntimeContract struct {
 	Version           string   `json:"version"`
@@ -22,14 +22,19 @@ type RuntimeContract struct {
 }
 
 func Contract() RuntimeContract {
+	supervisorEffort := strings.TrimSpace(os.Getenv("CLAUDEX_THREAD_EFFORT"))
+	if supervisorEffort != "medium" && supervisorEffort != "high" && supervisorEffort != "xhigh" {
+		supervisorEffort = "high"
+	}
 	return RuntimeContract{
 		Version:           ContractVersion,
-		SupervisorProfile: "gpt-5.6-sol/xhigh",
+		SupervisorProfile: "gpt-5.6-sol/" + supervisorEffort,
 		WorkerProfile:     workerModel + "/" + workerEffort,
 		Tools: []string{
 			"route_task",
 			"record_route_outcome",
 			"start_worker",
+			"collect_worker",
 			"resume_worker",
 			"search_external",
 			"digest_urls",

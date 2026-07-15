@@ -14,6 +14,7 @@ EXPECTED_TOOLS = {
     "route_task",
     "record_route_outcome",
     "start_worker",
+    "collect_worker",
     "resume_worker",
     "search_external",
     "digest_urls",
@@ -23,12 +24,20 @@ EXPECTED_TOOLS = {
     "consult_native_claude",
     "close_worker",
     "workflow_status",
+    "declare_gate",
+    "close_gate",
+    "ack_reroute",
+    "gate_status",
     "runtime_contract",
 }
 EXPECTED_FIELDS = [
+    "background",
     "context",
     "deadline_ms",
     "done_condition",
+    "estimate_basis",
+    "estimated_parallel_savings_seconds",
+    "estimated_worker_seconds",
     "marginal_contribution",
     "objective",
     "output_contract",
@@ -42,9 +51,6 @@ EXPECTED_FIELDS = [
 EXPECTED_REQUIRED = {
     "slice_id",
     "objective",
-    "marginal_contribution",
-    "output_contract",
-    "done_condition",
 }
 
 
@@ -132,6 +138,38 @@ def main():
         assert sorted(start["inputSchema"]["properties"]) == EXPECTED_FIELDS
         assert set(start["inputSchema"]["required"]) == EXPECTED_REQUIRED
 
+        route_tool = next(tool for tool in tools if tool["name"] == "route_task")
+        route_properties = route_tool["inputSchema"]["properties"]
+        assert route_properties["checkability"]["enum"] == [
+            "auto",
+            "objective",
+            "partial",
+            "semantic",
+        ]
+        assert route_properties["topology"]["enum"] == ["auto", "direct", "worker"]
+        assert route_properties["risk"]["enum"] == ["normal", "high"]
+        assert route_properties["independent_slices"]["minimum"] == 0
+        assert route_properties["independent_slices"]["maximum"] == 3
+
+        # The schema rejects plausible but unsupported synonyms before the
+        # router creates an open route or consumes a recovery turn.
+        mcp.send(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "route_task",
+                    "arguments": {
+                        "objective": "Implement an objectively testable parser.",
+                        "checkability": "direct",
+                    },
+                },
+            }
+        )
+        invalid_enum = mcp.receive(10)["result"]
+        assert invalid_enum.get("isError") is True
+
         mcp.send(
             {
                 "jsonrpc": "2.0",
@@ -183,6 +221,10 @@ def main():
                         "worker_marginal_contribution": "Own the isolated parser implementation so the supervisor only verifies it.",
                         "independent_slices": 1,
                         "checkability": "objective",
+                        "topology": "worker",
+                        "estimated_worker_seconds": 120,
+                        "estimated_parallel_savings_seconds": 60,
+                        "estimate_basis": "bounded contract canary with a deterministic verifier",
                     },
                 },
             }
@@ -191,8 +233,13 @@ def main():
         assert route["route_id"].startswith("route-")
         assert route["action"] == "bounded_worker"
         assert route["selected_lane"]["tool"] == "start_worker"
-        assert route["accounting_unit"] == "relative_resource_intensity"
-        assert route["durable_default"] is False
+        assert route["acceptance_ready"] is True
+        assert route["root_verifier"]["status"] == "available"
+        assert route["root_verifier"]["command"] == "go test ./parser"
+        assert route["root_verifier"]["source"] == "route_request"
+        assert route["root_verifier"]["setup_allowed"] is False
+        assert "candidate_comparison" not in route
+        assert "surface" not in route
 
         mcp.send(
             {
@@ -274,16 +321,16 @@ def main():
             }
         )
         status = mcp.receive(5)["result"]["structuredContent"]
-        assert status["contract"]["version"] == "claudex-workflow.v1.3"
+        assert status["contract"]["version"] == "claudex-workflow.v1.7.9"
         assert status["worker_starts"] == 0
         assert status["worker_turns"] == 0
         assert status["active_runs"] == 0
         assert status["workers"] == []
         assert status["thread_find_calls"] == 1
-        assert status["slices"][0]["state"] == "rejected"
+        # Strict mode rejects an unbound packet before reserving a slice or
+        # consuming any model/worker budget.
+        assert status["slices"] == []
         assert any(item["route_id"] == route["route_id"] and item["state"] == "abandoned" for item in status["routes"])
-        assert "identity" not in status["slices"][0]
-        assert "usage" not in status["slices"][0]
 
         print(
             json.dumps(

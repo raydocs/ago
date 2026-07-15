@@ -14,7 +14,7 @@ import (
 const (
 	stateFileMode = 0o600
 	stateDirMode  = 0o700
-	schemaVersion = 2
+	schemaVersion = 4
 )
 
 // Root-level budgets (never reset by declare_gate).
@@ -121,6 +121,16 @@ type state struct {
 	TranscriptPath string   `json:"transcript_path,omitempty"`
 	PathHints      []string `json:"path_hints,omitempty"`
 	TokenSource    string   `json:"token_source,omitempty"` // hook | transcript | ""
+
+	// Fast Path is scoped to the current user turn. A successful deterministic
+	// verifier latches VerifiedStop so the model cannot drift into post-PASS work.
+	FastPathActive   bool   `json:"fast_path_active,omitempty"`
+	FastPathTarget   string `json:"fast_path_target,omitempty"`
+	FastPathVerifier string `json:"fast_path_verifier,omitempty"`
+	FastPathEdited   bool   `json:"fast_path_edited,omitempty"`
+	FastPathDiffSeen bool   `json:"fast_path_diff_seen,omitempty"`
+	VerifiedStop     bool   `json:"verified_stop,omitempty"`
+	VerifiedReason   string `json:"verified_reason,omitempty"`
 }
 
 type gateEvent struct {
@@ -174,6 +184,12 @@ func loadStateUnlocked(dir, sessionID string) (state, error) {
 	}
 	if st.OpenGate != nil && st.OpenGate.VerifyCounts == nil {
 		st.OpenGate.VerifyCounts = map[string]int{}
+	}
+	// v1.5.0 stored only a boolean Fast Path marker. Never carry that soft
+	// marker into the v2 hard gate without a frozen target and verifier.
+	if st.FastPathActive && (strings.TrimSpace(st.FastPathTarget) == "" || strings.TrimSpace(st.FastPathVerifier) == "") {
+		st.FastPathActive = false
+		st.FastPathEdited = false
 	}
 	return st, nil
 }

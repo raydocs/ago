@@ -72,7 +72,9 @@ func main() {
 			err = printJSON(map[string]any{"changed": changed, "hooks": "route-hint+supervisor-gate"})
 		}
 	case "route-hint":
-		if os.Getenv("CLAUDE_CODE_CHILD_SESSION") == "1" {
+		// Claude Code print/SDK mode may set CHILD_SESSION even for the explicit
+		// claudex Supervisor. Worker launches always carry a non-supervisor role.
+		if os.Getenv("CLAUDE_CODE_CHILD_SESSION") == "1" && strings.TrimSpace(os.Getenv("CLAUDEX_THREAD_ROLE")) != "supervisor" {
 			return
 		}
 		var output []byte
@@ -285,7 +287,7 @@ func orchestratorStats(args []string) error {
 	return printJSON(map[string]any{
 		"path": path, "bytes": len(raw), "lines": strings.Count(string(raw), "\n") + 1,
 		"approx_tokens_bytes_div_4": len(raw) / 4,
-		"note":                     "T13 measurement only; do not split until Contract markers still load",
+		"note":                      "T13 measurement only; do not split until Contract markers still load",
 	})
 }
 
@@ -369,6 +371,9 @@ func route(args []string) error {
 	acceptance := fs.String("acceptance", "", "observable criteria separated by ||")
 	verificationTarget := fs.String("verification-target", "", "exact command, probe, artifact check, or bounded semantic review")
 	workerMarginalContribution := fs.String("worker-marginal-contribution", "", "concrete Supervisor work or critical-path delay the Worker avoids")
+	estimatedWorkerSeconds := fs.Int("estimated-worker-seconds", 0, "evidence-based useful work per Worker; at least 90 to delegate")
+	estimatedParallelSavings := fs.Int("estimated-parallel-savings-seconds", 0, "evidence-based critical-path savings after coordination; at least 45 to delegate")
+	estimateBasis := fs.String("estimate-basis", "", "task-local evidence for duration and savings estimates")
 	independentSlices := fs.Int("independent-slices", 0, "genuinely independent bounded slices, 0 to 3")
 	sharedState := fs.Bool("shared-state", false, "candidate workstreams share mutable state")
 	checkability := fs.String("checkability", "auto", "auto, objective, partial, or semantic")
@@ -380,7 +385,7 @@ func route(args []string) error {
 		return fmt.Errorf("--task is required")
 	}
 	if *model != "" || *effort != "" {
-		if *urls != "" || *acceptance != "" || *verificationTarget != "" || *workerMarginalContribution != "" || *independentSlices != 0 || *sharedState || *checkability != "auto" || *topology != "auto" {
+		if *urls != "" || *acceptance != "" || *verificationTarget != "" || *workerMarginalContribution != "" || *estimatedWorkerSeconds != 0 || *estimatedParallelSavings != 0 || *estimateBasis != "" || *independentSlices != 0 || *sharedState || *checkability != "auto" || *topology != "auto" {
 			return fmt.Errorf("explicit --model/--effort cannot be combined with structural route hints")
 		}
 		d, err := router.Decide(*task, router.Kind(*kind), *risk, *model, *effort)
@@ -392,6 +397,7 @@ func route(args []string) error {
 	plan, err := router.PlanRoute(router.RouteRequest{
 		Objective: *task, Kind: router.Kind(*kind), Risk: *risk, ExplicitURLs: splitList(*urls),
 		AcceptanceCriteria: splitCriteria(*acceptance), VerificationTarget: *verificationTarget, WorkerMarginalContribution: *workerMarginalContribution,
+		EstimatedWorkerSeconds: *estimatedWorkerSeconds, EstimatedParallelSavings: *estimatedParallelSavings, EstimateBasis: *estimateBasis,
 		IndependentSlices: *independentSlices, SharedMutableState: *sharedState,
 		Checkability: *checkability, Topology: *topology,
 	})
@@ -703,21 +709,33 @@ func hasCommandHook(settings map[string]any, event, command string, args []strin
 func maxWorkerServerTimeoutMS() int64 { return 660_000 }
 
 func defaultSettings() string {
+	if value := strings.TrimSpace(os.Getenv("CLAUDEX_SETTINGS")); value != "" {
+		return value
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "claudex", "settings.json")
 }
 
 func defaultBinary() string {
+	if value := strings.TrimSpace(os.Getenv("CLAUDEX_FLOW_BINARY")); value != "" {
+		return value
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".local", "bin", "claudex-flow")
 }
 
 func defaultMCPConfig() string {
+	if value := strings.TrimSpace(os.Getenv("CLAUDEX_MCP_CONFIG")); value != "" {
+		return value
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "claudex", "mcp.json")
 }
 
 func defaultOrchestrator() string {
+	if value := strings.TrimSpace(os.Getenv("CLAUDEX_ORCHESTRATOR")); value != "" {
+		return value
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "claudex", "orchestrator.md")
 }

@@ -5,7 +5,15 @@ import (
 	"testing"
 )
 
+func withWorkerROI(in RouteRequest) RouteRequest {
+	in.EstimatedWorkerSeconds = 180
+	in.EstimatedParallelSavings = 60
+	in.EstimateBasis = "isolated implementation with a deterministic package verifier"
+	return in
+}
+
 func TestAutomaticRoutesMatchClaudeXTopology(t *testing.T) {
+	t.Setenv("CLAUDEX_THREAD_EFFORT", "high")
 	tests := []struct {
 		task   string
 		action Action
@@ -30,9 +38,20 @@ func TestAutomaticRoutesMatchClaudeXTopology(t *testing.T) {
 		if plan.Action != tt.action || plan.SelectedLane.Model != tt.model || plan.SelectedLane.Tool != tt.tool {
 			t.Errorf("task %q route = %s %s %s; want %s %s %s", tt.task, plan.Action, plan.SelectedLane.Model, plan.SelectedLane.Tool, tt.action, tt.model, tt.tool)
 		}
-		if plan.Supervisor.Model != "gpt-5.6-sol" || plan.Supervisor.Effort != "xhigh" {
+		if plan.Supervisor.Model != "gpt-5.6-sol" || plan.Supervisor.Effort != "high" {
 			t.Fatalf("supervisor drifted: %#v", plan.Supervisor)
 		}
+	}
+}
+
+func TestSupervisorEffortReflectsExplicitLaunchProfile(t *testing.T) {
+	t.Setenv("CLAUDEX_THREAD_EFFORT", "xhigh")
+	plan, err := PlanRoute(RouteRequest{Objective: "fix parser bug"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Supervisor.Effort != "xhigh" || plan.Surface.LeadLane != "gpt-5.6-sol/xhigh" {
+		t.Fatalf("explicit launch effort not reflected: %#v", plan)
 	}
 }
 
@@ -55,14 +74,14 @@ func TestExternalAmpThreadURLDoesNotMisrouteToLocalReadThread(t *testing.T) {
 }
 
 func TestWorkerRequiresIndependentCheckableNonSharedSlice(t *testing.T) {
-	plan, err := PlanRoute(RouteRequest{
+	plan, err := PlanRoute(withWorkerROI(RouteRequest{
 		Objective:                  "Implement the isolated parser package and run go test ./parser.",
 		AcceptanceCriteria:         []string{"Parser behavior matches the fixture."},
 		VerificationTarget:         "go test ./parser",
 		WorkerMarginalContribution: "Own the isolated parser implementation so the supervisor only verifies it.",
-		IndependentSlices:          1,
+		IndependentSlices:          2,
 		Checkability:               "objective",
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,12 +108,54 @@ func TestWorkerRequiresIndependentCheckableNonSharedSlice(t *testing.T) {
 	}
 }
 
+func TestWorkerROIThresholdKeepsSmallSliceDirect(t *testing.T) {
+	plan, err := PlanRoute(RouteRequest{
+		Objective:                  "Implement three tiny isolated helpers.",
+		AcceptanceCriteria:         []string{"Helper tests pass."},
+		VerificationTarget:         "go test ./helpers",
+		WorkerMarginalContribution: "Own one helper.",
+		EstimatedWorkerSeconds:     40,
+		EstimatedParallelSavings:   20,
+		EstimateBasis:              "each helper is a few localized lines",
+		IndependentSlices:          3,
+		Checkability:               "objective",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Action != ActionDirect || plan.WorkerAdmissible {
+		t.Fatalf("sub-threshold work must stay direct: %#v", plan)
+	}
+	joined := strings.Join(plan.WorkerRejectionReasons, "; ")
+	if !strings.Contains(joined, "90-second") || !strings.Contains(joined, "45-second") {
+		t.Fatalf("missing ROI rejection evidence: %s", joined)
+	}
+}
+
+func TestAutomaticWorkerPolicyBoundsDownsideAndKeepsRootWork(t *testing.T) {
+	plan, err := PlanRoute(withWorkerROI(RouteRequest{
+		Objective: "Implement three independent packages.", AcceptanceCriteria: []string{"Package tests pass."},
+		VerificationTarget: "go test ./...", WorkerMarginalContribution: "Own bounded packages while the Supervisor implements one.",
+		IndependentSlices: 3, Checkability: "objective",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := plan.WorkerPolicy
+	if plan.Action != ActionWorker || policy.Mode != "bounded_speculation" || policy.RootOwnedSlices != 1 || policy.MaxWorkerStarts != 2 || policy.MaxWorkerDeadlineMS != 180_000 {
+		t.Fatalf("automatic policy is not downside-bounded: %#v", plan)
+	}
+	if policy.EstimateTrust != "caller_advisory_unattested" {
+		t.Fatalf("caller estimate was overstated as attested: %#v", policy)
+	}
+}
+
 func TestMandatoryWorkerTopologyCannotWeakenContract(t *testing.T) {
 	_, err := PlanRoute(RouteRequest{Objective: "Make a judgment call.", Topology: "worker", Checkability: "semantic"})
 	if err == nil || !strings.Contains(err.Error(), "not admissible") {
 		t.Fatalf("expected mandatory topology rejection, got %v", err)
 	}
-	plan, err := PlanRoute(RouteRequest{Objective: "Implement isolated parser and run go test.", AcceptanceCriteria: []string{"Parser tests pass."}, VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.", Topology: "worker", IndependentSlices: 1, Checkability: "objective"})
+	plan, err := PlanRoute(withWorkerROI(RouteRequest{Objective: "Implement isolated parser and run go test.", AcceptanceCriteria: []string{"Parser tests pass."}, VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.", Topology: "worker", IndependentSlices: 1, Checkability: "objective"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +178,7 @@ func TestHighRiskStaysWithSolAndAddsResidualReview(t *testing.T) {
 }
 
 func TestRouteComparisonHasNoFalseExactCostClaim(t *testing.T) {
-	plan, err := PlanRoute(RouteRequest{Objective: "Implement an isolated testable parser.", AcceptanceCriteria: []string{"Parser accepts the fixture."}, VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.", IndependentSlices: 1, Checkability: "objective"})
+	plan, err := PlanRoute(withWorkerROI(RouteRequest{Objective: "Implement an isolated testable parser.", AcceptanceCriteria: []string{"Parser accepts the fixture."}, VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.", IndependentSlices: 1, Checkability: "objective"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,14 +255,14 @@ func TestWorkerRouteRequiresFrozenAcceptanceContract(t *testing.T) {
 		t.Fatalf("missing contract rejection evidence: %s", joined)
 	}
 
-	ready, err := PlanRoute(RouteRequest{
+	ready, err := PlanRoute(withWorkerROI(RouteRequest{
 		Objective:                  "Implement isolated parser and run go test.",
 		AcceptanceCriteria:         []string{"Parser test fixture passes.", "No unrelated files change."},
 		VerificationTarget:         "go test ./parser",
 		WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.",
-		IndependentSlices:          1,
+		IndependentSlices:          2,
 		Checkability:               "objective",
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,11 +289,11 @@ func TestObservedLaneFailureQuarantinesWithoutFallback(t *testing.T) {
 }
 
 func TestUnavailableOptionalWorkerFallsBackToQualifiedSupervisorTopology(t *testing.T) {
-	in := RouteRequest{
+	in := withWorkerROI(RouteRequest{
 		Objective: "Implement isolated parser and run go test.", AcceptanceCriteria: []string{"Parser tests pass."},
 		VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.", IndependentSlices: 1, Checkability: "objective",
 		LaneHealth: []LaneHealth{{Tool: "start_worker", Status: "unavailable", FailureClass: "model_mismatch", Reason: "resolved wrong model"}},
-	}
+	})
 	plan, err := PlanRoute(in)
 	if err != nil {
 		t.Fatal(err)

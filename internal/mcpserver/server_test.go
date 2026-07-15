@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"claudexflow/internal/claude"
 	"claudexflow/internal/router"
@@ -35,14 +37,24 @@ func newTestServer(t *testing.T) *Server {
 
 func qualifiedInput() WorkerStartInput {
 	return WorkerStartInput{
-		SliceID:              "parser-contract",
-		Objective:            "Implement the parser contract.",
-		MarginalContribution: "Own the isolated parser change so the supervisor can verify instead of duplicating implementation.",
-		Context:              "The parser package is already isolated.",
-		OutputContract:       "Return changed paths, exact test output, and residual risk.",
-		DoneCondition:        "go test ./parser passes.",
-		DeadlineMS:           60_000,
+		SliceID:                  "parser-contract",
+		Objective:                "Implement the parser contract.",
+		MarginalContribution:     "Own the isolated parser change so the supervisor can verify instead of duplicating implementation.",
+		EstimatedWorkerSeconds:   180,
+		EstimatedParallelSavings: 60,
+		EstimateBasis:            "isolated implementation plus a dedicated package verifier",
+		Context:                  "The parser package is already isolated.",
+		OutputContract:           "Return changed paths, exact test output, and residual risk.",
+		DoneCondition:            "go test ./parser passes.",
+		DeadlineMS:               60_000,
 	}
+}
+
+func withRouteROI(in router.RouteRequest) router.RouteRequest {
+	in.EstimatedWorkerSeconds = 180
+	in.EstimatedParallelSavings = 60
+	in.EstimateBasis = "isolated implementation with a deterministic package verifier"
+	return in
 }
 
 func reportResult(status string) claude.Result {
@@ -87,6 +99,70 @@ func TestScopedDir(t *testing.T) {
 	}
 }
 
+func TestAbsoluteWorkerPathNormalizesBeforeAdmission(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "tagset"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{root: root}
+	in := WorkerStartInput{
+		RouteID:                  "route-1",
+		SliceID:                  "single-file",
+		Objective:                "implement tagset.Canonicalize",
+		MarginalContribution:     "worker owns one independently verifiable file",
+		EstimatedWorkerSeconds:   180,
+		EstimatedParallelSavings: 60,
+		EstimateBasis:            "isolated file with a deterministic package verifier",
+		OutputContract:           "return changed path and verifier result",
+		DoneCondition:            "go test ./...",
+		WorkDir:                  root,
+		Write:                    true,
+		Paths:                    []string{filepath.Join(root, "tagset", "tagset.go")},
+	}
+
+	dir, err := s.scopedDir(in.WorkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := s.normalizedPaths(in.Paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.WorkDir = dir
+	in.Paths = paths
+
+	if got, want := in.Paths, []string{filepath.Join("tagset", "tagset.go")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized paths = %#v, want %#v", got, want)
+	}
+	admission := evaluateWorkerAdmission(in)
+	if admission.Result != admissionAdmitted {
+		t.Fatalf("equivalent absolute single-file path rejected: %#v", admission.RejectionReasons)
+	}
+
+	// Exercise the real startWorker ordering without launching a model. The
+	// deliberately unknown route must be the first rejection; a regression that
+	// evaluates admission before normalization returns composite_slice instead.
+	_, _, err = s.startWorker(context.Background(), nil, in)
+	if err == nil {
+		t.Fatal("expected unknown route rejection")
+	}
+	if strings.Contains(err.Error(), "composite_slice") {
+		t.Fatalf("absolute path reached admission before normalization: %v", err)
+	}
+	if !strings.Contains(err.Error(), "route") {
+		t.Fatalf("expected route rejection after successful admission, got %v", err)
+	}
+}
+
+func TestAbsoluteWorkerPathOutsideLaunchRootRejected(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	s := &Server{root: root}
+	if _, err := s.normalizedPaths([]string{filepath.Join(outside, "tagset.go")}); err == nil {
+		t.Fatal("absolute worker path outside launch root must be rejected")
+	}
+}
+
 func TestWriteScopeLeaseRejectsOverlap(t *testing.T) {
 	s := newTestServer(t)
 	w1 := &workerState{id: "worker-1", write: true, paths: []string{"internal"}}
@@ -104,11 +180,12 @@ func TestWriteScopeLeaseRejectsOverlap(t *testing.T) {
 }
 
 func TestContractFieldsAndGuard(t *testing.T) {
+	t.Setenv("CLAUDEX_THREAD_EFFORT", "high")
 	contract := Contract()
 	if contract.Version != ContractVersion || contract.WorkerProfile != "grok-4.5/high" {
 		t.Fatalf("unexpected contract: %#v", contract)
 	}
-	wantFields := []string{"context", "deadline_ms", "done_condition", "marginal_contribution", "objective", "output_contract", "paths", "retry_reason", "route_id", "slice_id", "workdir", "write"}
+	wantFields := []string{"background", "context", "deadline_ms", "done_condition", "estimate_basis", "estimated_parallel_savings_seconds", "estimated_worker_seconds", "marginal_contribution", "objective", "output_contract", "paths", "retry_reason", "route_id", "slice_id", "workdir", "write"}
 	if !reflect.DeepEqual(contract.WorkerStartFields, wantFields) {
 		t.Fatalf("worker fields = %v; want %v", contract.WorkerStartFields, wantFields)
 	}
@@ -229,10 +306,7 @@ func TestRouteTaskUsesLiveLaneQuarantineWithoutFallback(t *testing.T) {
 
 func TestRouteLifecycleRecordsAcceptedResultOnce(t *testing.T) {
 	s := newTestServer(t)
-	_, plan, err := s.routeTask(context.Background(), nil, router.RouteRequest{
-		Objective: "Implement isolated parser.", AcceptanceCriteria: []string{"Parser passes."},
-		VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.", IndependentSlices: 1, Checkability: "objective",
-	})
+	_, plan, err := s.routeTask(context.Background(), nil, router.RouteRequest{Objective: "Fix one localized parser bug."})
 	if err != nil || plan.RouteID == "" {
 		t.Fatalf("route_id missing: plan=%#v err=%v", plan, err)
 	}
@@ -251,6 +325,10 @@ func TestRouteLifecycleRecordsAcceptedResultOnce(t *testing.T) {
 	if record.LedgerStatus != "persisted" {
 		t.Fatalf("terminal route was not persisted: %#v", record)
 	}
+	raw, err := json.Marshal(record)
+	if err != nil || bytes.Contains(raw, []byte(`"plan":`)) || len(raw) > 3000 {
+		t.Fatalf("outcome receipt leaked the frozen plan or grew too large (%d): %s", len(raw), raw)
+	}
 	ledger, err := os.ReadFile(s.routeLedgerPath)
 	if err != nil || !strings.Contains(string(ledger), plan.RouteID) {
 		t.Fatalf("route ledger missing terminal record: %q err=%v", ledger, err)
@@ -261,6 +339,34 @@ func TestRouteLifecycleRecordsAcceptedResultOnce(t *testing.T) {
 	_, status, err := s.workflowStatus(context.Background(), nil, EmptyInput{})
 	if err != nil || len(status.Routes) != 1 || status.Routes[0].State != "accepted" {
 		t.Fatalf("route lifecycle not observable: status=%#v err=%v", status, err)
+	}
+}
+
+func TestWorkerRouteAcceptanceRequiresCleanCompleteIntegration(t *testing.T) {
+	s := newTestServer(t)
+	_, plan, err := s.routeTask(context.Background(), nil, withRouteROI(router.RouteRequest{
+		Objective: "Implement two isolated parsers.", AcceptanceCriteria: []string{"Parsers pass."},
+		VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own one isolated parser while the supervisor retains the other.", IndependentSlices: 2, Checkability: "objective",
+	}))
+	if err != nil || plan.Action != router.ActionWorker {
+		t.Fatalf("worker route missing: plan=%#v err=%v", plan, err)
+	}
+	accept := RouteOutcomeInput{RouteID: plan.RouteID, Status: "accepted", Verification: "go test ./parser: PASS", HumanCorrection: "none"}
+	if _, _, err := s.recordRouteOutcome(context.Background(), nil, accept); err == nil || !strings.Contains(err.Error(), "before an admitted Worker integration") {
+		t.Fatalf("accepted worker route without integration: %v", err)
+	}
+	s.recordRouteIntegrationStart(plan.RouteID, "parser-a")
+	if _, _, err := s.recordRouteOutcome(context.Background(), nil, accept); err == nil || !strings.Contains(err.Error(), "integration incomplete") {
+		t.Fatalf("accepted pending integration: %v", err)
+	}
+	s.recordRouteIntegrationResult(plan.RouteID, "parser-a", &IntegrationDigest{DiffCheck: "fail: trailing whitespace"})
+	if _, _, err := s.recordRouteOutcome(context.Background(), nil, accept); err == nil || !strings.Contains(err.Error(), "failed hygiene checks") {
+		t.Fatalf("accepted failed integration: %v", err)
+	}
+	s.recordRouteIntegrationResult(plan.RouteID, "parser-a", &IntegrationDigest{DiffCheck: "pass", AutoFixed: true})
+	_, receipt, err := s.recordRouteOutcome(context.Background(), nil, accept)
+	if err != nil || receipt.State != "accepted" || receipt.Integration.Passed != 1 || receipt.Integration.AutoFixed != 1 {
+		t.Fatalf("clean integrated route was not accepted: receipt=%#v err=%v", receipt, err)
 	}
 }
 
@@ -288,11 +394,11 @@ func TestWorkerRouteIDMustSelectWorkerTool(t *testing.T) {
 func TestRuntimeLaneEvidenceOverridesCallerClaim(t *testing.T) {
 	s := newTestServer(t)
 	s.recordLaneFailure("start_worker", failureInfo{Class: failureModelMismatch, Detail: "resolved another model"})
-	in := router.RouteRequest{
+	in := withRouteROI(router.RouteRequest{
 		Objective: "Implement isolated parser and run go test.", AcceptanceCriteria: []string{"Parser passes."},
-		VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.", IndependentSlices: 1, Checkability: "objective",
+		VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own one of two isolated implementations while the supervisor retains the other.", IndependentSlices: 2, Checkability: "objective",
 		LaneHealth: []router.LaneHealth{{Tool: "start_worker", Status: "healthy"}},
-	}
+	})
 	_, plan, err := s.routeTask(context.Background(), nil, in)
 	if err != nil {
 		t.Fatal(err)
@@ -414,10 +520,10 @@ func TestResumeUsesOriginalWorkerAndSession(t *testing.T) {
 func TestRouteDiagnosticsCountChildCallsWithoutSupervisorEstimates(t *testing.T) {
 	s := newTestServer(t)
 	s.runModel = func(context.Context, claude.Request) claude.Result { return reportResult("completed") }
-	_, plan, err := s.routeTask(context.Background(), nil, router.RouteRequest{
+	_, plan, err := s.routeTask(context.Background(), nil, withRouteROI(router.RouteRequest{
 		Objective: "Implement isolated parser.", AcceptanceCriteria: []string{"Parser passes."},
-		VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.", IndependentSlices: 1, Checkability: "objective",
-	})
+		VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own one of two isolated implementations while the supervisor retains the other.", IndependentSlices: 2, Checkability: "objective",
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,6 +532,9 @@ func TestRouteDiagnosticsCountChildCallsWithoutSupervisorEstimates(t *testing.T)
 	if _, _, err := s.startWorker(context.Background(), nil, in); err != nil {
 		t.Fatal(err)
 	}
+	// This accounting test uses a non-git temp root. Supply the scoped
+	// integration result explicitly; git-backed behavior has dedicated tests.
+	s.recordRouteIntegrationResult(plan.RouteID, in.SliceID, &IntegrationDigest{DiffCheck: "pass"})
 	_, record, err := s.recordRouteOutcome(context.Background(), nil, RouteOutcomeInput{RouteID: plan.RouteID, Status: "accepted", Verification: "go test ./parser: PASS", HumanCorrection: "none"})
 	if err != nil {
 		t.Fatal(err)
@@ -436,6 +545,159 @@ func TestRouteDiagnosticsCountChildCallsWithoutSupervisorEstimates(t *testing.T)
 	}
 	if d.SupervisorIncluded || d.ComparableSpend || d.RequestedModels[workerModel] != 1 || d.ResolvedModels["grok-4.5-build-20260713"] != 1 {
 		t.Fatalf("route accounting boundary is dishonest or incomplete: %#v", d)
+	}
+}
+
+func TestStrictWorkerRouteEnforcesPacketDeadlineAndRootReserve(t *testing.T) {
+	s := newTestServer(t)
+	s.strictWorkerRoutes = true
+	s.runModel = func(context.Context, claude.Request) claude.Result { return reportResult("completed") }
+
+	if _, _, err := s.startWorker(context.Background(), nil, qualifiedInput()); err == nil || !strings.Contains(err.Error(), "route_id is required") {
+		t.Fatalf("strict mode admitted an unbound Worker: %v", err)
+	}
+	_, plan, err := s.routeTask(context.Background(), nil, withRouteROI(router.RouteRequest{
+		Objective: "Implement three independent packages.", AcceptanceCriteria: []string{"Package tests pass."},
+		VerificationTarget: "go test ./...", WorkerMarginalContribution: "Own bounded packages while Supervisor owns one.",
+		IndependentSlices: 3, Checkability: "objective",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mismatch := qualifiedInput()
+	mismatch.RouteID = plan.RouteID
+	mismatch.EstimatedParallelSavings++
+	if _, _, err := s.startWorker(context.Background(), nil, mismatch); err == nil || !strings.Contains(err.Error(), "must match route_task exactly") {
+		t.Fatalf("mutated ROI packet was admitted: %v", err)
+	}
+	overDeadline := qualifiedInput()
+	overDeadline.RouteID = plan.RouteID
+	overDeadline.DeadlineMS = plan.WorkerPolicy.MaxWorkerDeadlineMS + 1
+	if _, _, err := s.startWorker(context.Background(), nil, overDeadline); err == nil || !strings.Contains(err.Error(), "exceeds route cap") {
+		t.Fatalf("over-budget deadline was admitted: %v", err)
+	}
+
+	for i, id := range []string{"package-a", "package-b"} {
+		in := qualifiedInput()
+		in.RouteID = plan.RouteID
+		in.SliceID = id
+		in.DeadlineMS = 0
+		_, out, err := s.startWorker(context.Background(), nil, in)
+		if err != nil || out.Admission.DeadlineMS != plan.WorkerPolicy.MaxWorkerDeadlineMS {
+			t.Fatalf("admitted Worker %d failed or missed route deadline: out=%#v err=%v", i, out, err)
+		}
+	}
+	third := qualifiedInput()
+	third.RouteID = plan.RouteID
+	third.SliceID = "package-c"
+	third.DeadlineMS = 0
+	if _, _, err := s.startWorker(context.Background(), nil, third); err == nil || !strings.Contains(err.Error(), "Supervisor owns 1 remaining slice") {
+		t.Fatalf("route fan-out exceeded Root reserve: %v", err)
+	}
+}
+
+func TestBackgroundWorkerReturnsReceiptAndCollectsExactlyOnce(t *testing.T) {
+	s := newTestServer(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	s.runModel = func(ctx context.Context, _ claude.Request) claude.Result {
+		close(started)
+		select {
+		case <-release:
+			return reportResult("completed")
+		case <-ctx.Done():
+			return claude.Result{Success: false, TerminalReason: "timeout", ExitError: ctx.Err().Error()}
+		}
+	}
+	in := qualifiedInput()
+	in.Background = true
+	in.Write = true
+	in.Paths = []string{"pkg/a.go"}
+	_, receipt, err := s.startWorker(context.Background(), nil, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !receipt.Background || receipt.Collected || receipt.State != "running" || receipt.WorkerID == "" {
+		t.Fatalf("invalid background receipt: %#v", receipt)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background model did not start")
+	}
+	if s.activeRuns.Load() != 1 {
+		t.Fatalf("background slot was not retained: %d", s.activeRuns.Load())
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := s.collectWorker(canceled, nil, WorkerCollectInput{WorkerID: receipt.WorkerID}); err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("canceled collect did not remain retryable: %v", err)
+	}
+	close(release)
+	_, result, err := s.collectWorker(context.Background(), nil, WorkerCollectInput{WorkerID: receipt.WorkerID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "completed" || !result.Background || !result.Collected || result.SessionID == "" {
+		t.Fatalf("invalid collected result: %#v", result)
+	}
+	if s.activeRuns.Load() != 0 {
+		t.Fatalf("background slot leaked after collect: %d", s.activeRuns.Load())
+	}
+	if _, _, err := s.collectWorker(context.Background(), nil, WorkerCollectInput{WorkerID: receipt.WorkerID}); err == nil || !strings.Contains(err.Error(), "already collected") {
+		t.Fatalf("duplicate collect consumed result twice: %v", err)
+	}
+}
+
+func TestCloseCancelsBackgroundWorkerAndReleasesResources(t *testing.T) {
+	s := newTestServer(t)
+	started := make(chan struct{})
+	s.runModel = func(ctx context.Context, _ claude.Request) claude.Result {
+		close(started)
+		<-ctx.Done()
+		return claude.Result{Success: false, TerminalReason: "timeout", ExitError: ctx.Err().Error()}
+	}
+	in := qualifiedInput()
+	in.Background = true
+	in.Write = true
+	in.Paths = []string{"pkg/cancel.go"}
+	_, receipt, err := s.startWorker(context.Background(), nil, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background model did not start")
+	}
+	_, status, err := s.closeWorker(context.Background(), nil, WorkerCloseInput{WorkerID: receipt.WorkerID, Reason: "test cancellation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != "closed" || s.activeRuns.Load() != 0 || len(s.leases) != 0 {
+		t.Fatalf("background close leaked state: status=%#v active=%d leases=%v", status, s.activeRuns.Load(), s.leases)
+	}
+	for _, health := range s.liveLaneHealth() {
+		if health.Tool == "start_worker" && health.Status == "unavailable" {
+			t.Fatalf("intentional cancellation falsely quarantined Worker lane: %#v", health)
+		}
+	}
+}
+
+func TestCollectRejectsSynchronousWorker(t *testing.T) {
+	s := newTestServer(t)
+	s.runModel = func(context.Context, claude.Request) claude.Result { return reportResult("completed") }
+	_, out, err := s.startWorker(context.Background(), nil, qualifiedInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Background {
+		t.Fatalf("synchronous compatibility changed: %#v", out)
+	}
+	if _, _, err := s.collectWorker(context.Background(), nil, WorkerCollectInput{WorkerID: out.WorkerID}); err == nil || !strings.Contains(err.Error(), "started synchronously") {
+		t.Fatalf("synchronous Worker was collectable: %v", err)
 	}
 }
 
