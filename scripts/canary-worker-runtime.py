@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class MCP:
     def __init__(self, env=None):
+        self.progress = []
         root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
         self.process = subprocess.Popen(
             [os.path.expanduser("~/.local/bin/claudex-flow"), "mcp"],
@@ -44,6 +45,9 @@ class MCP:
                     print(line.rstrip(), file=sys.stderr)
                     continue
                 value = json.loads(line)
+                if value.get("method") == "notifications/progress":
+                    self.progress.append(value.get("params", {}))
+                    continue
                 if value.get("id") == request_id:
                     return value
         raise TimeoutError(f"MCP response {request_id} timed out")
@@ -126,6 +130,10 @@ def main():
                         "worker_marginal_contribution": "Prove the pinned Grok Worker runtime so the supervisor only verifies the result.",
                         "independent_slices": 1,
                         "checkability": "objective",
+                        "topology": "worker",
+                        "estimated_worker_seconds": 120,
+                        "estimated_parallel_savings_seconds": 60,
+                        "estimate_basis": "explicit runtime identity canary with a bounded deterministic verifier",
                     },
                 },
             }
@@ -141,6 +149,7 @@ def main():
                 "method": "tools/call",
                 "params": {
                     "name": "start_worker",
+                    "_meta": {"progressToken": "worker-canary-progress"},
                     "arguments": {
                         "route_id": route["route_id"],
                         "slice_id": "runtime-canary-v10",
@@ -234,6 +243,7 @@ def main():
                     "tool_uses": worker.get("tool_uses", {}),
                     "usage": worker["usage"],
                     "duration_ms": worker["duration_ms"],
+                    "progress_notifications": mcp.progress,
                     "thread_relation": relation,
                     "report": worker["report"],
                 },

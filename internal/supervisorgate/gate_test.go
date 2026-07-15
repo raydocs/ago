@@ -64,6 +64,33 @@ func TestSameVerifyBudget(t *testing.T) {
 	}
 }
 
+func TestFastPathVerifierHardStopsFurtherToolsUntilNextPrompt(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{StateDir: dir, HighCostSoft: 100, HighCostHard: 100, Now: fixedNow(t)}
+	session := "fast-stop"
+	prompt := HookInput{SessionID: session, HookEventName: "UserPromptSubmit", Prompt: "fix internal/catalog/catalog.go and run go test ./internal/catalog"}
+	dec, _, err := Run(bytes.NewReader(hookJSON(t, prompt)), cfg)
+	if err != nil || dec.State != "fast_path" {
+		t.Fatalf("expected fast path, dec=%#v err=%v", dec, err)
+	}
+	_, _, err = Run(bytes.NewReader(hookJSON(t, HookInput{SessionID: session, HookEventName: "PostToolUse", ToolName: "Edit", ToolInput: json.RawMessage(`{"file_path":"internal/catalog/catalog.go"}`)})), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, out, err := Run(bytes.NewReader(hookJSON(t, HookInput{SessionID: session, HookEventName: "PostToolUse", ToolName: "Bash", ToolInput: json.RawMessage(`{"command":"go test ./internal/catalog"}`)})), cfg)
+	if err != nil || !strings.Contains(string(out), "VERIFIED_HARD_STOP") {
+		t.Fatalf("expected post-tool hard stop context, out=%s err=%v", out, err)
+	}
+	dec, _, err = Run(bytes.NewReader(hookJSON(t, HookInput{SessionID: session, HookEventName: "PreToolUse", ToolName: "Read", ToolInput: json.RawMessage(`{"file_path":"internal/catalog/catalog.go"}`)})), cfg)
+	if err != nil || dec.Permission != "deny" || dec.State != "verified_stop_deny" {
+		t.Fatalf("expected verified stop deny, dec=%#v err=%v", dec, err)
+	}
+	dec, _, err = Run(bytes.NewReader(hookJSON(t, HookInput{SessionID: session, HookEventName: "UserPromptSubmit", Prompt: "new unrelated task"})), cfg)
+	if err != nil || dec.State != "user_prompt" {
+		t.Fatalf("new prompt should release latch, dec=%#v err=%v", dec, err)
+	}
+}
+
 func TestRootHandoffAfterCompacts(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{StateDir: dir, MaxCompacts: 2, Now: fixedNow(t)}
@@ -280,7 +307,7 @@ func TestParallelPostToolUseCountsExactly(t *testing.T) {
 
 func TestStickyRerouteDeniesUntilAck(t *testing.T) {
 	dir := t.TempDir()
-	cfg := Config{StateDir: dir, HighCostSoft: 2, HighCostHard: 50, MaxPlaywright: 100, Now: fixedNow(t)}
+	cfg := Config{StateDir: dir, HighCostSoft: 2, HighCostHard: 50, GateHighCostSoft: 2, MaxPlaywright: 100, Now: fixedNow(t)}
 	session := "sess-sticky"
 	if _, err := DeclareGate(dir, DeclareGateInput{
 		SessionID: session, GateID: "g1", Acceptance: []string{"tests pass"},
@@ -330,6 +357,37 @@ func TestStickyRerouteDeniesUntilAck(t *testing.T) {
 	}
 	if dec.Permission != "allow" {
 		t.Fatalf("after ack, Agent should allow, got %#v", dec)
+	}
+}
+
+func TestUngatedRootSoftBudgetDoesNotForceLifecycleCeremony(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{StateDir: dir, HighCostSoft: 2, HighCostHard: 50, GateHighCostSoft: 2, MaxPlaywright: 100, Now: fixedNow(t)}
+	session := "sess-ungated-soft"
+	for i := 0; i < 2; i++ {
+		if _, _, err := Run(bytes.NewReader(hookJSON(t, HookInput{
+			SessionID: session, HookEventName: "PostToolUse", ToolName: "Edit",
+			ToolInput: json.RawMessage(`{"file_path":"ordinary.go"}`),
+		})), cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := LoadStatus(dir, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.StickyReroutePending {
+		t.Fatalf("ordinary ungated work must not arm sticky reroute: %#v", st)
+	}
+	dec, _, err := Run(bytes.NewReader(hookJSON(t, HookInput{
+		SessionID: session, HookEventName: "PreToolUse", ToolName: "Edit",
+		ToolInput: json.RawMessage(`{"file_path":"ordinary.go"}`),
+	})), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dec.Permission == "deny" {
+		t.Fatalf("ordinary edit below the hard cap must remain allowed: %#v", dec)
 	}
 }
 
@@ -436,6 +494,19 @@ func TestChildSessionSkipped(t *testing.T) {
 	}
 }
 
+func TestPrintModeSupervisorIsNotSkipped(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+	t.Setenv("CLAUDEX_THREAD_ROLE", "supervisor")
+	dir := t.TempDir()
+	dec, _, err := Run(bytes.NewReader(hookJSON(t, HookInput{SessionID: "print-root", HookEventName: "UserPromptSubmit", Prompt: "fix a.go and run go test ./a"})), Config{StateDir: dir, Now: fixedNow(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dec.State != "fast_path" {
+		t.Fatalf("print/SDK supervisor must execute root hooks, got %#v", dec)
+	}
+}
+
 func TestTranscriptSizeTriggersHandoff(t *testing.T) {
 	dir := t.TempDir()
 	transcript := filepath.Join(dir, "big.jsonl")
@@ -461,6 +532,20 @@ func TestBashReadOnlyWhitelist(t *testing.T) {
 	}
 	if bashReadOnly(json.RawMessage(`{"command":"printf x > f"}`)) {
 		t.Fatal("redirect must not be readonly")
+	}
+}
+
+func TestBackgroundWorkerCleanupToolsRemainAvailable(t *testing.T) {
+	for _, name := range []string{"mcp__claudex-flow__collect_worker", "mcp__claudex-flow__close_worker"} {
+		if !isControlTool(name) {
+			t.Fatalf("%s must remain available during sticky reroute", name)
+		}
+		if !isHandoffControlTool(name) {
+			t.Fatalf("%s must remain available during Root handoff cleanup", name)
+		}
+		if blocked, reason := handoffBlocks(name, nil); blocked {
+			t.Fatalf("%s was blocked during handoff: %s", name, reason)
+		}
 	}
 }
 
@@ -507,18 +592,22 @@ func TestStopFailureLatchesOverflow(t *testing.T) {
 	}
 }
 
-func TestStrictAgentDeny(t *testing.T) {
+func TestStrictNativeCoordinationDeny(t *testing.T) {
 	t.Setenv("CLAUDEX_WORKFLOW_STRICT", "1")
-	dir := t.TempDir()
-	cfg := Config{StateDir: dir, HighCostSoft: 100, HighCostHard: 100, Now: fixedNow(t)}
-	dec, _, err := Run(bytes.NewReader(hookJSON(t, HookInput{
-		SessionID: "s", HookEventName: "PreToolUse", ToolName: "Agent", ToolInput: json.RawMessage(`{}`),
-	})), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dec.Permission != "deny" || !strings.Contains(dec.Reason, "STRICT") {
-		t.Fatalf("expected strict deny, got %#v", dec)
+	for _, tool := range []string{"Agent", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskUpdate"} {
+		t.Run(tool, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := Config{StateDir: dir, HighCostSoft: 100, HighCostHard: 100, Now: fixedNow(t)}
+			dec, _, err := Run(bytes.NewReader(hookJSON(t, HookInput{
+				SessionID: "s", HookEventName: "PreToolUse", ToolName: tool, ToolInput: json.RawMessage(`{}`),
+			})), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dec.Permission != "deny" || dec.State != "strict_coordination_deny" || !strings.Contains(dec.Reason, "STRICT") {
+				t.Fatalf("expected strict deny for %s, got %#v", tool, dec)
+			}
+		})
 	}
 }
 

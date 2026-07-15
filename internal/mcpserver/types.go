@@ -20,7 +20,9 @@ const (
 	defaultDeadlineMS  = int64(600_000)
 	minDeadlineMS      = int64(30_000)
 	maxDeadlineMS      = int64(600_000)
-	// T6: hard cumulative model-turn estimate across start+resume (per-invoke MaxTurns stays 10).
+	// T6: hard cumulative model-turn estimate across start+resume. A 12-turn
+	// first invoke lets bounded implementation workers emit their structured
+	// result instead of failing immediately after a successful final check.
 	maxCumulativeWorkerModelTurns = 24
 )
 
@@ -56,18 +58,22 @@ type EvidenceReport struct {
 // WorkerStartInput is intentionally compact. Runtime admission uses the
 // marginal contribution and owned scope instead of invented time estimates.
 type WorkerStartInput struct {
-	RouteID              string   `json:"route_id,omitempty" jsonschema:"route_id returned by route_task when this Worker executes that selected route."`
-	SliceID              string   `json:"slice_id" jsonschema:"Stable identifier for this independent slice in the root thread."`
-	Objective            string   `json:"objective" jsonschema:"One bounded worker result; never the whole parent task."`
-	MarginalContribution string   `json:"marginal_contribution" jsonschema:"Independent output this worker adds and which supervisor work it avoids duplicating."`
-	Context              string   `json:"context,omitempty" jsonschema:"Minimum facts, paths, constraints, and decisions needed; do not dump the parent transcript."`
-	OutputContract       string   `json:"output_contract" jsonschema:"Required report fields, evidence, residual risk, and maximum useful detail."`
-	DoneCondition        string   `json:"done_condition" jsonschema:"Observable acceptance condition, preferably an exact test or command."`
-	DeadlineMS           int64    `json:"deadline_ms,omitempty" jsonschema:"Hard worker deadline in milliseconds, 30000 to 600000; defaults to 600000."`
-	RetryReason          string   `json:"retry_reason,omitempty" jsonschema:"Required only for the one allowed same-lane retry after runtime reports retry_eligible=true."`
-	WorkDir              string   `json:"workdir,omitempty" jsonschema:"Working directory inside the Claude X launch directory."`
-	Write                bool     `json:"write,omitempty" jsonschema:"Whether this worker may edit files and run shell commands."`
-	Paths                []string `json:"paths,omitempty" jsonschema:"Exclusive write scopes. Required when write is true."`
+	RouteID                  string   `json:"route_id,omitempty" jsonschema:"route_id returned by route_task when this Worker executes that selected route."`
+	SliceID                  string   `json:"slice_id" jsonschema:"Stable identifier for this independent slice in the root thread."`
+	Objective                string   `json:"objective" jsonschema:"One bounded worker result; never the whole parent task."`
+	MarginalContribution     string   `json:"marginal_contribution,omitempty" jsonschema:"Optional on a route-bound start; otherwise state the independent output and avoided Supervisor work."`
+	EstimatedWorkerSeconds   int      `json:"estimated_worker_seconds,omitempty" jsonschema:"Optional on a route-bound start; runtime inherits the frozen route estimate. Direct starts require at least 90 seconds."`
+	EstimatedParallelSavings int      `json:"estimated_parallel_savings_seconds,omitempty" jsonschema:"Optional on a route-bound start; runtime inherits the frozen route estimate. Direct starts require at least 45 seconds."`
+	EstimateBasis            string   `json:"estimate_basis,omitempty" jsonschema:"Optional on a route-bound start; runtime inherits the frozen route evidence basis."`
+	Context                  string   `json:"context,omitempty" jsonschema:"Minimum facts, paths, constraints, and decisions needed; do not dump the parent transcript."`
+	OutputContract           string   `json:"output_contract,omitempty" jsonschema:"Optional on a route-bound start; defaults to a compact status, changed paths, verification, and residual risk packet."`
+	DoneCondition            string   `json:"done_condition,omitempty" jsonschema:"Optional narrower slice verifier. When omitted on a route-bound start, runtime keeps the integrated route verifier Root-owned and withholds Worker Bash."`
+	DeadlineMS               int64    `json:"deadline_ms,omitempty" jsonschema:"Hard worker deadline in milliseconds, 30000 to 600000; defaults to 600000."`
+	RetryReason              string   `json:"retry_reason,omitempty" jsonschema:"Required only for the one allowed same-lane retry after runtime reports retry_eligible=true."`
+	WorkDir                  string   `json:"workdir,omitempty" jsonschema:"Working directory inside the Claude X launch directory."`
+	Write                    bool     `json:"write,omitempty" jsonschema:"Whether this worker may edit files and run shell commands."`
+	Paths                    []string `json:"paths,omitempty" jsonschema:"Exclusive write scopes. Required when write is true."`
+	Background               bool     `json:"background,omitempty" jsonschema:"Run asynchronously and return a running receipt immediately. Collect exactly once with collect_worker after Supervisor completes its disjoint slice."`
 }
 
 // SuggestedSlice is a zero-model template for splitting a composite packet (T4).
@@ -84,6 +90,8 @@ type WorkerAdmission struct {
 	SliceID              string           `json:"slice_id"`
 	MarginalContribution string           `json:"marginal_contribution,omitempty"`
 	DeadlineMS           int64            `json:"deadline_ms"`
+	VerifierMode         string           `json:"verifier_mode"`
+	VerifierCommand      string           `json:"verifier_command,omitempty"`
 	Result               string           `json:"result"`
 	RejectionReasons     []string         `json:"rejection_reasons"`
 	SuggestedSlices      []SuggestedSlice `json:"suggested_slices,omitempty"`
@@ -93,6 +101,10 @@ type WorkerResumeInput struct {
 	WorkerID       string `json:"worker_id" jsonschema:"Existing worker ID returned by start_worker."`
 	EvidencePacket string `json:"evidence_packet" jsonschema:"New source-preserving evidence or verifier failure output only."`
 	Instruction    string `json:"instruction,omitempty" jsonschema:"Narrow continuation or repair instruction."`
+}
+
+type WorkerCollectInput struct {
+	WorkerID string `json:"worker_id" jsonschema:"Background worker ID returned by start_worker."`
 }
 
 type WorkerCloseInput struct {
@@ -173,23 +185,62 @@ type ExecutionIdentity struct {
 }
 
 type WorkerOutput struct {
-	SliceID              string            `json:"slice_id"`
-	Admission            WorkerAdmission   `json:"admission"`
-	StartAttempts        int               `json:"start_attempts"`
-	WorkerID             string            `json:"worker_id"`
-	Identity             ExecutionIdentity `json:"identity"`
-	SessionID            string            `json:"session_id,omitempty"`
-	Turn                   int               `json:"turn"`
-	CumulativeModelTurns   int               `json:"cumulative_model_turns,omitempty"`
-	TurnAccountingQuality  string            `json:"turn_accounting_quality,omitempty"`
-	State                  string            `json:"state"`
-	Report               WorkerReport      `json:"report"`
-	ToolUses             map[string]int    `json:"tool_uses,omitempty"`
-	Usage                TokenUsage        `json:"usage"`
-	DurationMS           int64             `json:"duration_ms"`
-	FailureClass         string            `json:"failure_class,omitempty"`
-	RetryEligible        bool              `json:"retry_eligible"`
-	Error                string            `json:"error,omitempty"`
+	SliceID               string             `json:"slice_id"`
+	Admission             WorkerAdmission    `json:"admission"`
+	StartAttempts         int                `json:"start_attempts"`
+	WorkerID              string             `json:"worker_id"`
+	Identity              ExecutionIdentity  `json:"identity"`
+	SessionID             string             `json:"session_id,omitempty"`
+	Turn                  int                `json:"turn"`
+	CumulativeModelTurns  int                `json:"cumulative_model_turns,omitempty"`
+	TurnAccountingQuality string             `json:"turn_accounting_quality,omitempty"`
+	State                 string             `json:"state"`
+	Report                WorkerReport       `json:"report"`
+	ToolUses              map[string]int     `json:"tool_uses,omitempty"`
+	Usage                 TokenUsage         `json:"usage"`
+	DurationMS            int64              `json:"duration_ms"`
+	FailureClass          string             `json:"failure_class,omitempty"`
+	RetryEligible         bool               `json:"retry_eligible"`
+	Error                 string             `json:"error,omitempty"`
+	Background            bool               `json:"background,omitempty"`
+	Collected             bool               `json:"collected,omitempty"`
+	Provisional           bool               `json:"provisional,omitempty"`
+	Integration           *IntegrationDigest `json:"integration,omitempty"`
+}
+
+// IntegrationDigest is generated by runtime after a background Worker
+// completes. It gives Root one scoped review packet without another Read/diff
+// discovery round. The patch is bounded and never substitutes for verification.
+type IntegrationDigest struct {
+	OwnedPaths     []string `json:"owned_paths"`
+	DiffStat       string   `json:"diff_stat,omitempty"`
+	DiffCheck      string   `json:"diff_check"`
+	AutoFixed      bool     `json:"auto_fixed"`
+	AutoFixes      []string `json:"auto_fixes,omitempty"`
+	ArtifactPath   string   `json:"artifact_path,omitempty"`
+	PatchSHA256    string   `json:"patch_sha256,omitempty"`
+	PatchBytes     int      `json:"patch_bytes,omitempty"`
+	PatchTruncated bool     `json:"patch_truncated"`
+	ReviewContract string   `json:"review_contract"`
+}
+
+// WorkerCollectOutput is the compact Supervisor-facing rendezvous packet.
+// Full patches stay in a local artifact so ordinary collection does not inject
+// implementation-sized payloads into the Root context.
+type WorkerCollectOutput struct {
+	SliceID       string             `json:"slice_id"`
+	WorkerID      string             `json:"worker_id"`
+	Identity      ExecutionIdentity  `json:"identity"`
+	SessionID     string             `json:"session_id,omitempty"`
+	State         string             `json:"state"`
+	Report        WorkerReport       `json:"report"`
+	DurationMS    int64              `json:"duration_ms"`
+	FailureClass  string             `json:"failure_class,omitempty"`
+	RetryEligible bool               `json:"retry_eligible"`
+	Background    bool               `json:"background"`
+	Collected     bool               `json:"collected"`
+	Provisional   bool               `json:"provisional,omitempty"`
+	Integration   *IntegrationDigest `json:"integration,omitempty"`
 }
 
 type SpecialistOutput struct {
@@ -231,6 +282,9 @@ type WorkerStatus struct {
 	DurationMS    int64             `json:"duration_ms,omitempty"`
 	ToolUses      map[string]int    `json:"tool_uses,omitempty"`
 	Usage         TokenUsage        `json:"usage"`
+	Background    bool              `json:"background,omitempty"`
+	Collected     bool              `json:"collected,omitempty"`
+	Provisional   bool              `json:"provisional,omitempty"`
 }
 
 type SliceStatus struct {
@@ -246,6 +300,7 @@ type SliceStatus struct {
 	DurationMS    int64              `json:"duration_ms,omitempty"`
 	ToolUses      map[string]int     `json:"tool_uses,omitempty"`
 	Usage         *TokenUsage        `json:"usage,omitempty"`
+	Provisional   bool               `json:"provisional,omitempty"`
 }
 
 type WorkflowStatusOutput struct {
@@ -284,6 +339,21 @@ type RouteOutcome struct {
 	RecordedAt      string `json:"recorded_at"`
 }
 
+type RouteIntegrationSlice struct {
+	State        string `json:"state"`
+	DiffCheck    string `json:"diff_check,omitempty"`
+	AutoFixed    bool   `json:"auto_fixed,omitempty"`
+	ArtifactPath string `json:"artifact_path,omitempty"`
+}
+
+type RouteIntegrationState struct {
+	Required  int                              `json:"required"`
+	Completed int                              `json:"completed"`
+	Passed    int                              `json:"passed"`
+	AutoFixed int                              `json:"auto_fixed"`
+	Slices    map[string]RouteIntegrationSlice `json:"slices,omitempty"`
+}
+
 // RouteDiagnostics counts each child model invocation once. Token classes stay
 // separate so cached input is never silently added to ordinary input twice.
 // The Claude Code Supervisor is outside this MCP process and is therefore
@@ -308,19 +378,34 @@ type RouteDiagnostics struct {
 }
 
 type RouteRecord struct {
-	RouteID         string           `json:"route_id"`
-	State           string           `json:"state"`
-	Plan            router.Plan      `json:"plan"`
-	CreatedAt       string           `json:"created_at"`
+	RouteID            string      `json:"route_id"`
+	State              string      `json:"state"`
+	Plan               router.Plan `json:"plan"`
+	CreatedAt          string      `json:"created_at"`
+	RequestFingerprint string      `json:"request_fingerprint,omitempty"`
 	// RootSessionID is best-effort bind for resume / multi-process recovery.
-	RootSessionID   string           `json:"root_session_id,omitempty"`
-	ParentSessionID string           `json:"parent_session_id,omitempty"`
+	RootSessionID   string `json:"root_session_id,omitempty"`
+	ParentSessionID string `json:"parent_session_id,omitempty"`
 	// WorkDir absolute cwd when the route was planned (boundary for gate/verify).
-	WorkDir         string           `json:"workdir,omitempty"`
-	Diagnostics     RouteDiagnostics `json:"diagnostics"`
-	Outcome         *RouteOutcome    `json:"outcome,omitempty"`
-	LedgerStatus    string           `json:"ledger_status"`
-	LedgerError     string           `json:"ledger_error,omitempty"`
+	WorkDir      string                `json:"workdir,omitempty"`
+	Diagnostics  RouteDiagnostics      `json:"diagnostics"`
+	Integration  RouteIntegrationState `json:"integration"`
+	Outcome      *RouteOutcome         `json:"outcome,omitempty"`
+	LedgerStatus string                `json:"ledger_status"`
+	LedgerError  string                `json:"ledger_error,omitempty"`
+}
+
+// RouteOutcomeReceipt deliberately excludes the frozen route plan. The full
+// record remains in the durable ledger; Root only needs terminal acceptance,
+// integration, and accounting evidence on the MCP surface.
+type RouteOutcomeReceipt struct {
+	RouteID      string                `json:"route_id"`
+	State        string                `json:"state"`
+	Outcome      *RouteOutcome         `json:"outcome,omitempty"`
+	Integration  RouteIntegrationState `json:"integration"`
+	Diagnostics  RouteDiagnostics      `json:"diagnostics"`
+	LedgerStatus string                `json:"ledger_status"`
+	LedgerError  string                `json:"ledger_error,omitempty"`
 }
 
 type EmptyInput struct{}

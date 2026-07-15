@@ -2,6 +2,7 @@ package router
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -45,11 +46,17 @@ type RouteRequest struct {
 	AcceptanceCriteria         []string     `json:"acceptance_criteria,omitempty" jsonschema:"Observable acceptance criteria already fixed for the parent task. Required before automatic or mandatory Worker dispatch."`
 	VerificationTarget         string       `json:"verification_target,omitempty" jsonschema:"Exact deterministic command, probe, artifact check, or bounded semantic review that will evaluate the Worker slice."`
 	WorkerMarginalContribution string       `json:"worker_marginal_contribution,omitempty" jsonschema:"Concrete parent work or critical-path time one independent Worker would avoid duplicating. Required before automatic or mandatory Worker dispatch."`
+	EstimatedWorkerSeconds     int          `json:"estimated_worker_seconds,omitempty" jsonschema:"Evidence-based useful work duration for each candidate Worker slice. Worker admission requires at least 90 seconds; use 0 when unknown and stay direct."`
+	EstimatedParallelSavings   int          `json:"estimated_parallel_savings_seconds,omitempty" jsonschema:"Evidence-based critical-path savings after coordination and integration. Worker admission requires at least 45 seconds; use 0 when unknown and stay direct."`
+	EstimateBasis              string       `json:"estimate_basis,omitempty" jsonschema:"Short task-local evidence for the duration and savings estimates; never invent timing merely to obtain a Worker route."`
 	LaneHealth                 []LaneHealth `json:"lane_health,omitempty" jsonschema:"Observed runtime lane health only. Do not invent failures. The MCP server injects current-session evidence."`
 	IndependentSlices          int          `json:"independent_slices,omitempty" jsonschema:"Count of genuinely independent bounded slices, 0 to 3. Do not invent slices."`
 	SharedMutableState         bool         `json:"shared_mutable_state,omitempty" jsonschema:"Whether candidate workstreams would edit or coordinate through shared mutable state."`
 	Checkability               string       `json:"checkability,omitempty" jsonschema:"auto, objective, partial, or semantic."`
 	Topology                   string       `json:"topology,omitempty" jsonschema:"auto, direct, or worker. Worker is a user-mandated topology and still must be admissible."`
+	// RuntimeVerifierStatus is injected by claudex-flow after a zero-model
+	// executable/environment preflight. It is not caller-controlled.
+	RuntimeVerifierStatus string `json:"-"`
 }
 
 type Lane struct {
@@ -127,11 +134,26 @@ type Plan struct {
 	AdoptionRule           string             `json:"adoption_rule"`
 	WorkerAdmissible       bool               `json:"worker_admissible"`
 	WorkerRejectionReasons []string           `json:"worker_rejection_reasons,omitempty"`
+	WorkerPolicy           WorkerPolicy       `json:"worker_policy"`
 	Verification           string             `json:"verification"`
 	ResidualReview         string             `json:"residual_review"`
 	Escalation             []EscalationStep   `json:"escalation"`
 	StopCondition          string             `json:"stop_condition"`
 	BlockedCapability      string             `json:"blocked_capability,omitempty"`
+}
+
+// WorkerPolicy is the runtime-enforced downside bound for delegation. Caller
+// timing estimates remain advisory; they never authorize unbounded fan-out.
+// Automatic routing always keeps one independent slice with the Supervisor.
+type WorkerPolicy struct {
+	Mode                     string `json:"mode"`
+	EstimateTrust            string `json:"estimate_trust"`
+	EstimatedWorkerSeconds   int    `json:"estimated_worker_seconds,omitempty"`
+	EstimatedParallelSavings int    `json:"estimated_parallel_savings_seconds,omitempty"`
+	IndependentSlices        int    `json:"independent_slices"`
+	RootOwnedSlices          int    `json:"root_owned_slices"`
+	MaxWorkerStarts          int    `json:"max_worker_starts"`
+	MaxWorkerDeadlineMS      int64  `json:"max_worker_deadline_ms"`
 }
 
 // Decision preserves the single-lane CLI surface while embedding the route
@@ -225,6 +247,16 @@ func PlanRoute(in RouteRequest) (Plan, error) {
 	if in.IndependentSlices < 0 || in.IndependentSlices > 3 {
 		return Plan{}, fmt.Errorf("independent_slices must be between 0 and 3")
 	}
+	if in.EstimatedWorkerSeconds < 0 || in.EstimatedWorkerSeconds > 86_400 {
+		return Plan{}, fmt.Errorf("estimated_worker_seconds must be between 0 and 86400")
+	}
+	if in.EstimatedParallelSavings < 0 || in.EstimatedParallelSavings > 86_400 {
+		return Plan{}, fmt.Errorf("estimated_parallel_savings_seconds must be between 0 and 86400")
+	}
+	in.EstimateBasis = strings.TrimSpace(in.EstimateBasis)
+	if len(in.EstimateBasis) > 2000 {
+		return Plan{}, fmt.Errorf("estimate_basis exceeds 2000 bytes")
+	}
 	urls := append([]string(nil), in.ExplicitURLs...)
 	if len(urls) == 0 {
 		urls = urlPattern.FindAllString(in.Objective, 8)
@@ -258,8 +290,9 @@ func PlanRoute(in RouteRequest) (Plan, error) {
 		return Plan{}, fmt.Errorf("mandatory worker topology is not admissible: %s", strings.Join(workerReasons, "; "))
 	}
 
-	supervisor := Lane{Model: "gpt-5.6-sol", Effort: "xhigh", Role: "supervisor"}
+	supervisor := Lane{Model: "gpt-5.6-sol", Effort: supervisorEffort(), Role: "supervisor"}
 	action, selected, reason := chooseAction(in, urls, workerAdmissible, supervisor)
+	workerPolicy := buildWorkerPolicy(in, action)
 	blockedCapability := ""
 	if selected.Tool != "" && laneUnavailable(in.LaneHealth, selected.Tool) {
 		blockedCapability = selected.Tool
@@ -279,7 +312,7 @@ func PlanRoute(in RouteRequest) (Plan, error) {
 		Kind: in.Kind, Risk: in.Risk, Action: action, Supervisor: supervisor, SelectedLane: selected,
 		Reason: reason,
 		Surface: SurfaceSnapshot{
-			Client: "Claude Code via Claude X", LeadLane: "gpt-5.6-sol/xhigh", WorkerLane: "grok-4.5/high",
+			Client: "Claude Code via Claude X", LeadLane: "gpt-5.6-sol/" + supervisor.Effort, WorkerLane: "grok-4.5/high",
 			WorkerOverrideEvidence: "pinned request plus resolved-model verification", MaximumConcurrentRuns: 3,
 			AccountingComparability: "mixed subscription and gateway signals; no single comparable spend unit",
 			LaneHealth:              append([]LaneHealth(nil), in.LaneHealth...),
@@ -293,7 +326,7 @@ func PlanRoute(in RouteRequest) (Plan, error) {
 		Candidates: candidates, EvidenceBasis: evidenceBasis,
 		AccountingUnit: "relative_resource_intensity", DurableDefault: false,
 		AdoptionRule:     "promote a route only after predeclared representative runs meet the frozen acceptance contract and non-inferiority threshold",
-		WorkerAdmissible: workerAdmissible, WorkerRejectionReasons: workerReasons,
+		WorkerAdmissible: workerAdmissible, WorkerRejectionReasons: workerReasons, WorkerPolicy: workerPolicy,
 		Verification:   verificationInstruction(in.VerificationTarget),
 		ResidualReview: residual,
 		Escalation: []EscalationStep{
@@ -304,6 +337,46 @@ func PlanRoute(in RouteRequest) (Plan, error) {
 		},
 		StopCondition: stopCondition(blockedCapability), BlockedCapability: blockedCapability,
 	}, nil
+}
+
+func buildWorkerPolicy(in RouteRequest, action Action) WorkerPolicy {
+	policy := WorkerPolicy{
+		Mode: "direct", EstimateTrust: "caller_advisory_unattested",
+		EstimatedWorkerSeconds:   in.EstimatedWorkerSeconds,
+		EstimatedParallelSavings: in.EstimatedParallelSavings,
+		IndependentSlices:        in.IndependentSlices,
+	}
+	if action != ActionWorker {
+		return policy
+	}
+	policy.Mode = "bounded_speculation"
+	policy.MaxWorkerDeadlineMS = 180_000
+	policy.RootOwnedSlices = 1
+	policy.MaxWorkerStarts = in.IndependentSlices - policy.RootOwnedSlices
+	if policy.MaxWorkerStarts > 2 {
+		policy.MaxWorkerStarts = 2
+	}
+	if in.Topology == "worker" {
+		// A user-mandated topology may assign every declared slice, but remains
+		// bounded by the normal runtime concurrency and a five-minute deadline.
+		policy.Mode = "user_mandated_bounded"
+		policy.RootOwnedSlices = 0
+		policy.MaxWorkerStarts = in.IndependentSlices
+		policy.MaxWorkerDeadlineMS = 300_000
+	}
+	if policy.MaxWorkerStarts < 0 {
+		policy.MaxWorkerStarts = 0
+	}
+	return policy
+}
+
+func supervisorEffort() string {
+	switch effort := strings.ToLower(strings.TrimSpace(os.Getenv("CLAUDEX_THREAD_EFFORT"))); effort {
+	case "medium", "high", "xhigh":
+		return effort
+	default:
+		return "high"
+	}
 }
 
 func chooseAction(in RouteRequest, urls []string, workerAdmissible bool, supervisor Lane) (Action, Lane, string) {
@@ -344,14 +417,29 @@ func workerRejectionReasons(in RouteRequest, factors RouteFactors) []string {
 	if in.IndependentSlices == 0 {
 		reasons = append(reasons, "no independent slice was declared")
 	}
+	if in.Topology == "auto" && in.IndependentSlices < 2 {
+		reasons = append(reasons, "automatic delegation requires at least two independent slices so the Supervisor retains useful work")
+	}
 	if strings.TrimSpace(in.WorkerMarginalContribution) == "" {
 		reasons = append(reasons, "no marginal contribution was declared for the Worker")
+	}
+	if in.EstimatedWorkerSeconds < 90 {
+		reasons = append(reasons, "estimated useful work per Worker is below the 90-second delegation threshold")
+	}
+	if in.EstimatedParallelSavings < 45 {
+		reasons = append(reasons, "estimated critical-path savings is below the 45-second delegation threshold")
+	}
+	if strings.TrimSpace(in.EstimateBasis) == "" {
+		reasons = append(reasons, "no task-local estimate basis was supplied; unknown ROI stays Supervisor-direct")
 	}
 	if in.SharedMutableState {
 		reasons = append(reasons, "candidate work shares mutable state")
 	}
 	if factors.Checkability == "semantic" {
 		reasons = append(reasons, "the slice lacks an affordable objective or partial verifier")
+	}
+	if in.RuntimeVerifierStatus != "" && in.RuntimeVerifierStatus != "available" && in.RuntimeVerifierStatus != "available_fallback" {
+		reasons = append(reasons, "the Root verifier is not executable in the current project environment (status="+in.RuntimeVerifierStatus+")")
 	}
 	if factors.ContextDuplication == "high" {
 		reasons = append(reasons, "the slice would duplicate most lead context")

@@ -86,6 +86,7 @@ func Collect(ctx context.Context, input io.Reader) Delivery {
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return Delivery{Enabled: true, Detail: "invalid hook JSON: " + err.Error()}
 	}
+	defer cleanupEphemeralSecurityKey(payload)
 
 	eventID := newEventID()
 	sessionID := stringFromAny(payload["session_id"])
@@ -142,6 +143,35 @@ func Collect(ctx context.Context, input io.Reader) Delivery {
 		_ = threadgraph.CommitCursor(graphAttach)
 		return Delivery{Enabled: true, Spooled: true, EventID: eventID, Detail: err.Error()}
 	}
+}
+
+// Some Claude/custom-model runtime builds create a per-working-copy
+// logs/security/.security-key. It is session plumbing, not project output.
+// Remove it only on terminal hooks and only when the directory contains the
+// exact 32-byte key and nothing else; any real security log makes this a no-op.
+func cleanupEphemeralSecurityKey(payload map[string]any) {
+	event := stringFromAny(payload["hook_event_name"])
+	if event != "Stop" && event != "SessionEnd" {
+		return
+	}
+	cwd := stringFromAny(payload["cwd"])
+	if cwd == "" {
+		return
+	}
+	dir := filepath.Join(cwd, "logs", "security")
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != ".security-key" || entries[0].Type()&os.ModeSymlink != 0 {
+		return
+	}
+	key := filepath.Join(dir, ".security-key")
+	info, err := os.Lstat(key)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != 32 {
+		return
+	}
+	if os.Remove(key) != nil || os.Remove(dir) != nil {
+		return
+	}
+	_ = os.Remove(filepath.Join(cwd, "logs")) // succeeds only when empty
 }
 
 // sanitizeUsageRecords keeps only the compact numeric usage shape for upload.

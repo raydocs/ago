@@ -21,18 +21,20 @@ type Server struct {
 	root           string
 	parentPID      int
 	transcriptRoot string
+	serverCtx      context.Context
 
-	mu              sync.Mutex
-	workers         map[string]*workerState
-	leases          map[string]string
-	attemptedSlices map[string]int
-	preparingSlices map[string]bool
-	sliceInputs     map[string]WorkerStartInput
-	sliceHistory    []*sliceState
-	laneHealth      map[string]router.LaneHealth
+	mu                     sync.Mutex
+	workers                map[string]*workerState
+	leases                 map[string]string
+	attemptedSlices        map[string]int
+	preparingSlices        map[string]bool
+	sliceInputs            map[string]WorkerStartInput
+	sliceHistory           []*sliceState
+	laneHealth             map[string]router.LaneHealth
 	routes                 map[string]*RouteRecord
 	routeLedgerPath        string
 	openRoutesPathOverride string // tests
+	strictWorkerRoutes     bool
 	nextID                 atomic.Int32
 	nextRoute              atomic.Int32
 	runModel               func(context.Context, claude.Request) claude.Result
@@ -55,6 +57,7 @@ type workerState struct {
 	workDir       string
 	write         bool
 	paths         []string
+	allowBash     bool
 	leased        bool
 	turn          int
 	deadlineMS    int64
@@ -69,9 +72,19 @@ type workerState struct {
 	identity      ExecutionIdentity
 	failureClass  string
 	retryEligible bool
-	// T6: model turns accumulated across start+resume (MaxTurns per invoke stays ≤10).
-	cumulativeModelTurns   int
-	turnAccountingQuality  string // exact | upper_bound | unknown
+	background    bool
+	collecting    bool
+	collected     bool
+	done          chan struct{}
+	doneOnce      sync.Once
+	cancel        context.CancelFunc
+	backgroundErr error
+	closing       bool
+	provisional   bool
+	integration   *IntegrationDigest
+	// T6: model turns accumulated across start+resume (MaxTurns per invoke stays ≤12).
+	cumulativeModelTurns  int
+	turnAccountingQuality string // exact | upper_bound | unknown
 }
 
 type sliceState struct {
@@ -93,40 +106,52 @@ func Run(ctx context.Context, version, settings string) error {
 		return err
 	}
 	s := &Server{
-		settings:        settings,
-		root:            root,
-		parentPID:       os.Getppid(),
-		transcriptRoot:  os.Getenv("CLAUDEX_TRANSCRIPT_ROOT"),
-		workers:         map[string]*workerState{},
-		leases:          map[string]string{},
-		attemptedSlices: map[string]int{},
-		preparingSlices: map[string]bool{},
-		sliceInputs:     map[string]WorkerStartInput{},
-		routes:          map[string]*RouteRecord{},
-		routeLedgerPath: defaultRouteLedgerPath(),
-		slots:           make(chan struct{}, maxConcurrentRuns),
-		runModel:        claude.Run,
+		settings:           settings,
+		root:               root,
+		parentPID:          os.Getppid(),
+		transcriptRoot:     os.Getenv("CLAUDEX_TRANSCRIPT_ROOT"),
+		serverCtx:          ctx,
+		workers:            map[string]*workerState{},
+		leases:             map[string]string{},
+		attemptedSlices:    map[string]int{},
+		preparingSlices:    map[string]bool{},
+		sliceInputs:        map[string]WorkerStartInput{},
+		routes:             map[string]*RouteRecord{},
+		routeLedgerPath:    defaultRouteLedgerPath(),
+		strictWorkerRoutes: true,
+		slots:              make(chan struct{}, maxConcurrentRuns),
+		runModel:           claude.Run,
 	}
 	// Resume recovery: hydrate open routes from durable index before serving tools.
 	s.loadOpenRoutesIntoMemory()
 	server := mcp.NewServer(&mcp.Implementation{Name: "claudex-flow", Version: version}, nil)
 	readOnly, openWorld, destructive := true, true, true
+	routeSchema, err := routeTaskInputSchema()
+	if err != nil {
+		return fmt.Errorf("build route_task input schema: %w", err)
+	}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "route_task",
-		Description: "Zero-model prospective route comparison for a substantial task when the choice between Sol direct, one specialist capability, and one bounded Worker is materially uncertain. It reports task-shape factors, the frozen acceptance contract, live lane health, three candidates, relative resource intensity, worker admissibility, verification, and a one-dimension-at-a-time escalation ladder. Automatic or mandatory Worker routing requires observable acceptance_criteria, a concrete verification_target, and a truthful worker_marginal_contribution naming the Supervisor work or critical-path delay the Worker avoids. A quarantined lane is never silently replaced. It never launches a model or establishes a durable default from one heuristic.",
+		Description: "Zero-model prospective route comparison for a substantial task when the choice between Sol direct, one specialist capability, and bounded Worker speculation is materially uncertain. Use only schema-listed enum values: checkability is auto/objective/partial/semantic; topology is auto/direct/worker; risk is normal/high. root_verifier applies the project contract (explicit environment, executable requested command, then high-confidence repository runner) without running tests or setup. Automatic Worker admission requires an available verifier; setup_required/unavailable/resolution_required stays Supervisor-direct. Exact repeated requests reuse the open route. Automatic Worker routing requires at least two independent slices and keeps one slice with the Supervisor. Caller time estimates are explicitly unattested; runtime caps fan-out and Worker deadlines. Unknown or sub-threshold ROI stays Supervisor-direct. A quarantined lane is never silently replaced.",
+		InputSchema: routeSchema,
 		Annotations: &mcp.ToolAnnotations{Title: "Plan accepted-result route", ReadOnlyHint: readOnly},
-	}, s.routeTask)
+	}, s.routeTaskTool)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "record_route_outcome",
-		Description: "Close one route_id returned by route_task as accepted, failed, or abandoned. Accepted requires concrete verification evidence. Records human correction, residual risk, and child-call diagnostics without invoking a model, then appends one compact local JSONL record. Supervisor cost remains explicitly unobserved rather than estimated. Use only for substantial tasks that actually called route_task.",
+		Description: "Close one route_id returned by route_task as accepted, failed, or abandoned. Accepted requires concrete verification evidence; bounded_worker routes additionally require every started slice to have a completed passing integration check. Returns a compact receipt while the full plan and diagnostics remain in the local ledger. Supervisor cost remains explicitly unobserved rather than estimated.",
 		Annotations: &mcp.ToolAnnotations{Title: "Record accepted route outcome", ReadOnlyHint: false},
 	}, s.recordRouteOutcome)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "start_worker",
-		Description: "Create one persistent Grok 4.5 high worker for a bounded independent slice. Runtime admission requires a stable slice_id, marginal contribution, output contract, done condition, bounded deadline, and explicit non-overlapping write paths. Admission rejection invokes no model or budget. A failed start may be retried once only when runtime reports retry_eligible=true, with the identical slice and a retry_reason; no model fallback is performed.",
+		Description: "Create one persistent Grok 4.5 high worker for a bounded independent slice selected by route_task. For a route-bound start, send only route_id, slice_id, objective, paths, write, background, plus genuinely slice-specific context or done_condition when needed; runtime inherits the frozen estimates, deadline, output contract, and verifier defaults. A literal single verifier enables one Worker Bash attempt and 12 initial turns; descriptive slice completion keeps verification Root-only, withholds Bash, and caps the initial call at 8 turns. Set background=true, let the Supervisor implement its disjoint retained slice, then collect exactly once. Runtime enforces fan-out, deadline, verifier, and write scopes.",
 		Annotations: &mcp.ToolAnnotations{Title: "Start Grok 4.5 worker", ReadOnlyHint: false, DestructiveHint: &destructive},
 	}, s.startWorker)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "collect_worker",
+		Description: "Wait once for one background Worker and return a compact terminal report, scoped diff stat/check, and local patch artifact path. Runtime deterministically repairs introduced trailing whitespace or blank EOF lines and rechecks them. Read the artifact only for a concrete residual risk or repair; otherwise use the acceptance mapping and run the attested Root verifier once. Non-hygiene integration failures require one localized resume of the same Worker. Do not poll workflow_status or call collect_worker repeatedly.",
+		Annotations: &mcp.ToolAnnotations{Title: "Collect background Worker", ReadOnlyHint: readOnly},
+	}, s.collectWorker)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "resume_worker",
 		Description: "Append evidence or verifier feedback to the same persistent Grok 4.5 high worker thread and wait for its next structured response. Always use the original worker_id; do not create a replacement worker or resend the full task. Typical loop: worker needs capability -> specialist returns evidence -> resume this worker -> verify -> optionally resume once with bounded failure evidence.",
@@ -383,7 +408,7 @@ func (s *Server) workflowStatus(_ context.Context, _ *mcp.CallToolRequest, _ Emp
 	sort.Slice(routes, func(i, j int) bool { return routes[i].CreatedAt < routes[j].CreatedAt })
 	return nil, WorkflowStatusOutput{
 		Contract:        Contract(),
-		Supervisor:      "gpt-5.6-sol/xhigh",
+		Supervisor:      Contract().SupervisorProfile,
 		WorkerProfile:   "grok-4.5/high",
 		ActiveRuns:      int(s.activeRuns.Load()),
 		WorkerStarts:    s.workerStarts.Load(),
@@ -421,6 +446,9 @@ func workerStatusLocked(w *workerState) WorkerStatus {
 		Identity:      w.identity,
 		FailureClass:  w.failureClass,
 		RetryEligible: w.retryEligible,
+		Background:    w.background,
+		Collected:     w.collected,
+		Provisional:   w.provisional,
 	}
 }
 

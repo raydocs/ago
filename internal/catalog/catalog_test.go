@@ -7,7 +7,7 @@ func TestValidateEffort(t *testing.T) {
 		model, effort string
 		wantErr       bool
 	}{
-		{"gpt-5.6-sol", "xhigh", false},
+		{"gpt-5.6-sol", "high", false},
 		{"gpt-5.6-sol", "max", true},
 		{"gemini-3.1-pro", "medium", false},
 		{"gemini-3.1-pro", "xhigh", true},

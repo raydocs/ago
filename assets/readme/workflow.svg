@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 390" role="img" aria-labelledby="title desc">
+  <title id="title">ClaudeX Flow routing architecture</title>
+  <desc id="desc">Localized work stays with Sol, evidence gaps use capabilities, and only independent verified slices start bounded Grok workers.</desc>
+  <defs><linearGradient id="line" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#36D4FF"/><stop offset="1" stop-color="#F06CFF"/></linearGradient></defs>
+  <rect width="1200" height="390" rx="24" fill="#0B0F16"/>
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+    <text x="48" y="55" fill="#8A95A8" font-size="14" letter-spacing="2">ONE POLICY · THREE EXECUTION SHAPES · ONE ACCEPTANCE OWNER</text>
+    <path d="M250 191H352M548 191H650M846 191H948" stroke="url(#line)" stroke-width="3"/>
+    <path d="M352 191l-10-6v12zM650 191l-10-6v12zM948 191l-10-6v12z" fill="#73E4FF"/>
+    <g transform="translate(48 118)">
+      <rect width="202" height="146" rx="17" fill="#111722" stroke="#354052"/>
+      <text x="22" y="34" fill="#7C879A" font-size="12">01 / TRIAGE</text><text x="22" y="66" fill="#F5F7FB" font-size="20" font-weight="700">FREEZE CONTRACT</text>
+      <text x="22" y="96" fill="#AAB4C4" font-size="13">scope · verifier · risk</text><text x="22" y="119" fill="#AAB4C4" font-size="13">stop condition</text>
+    </g>
+    <g transform="translate(352 96)">
+      <rect width="196" height="190" rx="17" fill="#101B25" stroke="#36D4FF" stroke-opacity=".7"/>
+      <text x="22" y="34" fill="#36D4FF" font-size="12">02 / SOL ROOT</text><text x="22" y="67" fill="#F5F7FB" font-size="20" font-weight="700">KEEP IT DIRECT</text>
+      <text x="22" y="99" fill="#AFBACA" font-size="13">localized</text><text x="22" y="122" fill="#AFBACA" font-size="13">serial</text><text x="22" y="145" fill="#AFBACA" font-size="13">high-risk</text>
+      <rect x="22" y="158" width="118" height="20" rx="10" fill="#36D4FF" fill-opacity=".12"/><text x="34" y="172" fill="#8CEAFF" font-size="10">NO CEREMONY</text>
+    </g>
+    <g transform="translate(650 96)">
+      <rect width="196" height="190" rx="17" fill="#18131E" stroke="#F06CFF" stroke-opacity=".65"/>
+      <text x="22" y="34" fill="#F06CFF" font-size="12">03 / OPTIONAL</text><text x="22" y="67" fill="#F5F7FB" font-size="20" font-weight="700">OPEN ONE LANE</text>
+      <text x="22" y="99" fill="#C4B5CA" font-size="13">specialist evidence</text><text x="22" y="122" fill="#C4B5CA" font-size="13">or disjoint Worker</text><text x="22" y="145" fill="#C4B5CA" font-size="13">only with positive ROI</text>
+      <rect x="22" y="158" width="130" height="20" rx="10" fill="#F06CFF" fill-opacity=".12"/><text x="34" y="172" fill="#F5AEFF" font-size="10">HARD BOUNDARIES</text>
+    </g>
+    <g transform="translate(948 118)">
+      <rect width="204" height="146" rx="17" fill="#111722" stroke="#36D4FF"/>
+      <text x="22" y="34" fill="#36D4FF" font-size="12">04 / ACCEPT</text><text x="22" y="66" fill="#F5F7FB" font-size="20" font-weight="700">VERIFY ONCE</text>
+      <text x="22" y="96" fill="#AAB4C4" font-size="13">integrate · test</text><text x="22" y="119" fill="#AAB4C4" font-size="13">record · stop</text>
+    </g>
+    <text x="48" y="340" fill="#657186" font-size="12">Workers are a latency tool, not a default stage.</text>
+    <text x="1152" y="340" fill="#657186" font-size="12" text-anchor="end">ROOT RETAINS ACCEPTANCE</text>
+  </g>
+</svg>

@@ -16,3 +16,9 @@ thread-app/.test-dist/
 thread-app/thread-app/.test-dist/
 outputs/*.tar.gz
 outputs/claudex-flow-darwin-arm64
+dist/claudex-flow-*-darwin-*
+dist/claudex-flow-*-linux-*
+dist/claudex-flow-*.sha256
+outputs/runtime-contract-*.json
+outputs/claudex-flow-*.sha256
+*.png

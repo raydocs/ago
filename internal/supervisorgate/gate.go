@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"claudexflow/internal/fastpath"
 )
 
 const maxHookInputBytes = 4 * 1024 * 1024
@@ -50,8 +53,8 @@ type HookInput struct {
 	ErrorDetails     string `json:"error_details"`
 	LastAssistantMsg string `json:"last_assistant_message"`
 	// Optional usage fields if present on hook payloads.
-	InputTokens             int64 `json:"input_tokens"`
-	CacheReadInputTokens    int64 `json:"cache_read_input_tokens"`
+	InputTokens              int64 `json:"input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 }
 
@@ -83,7 +86,7 @@ func Run(input io.Reader, cfg Config) (Decision, []byte, error) {
 	if len(raw) > maxHookInputBytes {
 		return Decision{}, nil, fmt.Errorf("supervisor-gate hook input exceeds %d bytes", maxHookInputBytes)
 	}
-	if os.Getenv("CLAUDE_CODE_CHILD_SESSION") == "1" {
+	if isActualChildSession() {
 		return Decision{State: "child_skip"}, nil, nil
 	}
 	var hook HookInput
@@ -189,6 +192,10 @@ func Run(input io.Reader, cfg Config) (Decision, []byte, error) {
 	return decision, out, encErr
 }
 
+func isActualChildSession() bool {
+	return os.Getenv("CLAUDE_CODE_CHILD_SESSION") == "1" && strings.TrimSpace(os.Getenv("CLAUDEX_THREAD_ROLE")) != "supervisor"
+}
+
 func normalizeConfig(cfg Config) Config {
 	if cfg.StateDir == "" {
 		cfg.StateDir = DefaultStateDir()
@@ -274,6 +281,20 @@ func expireOverride(st *state, now time.Time) {
 }
 
 func handleUserPrompt(st *state, hook HookInput, cfg Config) Decision {
+	// A new user turn releases the previous final-only latch. Fast Path never
+	// leaks across turns.
+	st.VerifiedStop = false
+	st.VerifiedReason = ""
+	st.FastPathActive = false
+	st.FastPathTarget = ""
+	st.FastPathVerifier = ""
+	st.FastPathEdited = false
+	st.FastPathDiffSeen = false
+	if contract, ok := fastpath.Parse(hook.Prompt); ok && st.OpenGate == nil && !st.StickyReroutePending && !st.HandoffRequired && !st.OverflowLatched {
+		st.FastPathActive = true
+		st.FastPathTarget = contract.TargetPath
+		st.FastPathVerifier = contract.Verifier
+	}
 	// Only real UserPromptSubmit may issue overrides (not model/MCP self-auth).
 	if lease, ok, msg := parseGateOverride(hook.Prompt, cfg.Now()); ok {
 		if st.HandoffRequired {
@@ -291,6 +312,9 @@ func handleUserPrompt(st *state, hook HookInput, cfg Config) Decision {
 			State:   "override_issued",
 			Context: fmt.Sprintf("CLAUDEX_GATE_OVERRIDE v1: lease active until %s, remaining_actions=%d, paths=%v. %s", lease.ExpiresAt, lease.RemainingActions, lease.PathScope, msg),
 		}
+	}
+	if st.FastPathActive {
+		return Decision{State: "fast_path", Context: fastpath.Context(fastpath.Contract{TargetPath: st.FastPathTarget, Verifier: st.FastPathVerifier})}
 	}
 	return Decision{State: "user_prompt"}
 }
@@ -372,6 +396,22 @@ func handleStopFailure(st *state, hook HookInput, cfg Config) Decision {
 func recordTool(st *state, hook HookInput, cfg Config) Decision {
 	name := hook.ToolName
 	st.LastToolName = name
+	if hook.HookEventName == "PostToolUse" && st.FastPathActive {
+		switch name {
+		case "Edit", "Write", "MultiEdit":
+			if fastPathTargetMatches(*st, hook) {
+				st.FastPathEdited = true
+			}
+		case "Bash":
+			command := strings.TrimSpace(bashCommand(hook.ToolInput))
+			if fastPathReadOnlyDiffMatches(*st, hook) && hook.HookEventName == "PostToolUse" {
+				st.FastPathDiffSeen = true
+			} else if st.FastPathEdited && command == st.FastPathVerifier && fastpath.SafeVerifier(command) && !toolResponseInterrupted(hook.ToolResponse) {
+				st.VerifiedStop = true
+				st.VerifiedReason = "Fast Path target edited and frozen verifier succeeded"
+			}
+		}
+	}
 	// Capture write-path hints for handoff recovery (bounded).
 	if p := toolPathFromInput(hook.ToolInput); p != "" && (name == "Write" || name == "Edit" || name == "MultiEdit") {
 		st.PathHints = appendPathHint(st.PathHints, p, 32)
@@ -435,14 +475,20 @@ func recordTool(st *state, hook HookInput, cfg Config) Decision {
 		}
 		st.LastVerifyKey = key
 	}
-	// Arm sticky when Root or gate soft high-cost crossed.
-	rootSoft := st.HighCostCalls >= cfg.HighCostSoft
+	// Sticky re-route is gate-local. Ordinary one-shot implementation has no
+	// lifecycle gate by design; forcing it to create one after a handful of
+	// edits/tests adds tool turns without changing the acceptance boundary.
+	// The Root hard cap still protects ungated work. A genuine multi-stage gate
+	// retains the sticky soft limit and requires an explicit re-route decision.
 	gateSoft := st.OpenGate != nil && st.OpenGate.HighCostCalls >= cfg.GateHighCostSoft
-	if (rootSoft || gateSoft) && !st.StickyReroutePending {
+	if gateSoft && !st.StickyReroutePending {
 		st.StickyReroutePending = true
 		st.StickyReason = fmt.Sprintf("high_cost root=%d gate=%d", st.HighCostCalls, gateHigh(*st))
 	}
 	refreshLifecycle(st, hook, cfg)
+	if st.VerifiedStop {
+		return Decision{State: "verified_stop_latched", Context: verifiedStopContext(*st)}
+	}
 	return Decision{State: "recorded"}
 }
 
@@ -451,19 +497,38 @@ func evaluatePre(st *state, hook HookInput, cfg Config) Decision {
 	refreshLifecycle(st, hook, cfg)
 	expireOverride(st, cfg.Now())
 
-	// Control tools always allowed (scheduler must not lock itself out).
-	if isControlTool(name) {
-		return Decision{Permission: "allow", State: "control_allow"}
-	}
-
-	// T5: opt-in workflow strict mode denies native Agent fan-out.
-	if os.Getenv("CLAUDEX_WORKFLOW_STRICT") == "1" && name == "Agent" {
+	if st.VerifiedStop {
+		if isVerifiedStopControl(name) {
+			return Decision{Permission: "allow", State: "verified_stop_control_allow", Context: verifiedStopContext(*st)}
+		}
 		return Decision{
 			Permission: "deny",
-			Reason:      "CLAUDEX_WORKFLOW_STRICT: native Agent denied; use mcp__claudex-flow__start_worker or explore_repository",
-			Context:    "CLAUDEX_STRICT: prefer MCP Worker/specialist lanes for unattended canaries.",
-			State:      "strict_agent_deny",
+			Reason:     "CLAUDEX_VERIFIED_HARD_STOP: deterministic verifier already passed; no more tools on this turn",
+			Context:    verifiedStopContext(*st),
+			State:      "verified_stop_deny",
 		}
+	}
+
+	if st.FastPathActive {
+		return evaluateFastPathPre(*st, hook)
+	}
+
+	// Strict workflow mode removes Claude Code's native Agent/Task bookkeeping
+	// surface. Claude X workers are event-returning MCP calls, so polling TaskGet
+	// or maintaining a second task ledger only adds context and tool round trips.
+	if os.Getenv("CLAUDEX_WORKFLOW_STRICT") == "1" && isNativeCoordinationTool(name) {
+		return Decision{
+			Permission: "deny",
+			Reason:     "CLAUDEX_WORKFLOW_STRICT: native Agent/Task coordination denied; use one event-returning mcp__claudex-flow__start_worker call only after ROI admission",
+			Context:    "CLAUDEX_STRICT: keep short and serial work Supervisor-direct; do not poll worker state.",
+			State:      "strict_coordination_deny",
+		}
+	}
+
+	// Control tools always allowed (scheduler must not lock itself out). Native
+	// Task controls were already rejected above when strict mode is enabled.
+	if isControlTool(name) {
+		return Decision{Permission: "allow", State: "control_allow"}
 	}
 
 	// User override lease (construction tools only, path-scoped).
@@ -523,7 +588,7 @@ func evaluatePre(st *state, hook HookInput, cfg Config) Decision {
 	if st.StickyReroutePending && isHighCost(name) {
 		return Decision{
 			Permission: "deny",
-			Reason:      "CLAUDEX_STICKY_REROUTE: call mcp__claudex-flow__ack_reroute with open gate_id, remaining_acceptance, and worker_decision before more high-cost tools",
+			Reason:     "CLAUDEX_STICKY_REROUTE: call mcp__claudex-flow__ack_reroute with open gate_id, remaining_acceptance, and worker_decision before more high-cost tools",
 			Context:    stickyContext(*st),
 			State:      "sticky_deny",
 		}
@@ -603,6 +668,119 @@ func evaluatePre(st *state, hook HookInput, cfg Config) Decision {
 	return Decision{Permission: "allow", State: "allow"}
 }
 
+func isNativeCoordinationTool(name string) bool {
+	switch name {
+	case "Agent", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskUpdate":
+		return true
+	default:
+		return false
+	}
+}
+
+func verifiedStopContext(st state) string {
+	return fmt.Sprintf("CLAUDEX_VERIFIED_HARD_STOP v1: %s. Return the concise result now. Do not inspect diff/status, re-run tests, open a review, or start another model. Control tools remain available only to close an already-open lifecycle record.", st.VerifiedReason)
+}
+
+func evaluateFastPathPre(st state, hook HookInput) Decision {
+	context := fastpath.Context(fastpath.Contract{TargetPath: st.FastPathTarget, Verifier: st.FastPathVerifier})
+	deny := func(reason string) Decision {
+		return Decision{Permission: "deny", Reason: "CLAUDEX_FAST_PATH_HARD: " + reason, Context: context, State: "fast_path_deny"}
+	}
+	switch hook.ToolName {
+	case "Read", "Grep":
+		if !fastPathTargetMatches(st, hook) {
+			return deny("read scope must be the frozen target file")
+		}
+		return Decision{Permission: "allow", State: "fast_path_read_allow", Context: context}
+	case "Edit", "Write", "MultiEdit":
+		if !fastPathTargetMatches(st, hook) {
+			return deny("write scope must be the frozen target file")
+		}
+		return Decision{Permission: "allow", State: "fast_path_edit_allow", Context: context}
+	case "Bash":
+		command := strings.TrimSpace(bashCommand(hook.ToolInput))
+		if !st.FastPathEdited {
+			return deny("the frozen target must be edited successfully before verification")
+		}
+		if fastPathReadOnlyDiffMatches(st, hook) {
+			if st.FastPathDiffSeen {
+				return deny("the one read-only target diff was already inspected")
+			}
+			return Decision{Permission: "allow", State: "fast_path_diff_allow", Context: context}
+		}
+		if command != st.FastPathVerifier || !fastpath.SafeVerifier(command) {
+			return deny("only one exact read-only target diff or the frozen foreground verifier is allowed; never combine commands")
+		}
+		return Decision{Permission: "allow", State: "fast_path_verify_allow", Context: context}
+	default:
+		return deny("orchestration, secondary models, broad tools, and lifecycle ceremony are disabled on Fast Path")
+	}
+}
+
+func fastPathTargetMatches(st state, hook HookInput) bool {
+	actual := strings.TrimSpace(toolPathFromInput(hook.ToolInput))
+	return fastPathPathMatches(st, hook.Cwd, actual)
+}
+
+func fastPathPathMatches(st state, cwd, actual string) bool {
+	target := strings.TrimSpace(st.FastPathTarget)
+	if actual == "" || target == "" {
+		return false
+	}
+	if filepath.Clean(actual) == filepath.Clean(target) {
+		return true
+	}
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		cwd = "."
+	}
+	resolve := func(path string) string {
+		path = expandHome(path)
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(cwd, path)
+		}
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return filepath.Clean(path)
+		}
+		return filepath.Clean(absolute)
+	}
+	return resolve(actual) == resolve(target)
+}
+
+// fastPathReadOnlyDiffMatches admits exactly `git diff -- <frozen-target>`.
+// No flags, shell composition, multiple paths, revisions, or aliases are
+// accepted. The command is read-only and may run once before the verifier.
+func fastPathReadOnlyDiffMatches(st state, hook HookInput) bool {
+	fields := strings.Fields(strings.TrimSpace(bashCommand(hook.ToolInput)))
+	if len(fields) != 4 || fields[0] != "git" || fields[1] != "diff" || fields[2] != "--" {
+		return false
+	}
+	path := fields[3]
+	if strings.ContainsAny(path, "'\"$`;&|<>(){}[]*?!~") {
+		return false
+	}
+	return fastPathPathMatches(st, hook.Cwd, path)
+}
+
+func toolResponseInterrupted(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var response struct {
+		Interrupted bool `json:"interrupted"`
+		IsInterrupt bool `json:"is_interrupt"`
+	}
+	return json.Unmarshal(raw, &response) == nil && (response.Interrupted || response.IsInterrupt)
+}
+
+func isVerifiedStopControl(name string) bool {
+	if !strings.HasPrefix(name, "mcp__claudex-flow__") {
+		return false
+	}
+	return strings.HasSuffix(name, "__close_gate") || strings.HasSuffix(name, "__record_route_outcome")
+}
+
 func contextPressureContext(st state) string {
 	soft, hard := promptSoftHard()
 	return fmt.Sprintf("CLAUDEX_CONTEXT_PRESSURE v1 level=%s prompt_tokens=%d soft>=%d hard>=%d tool_bytes_window=%d. Soft is warning only; hard latches handoff / blocks large-output tools. PostCompact resets samples. StopFailure latch is reactive only.", st.ContextPressure, st.LatestPromptTokens, soft, hard, st.ToolResultBytesWindow)
@@ -680,7 +858,9 @@ func isControlTool(name string) bool {
 		strings.HasSuffix(name, "__find_thread"),
 		strings.HasSuffix(name, "__read_thread"),
 		strings.HasSuffix(name, "__route_task"),
-		strings.HasSuffix(name, "__record_route_outcome"):
+		strings.HasSuffix(name, "__record_route_outcome"),
+		strings.HasSuffix(name, "__collect_worker"),
+		strings.HasSuffix(name, "__close_worker"):
 		return true
 	default:
 		return false
@@ -725,7 +905,9 @@ func isHandoffControlTool(name string) bool {
 		strings.HasSuffix(name, "__workflow_status"),
 		strings.HasSuffix(name, "__runtime_contract"),
 		strings.HasSuffix(name, "__find_thread"),
-		strings.HasSuffix(name, "__read_thread"):
+		strings.HasSuffix(name, "__read_thread"),
+		strings.HasSuffix(name, "__collect_worker"),
+		strings.HasSuffix(name, "__close_worker"):
 		return true
 	default:
 		return false

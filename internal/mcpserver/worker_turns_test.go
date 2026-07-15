@@ -7,7 +7,7 @@ import (
 )
 
 func TestWorkerInvokeMaxTurnsRemaining(t *testing.T) {
-	if got := workerInvokeMaxTurns(0); got != 10 {
+	if got := workerInvokeMaxTurns(0); got != 12 {
 		t.Fatalf("got %d", got)
 	}
 	if got := workerInvokeMaxTurns(20); got != 4 {
@@ -22,16 +22,16 @@ func TestWorkerInvokeMaxTurnsRemaining(t *testing.T) {
 }
 
 func TestTurnAccountingQualityDoesNotUpgrade(t *testing.T) {
-	// First invoke missing num_turns → upper_bound 10; second exact=2 → cumulative 12 quality stays upper_bound.
+	// First invoke missing num_turns → upper_bound 12; second exact=2 → cumulative 14 quality stays upper_bound.
 	w := &workerState{}
 	s := &Server{}
-	s.applyResult(w, claude.Result{}, 10)
-	if w.cumulativeModelTurns != 10 || w.turnAccountingQuality != "upper_bound" {
+	s.applyResult(w, claude.Result{}, 12)
+	if w.cumulativeModelTurns != 12 || w.turnAccountingQuality != "upper_bound" {
 		t.Fatalf("after upper_bound: turns=%d quality=%q", w.cumulativeModelTurns, w.turnAccountingQuality)
 	}
-	s.applyResult(w, claude.Result{NumTurns: 2, TurnAccountingQuality: "exact"}, 10)
-	if w.cumulativeModelTurns != 12 {
-		t.Fatalf("cumulative=%d want 12", w.cumulativeModelTurns)
+	s.applyResult(w, claude.Result{NumTurns: 2, TurnAccountingQuality: "exact"}, 12)
+	if w.cumulativeModelTurns != 14 {
+		t.Fatalf("cumulative=%d want 14", w.cumulativeModelTurns)
 	}
 	if w.turnAccountingQuality != "upper_bound" {
 		t.Fatalf("quality upgraded to %q; must stay upper_bound", w.turnAccountingQuality)

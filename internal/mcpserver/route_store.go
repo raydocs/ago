@@ -13,8 +13,8 @@ import (
 // Terminal outcomes remain on the append-only ledger; open routes live here.
 
 type openRoutesFile struct {
-	UpdatedAt string                  `json:"updated_at"`
-	Routes    map[string]RouteRecord  `json:"routes"`
+	UpdatedAt string                 `json:"updated_at"`
+	Routes    map[string]RouteRecord `json:"routes"`
 }
 
 func defaultOpenRoutesPath() string {

@@ -2,15 +2,14 @@
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
-EXPECTED="$HOME/orca/projects/x"
 SOURCE="$ROOT/adapter/model-filter-proxy.mjs"
-TARGET="$HOME/.local/share/cliproxyapi/model-filter-proxy.mjs"
+TARGET="${CLAUDEX_MODEL_FILTER_TARGET:-$HOME/.local/share/cliproxyapi/model-filter-proxy.mjs}"
 BACKUP="$TARGET.backup.$(date +%Y%m%d%H%M%S)"
-LABEL="local.cliproxyapi.model-filter"
+LABEL="${CLAUDEX_MODEL_FILTER_LABEL:-local.cliproxyapi.model-filter}"
 DOMAIN="gui/$(id -u)"
 
-if [ "$ROOT" != "$EXPECTED" ]; then
-  echo "refusing non-canonical install: source=$ROOT expected=$EXPECTED" >&2
+if [ "$(uname -s)" != "Darwin" ] || ! command -v launchctl >/dev/null 2>&1; then
+  echo "claudex: optional model-filter installer currently requires macOS launchctl" >&2
   exit 2
 fi
 

@@ -37,19 +37,43 @@ func TestAdmissionRejectsCompositeMultiDomainSlice(t *testing.T) {
 
 func TestAdmissionAcceptsSingleDomainBoundedSlice(t *testing.T) {
 	in := WorkerStartInput{
-		SliceID:              "usage-parse-only",
-		Objective:            "Implement isolated transcript usage parser for one JSONL file.",
-		MarginalContribution: "Own parser so supervisor only runs go test.",
-		Context:              "internal/threadusage is empty.",
-		OutputContract:       "changed paths and go test output",
-		DoneCondition:        "go test ./internal/threadusage passes",
-		Paths:                []string{"internal/threadusage/parse.go"},
-		Write:                true,
-		DeadlineMS:           120_000,
+		SliceID:                  "usage-parse-only",
+		Objective:                "Implement isolated transcript usage parser for one JSONL file.",
+		MarginalContribution:     "Own parser so supervisor only runs go test.",
+		EstimatedWorkerSeconds:   180,
+		EstimatedParallelSavings: 60,
+		EstimateBasis:            "isolated parser implementation with package tests",
+		Context:                  "internal/threadusage is empty.",
+		OutputContract:           "changed paths and go test output",
+		DoneCondition:            "go test ./internal/threadusage passes",
+		Paths:                    []string{"internal/threadusage/parse.go"},
+		Write:                    true,
+		DeadlineMS:               120_000,
 	}
 	admission := evaluateWorkerAdmission(in)
 	if admission.Result != admissionAdmitted {
 		t.Fatalf("expected admission, got %#v", admission)
+	}
+}
+
+func TestAdmissionRejectsSubThresholdROI(t *testing.T) {
+	in := WorkerStartInput{
+		SliceID:                  "tiny-parser",
+		Objective:                "Change one tiny parser branch.",
+		MarginalContribution:     "Own the branch.",
+		EstimatedWorkerSeconds:   30,
+		EstimatedParallelSavings: 10,
+		EstimateBasis:            "localized one-line branch",
+		OutputContract:           "changed path and test",
+		DoneCondition:            "go test ./parser",
+	}
+	admission := evaluateWorkerAdmission(in)
+	if admission.Result != admissionRejected {
+		t.Fatalf("sub-threshold slice admitted: %#v", admission)
+	}
+	joined := strings.Join(admission.RejectionReasons, "; ")
+	if !strings.Contains(joined, "at least 90") || !strings.Contains(joined, "at least 45") {
+		t.Fatalf("missing ROI rejection evidence: %s", joined)
 	}
 }
 
@@ -59,10 +83,13 @@ func TestAdmissionAcceptsUsagePageUIOnly(t *testing.T) {
 		SliceID: "usage-ui-polish",
 		Objective: "Only modify the existing Usage page UI. API, Schema, data computation, " +
 			"and deploy are frozen and not in scope.",
-		MarginalContribution: "Own CSS/layout so supervisor verifies screenshots.",
-		Context:              "Usage foundation already shipped; do not touch migrations or thread-app/src.",
-		OutputContract:       "changed public assets + screenshot evidence",
-		DoneCondition:        "frontend-contract tests pass for usage panel",
+		MarginalContribution:     "Own CSS/layout so supervisor verifies screenshots.",
+		EstimatedWorkerSeconds:   240,
+		EstimatedParallelSavings: 90,
+		EstimateBasis:            "three independent frontend assets plus screenshot verification",
+		Context:                  "Usage foundation already shipped; do not touch migrations or thread-app/src.",
+		OutputContract:           "changed public assets + screenshot evidence",
+		DoneCondition:            "frontend-contract tests pass for usage panel",
 		Paths: []string{
 			"thread-app/public/app.js",
 			"thread-app/public/styles.css",
@@ -124,14 +151,17 @@ func TestPartialUnknownPathRejectsOrMultiDomain(t *testing.T) {
 func TestUnknownOnlySinglePackageAdmits(t *testing.T) {
 	// Codex follow-up: internal/catalog/catalog.go must not be fabricated as API+UI.
 	in := WorkerStartInput{
-		SliceID:              "catalog-fix",
-		Objective:            "Fix a localized catalog lookup bug.",
-		MarginalContribution: "Own catalog package so supervisor only verifies go test.",
-		OutputContract:       "changed paths + go test output",
-		DoneCondition:        "go test ./internal/catalog",
-		Paths:                []string{"internal/catalog/catalog.go"},
-		Write:                true,
-		DeadlineMS:           60_000,
+		SliceID:                  "catalog-fix",
+		Objective:                "Fix a localized catalog lookup bug.",
+		MarginalContribution:     "Own catalog package so supervisor only verifies go test.",
+		EstimatedWorkerSeconds:   120,
+		EstimatedParallelSavings: 45,
+		EstimateBasis:            "isolated package change with deterministic tests",
+		OutputContract:           "changed paths + go test output",
+		DoneCondition:            "go test ./internal/catalog",
+		Paths:                    []string{"internal/catalog/catalog.go"},
+		Write:                    true,
+		DeadlineMS:               60_000,
 	}
 	admission := evaluateWorkerAdmission(in)
 	if admission.Result != admissionAdmitted {

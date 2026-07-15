@@ -13,6 +13,66 @@ const (
 )
 
 var sliceIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
+var shellAssignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=.*$`)
+
+const (
+	verifierRootOnly  = "root_only"
+	verifierExactOnce = "worker_exact_once"
+)
+
+var workerVerifierExecutables = map[string]bool{
+	"bazel": true, "bundle": true, "bun": true, "cargo": true, "cmake": true,
+	"ctest": true, "deno": true, "dotnet": true, "go": true, "gradle": true,
+	"jest": true, "make": true, "mvn": true, "node": true, "nox": true,
+	"npm": true, "pnpm": true, "pytest": true, "python": true, "python3": true,
+	"rake": true, "ruby": true, "swift": true, "tox": true, "uv": true,
+	"xcodebuild": true, "yarn": true,
+}
+
+// exactWorkerVerifier recognizes one literal repository-local verifier. It is
+// intentionally conservative: descriptive acceptance prose still admits the
+// slice, but the Worker receives no Bash and Root owns final verification.
+func exactWorkerVerifier(value string) (string, bool) {
+	command := strings.TrimSpace(value)
+	if command == "" || strings.ContainsAny(command, "\r\n;&|`<>") || strings.Contains(command, "$(") {
+		return "", false
+	}
+	lower := " " + strings.ToLower(command) + " "
+	for _, install := range []string{
+		" -m pip install ", " pip install ", " npm install ", " pnpm install ",
+		" yarn install ", " bundle install ", " cargo install ", " go install ",
+		" uv pip install ",
+	} {
+		if strings.Contains(lower, install) {
+			return "", false
+		}
+	}
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return "", false
+	}
+	i := 0
+	for i < len(fields) && shellAssignmentPattern.MatchString(fields[i]) {
+		i++
+	}
+	if i == len(fields) {
+		return "", false
+	}
+	executable := fields[i]
+	base := executable
+	if slash := strings.LastIndexAny(base, `/\\`); slash >= 0 {
+		base = base[slash+1:]
+	}
+	if workerVerifierExecutables[base] {
+		return command, true
+	}
+	// A checked-in relative runner is an exact verifier without requiring a
+	// language-specific allowlist (for example ./scripts/test.sh).
+	if strings.HasPrefix(executable, "./") && len(executable) > 2 && !strings.Contains(executable[2:], "..") {
+		return command, true
+	}
+	return "", false
+}
 
 // evaluateWorkerAdmission is pure: rejection consumes no model call, budget,
 // concurrency slot, or write lease.
@@ -21,12 +81,19 @@ func evaluateWorkerAdmission(in WorkerStartInput) WorkerAdmission {
 	if deadline == 0 {
 		deadline = defaultDeadlineMS
 	}
+	verifierMode := verifierRootOnly
+	verifierCommand := ""
+	if command, ok := exactWorkerVerifier(in.DoneCondition); ok {
+		verifierMode, verifierCommand = verifierExactOnce, command
+	}
 	admission := WorkerAdmission{
 		Route:                routeParallelWorker,
 		RouteID:              strings.TrimSpace(in.RouteID),
 		SliceID:              strings.TrimSpace(in.SliceID),
 		MarginalContribution: strings.TrimSpace(in.MarginalContribution),
 		DeadlineMS:           deadline,
+		VerifierMode:         verifierMode,
+		VerifierCommand:      verifierCommand,
 		Result:               admissionAdmitted,
 		RejectionReasons:     []string{},
 	}
@@ -41,6 +108,15 @@ func evaluateWorkerAdmission(in WorkerStartInput) WorkerAdmission {
 	if admission.MarginalContribution == "" {
 		admission.RejectionReasons = append(admission.RejectionReasons, "marginal_contribution is required")
 	}
+	if in.EstimatedWorkerSeconds < 90 {
+		admission.RejectionReasons = append(admission.RejectionReasons, "estimated_worker_seconds must be at least 90; keep smaller or unknown slices Supervisor-direct")
+	}
+	if in.EstimatedParallelSavings < 45 {
+		admission.RejectionReasons = append(admission.RejectionReasons, "estimated_parallel_savings_seconds must be at least 45 after coordination and integration")
+	}
+	if strings.TrimSpace(in.EstimateBasis) == "" {
+		admission.RejectionReasons = append(admission.RejectionReasons, "estimate_basis is required; do not invent timing to obtain Worker admission")
+	}
 	if strings.TrimSpace(in.OutputContract) == "" {
 		admission.RejectionReasons = append(admission.RejectionReasons, "output_contract is required")
 	}
@@ -50,7 +126,10 @@ func evaluateWorkerAdmission(in WorkerStartInput) WorkerAdmission {
 	if deadline < minDeadlineMS || deadline > maxDeadlineMS {
 		admission.RejectionReasons = append(admission.RejectionReasons, fmt.Sprintf("deadline_ms must be between %d and %d", minDeadlineMS, maxDeadlineMS))
 	}
-	if len(in.RouteID) > 128 || len(in.Objective) > 8000 || len(in.Context) > 24000 || len(in.OutputContract) > 4000 || len(in.DoneCondition) > 4000 || len(in.MarginalContribution) > 4000 || len(in.RetryReason) > 2000 {
+	if in.EstimatedWorkerSeconds > 86_400 || in.EstimatedParallelSavings > 86_400 {
+		admission.RejectionReasons = append(admission.RejectionReasons, "worker estimates are capped at 86400 seconds")
+	}
+	if len(in.RouteID) > 128 || len(in.Objective) > 8000 || len(in.Context) > 24000 || len(in.OutputContract) > 4000 || len(in.DoneCondition) > 4000 || len(in.MarginalContribution) > 4000 || len(in.EstimateBasis) > 2000 || len(in.RetryReason) > 2000 {
 		admission.RejectionReasons = append(admission.RejectionReasons, "worker packet exceeds bounded field limits")
 	}
 	if len(in.Paths) > 32 {
@@ -115,7 +194,7 @@ func suggestSlices(in WorkerStartInput) []SuggestedSlice {
 		}
 		out = append(out, SuggestedSlice{
 			SliceID: fmt.Sprintf("%s-%s-%d", sanitizeID(in.SliceID), shortDomain(d), i),
-			Paths: paths, DoneCondition: done,
+			Paths:   paths, DoneCondition: done,
 			Note: "zero-model template; re-admit with one domain only",
 		})
 	}

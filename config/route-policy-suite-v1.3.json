@@ -1,9 +1,9 @@
 {
-  "version": "claudex-route-policy.v1.3.2",
+  "version": "claudex-route-policy.v1.7.8",
   "purpose": "Freeze the intended Amp-style Claude X routing policy, including prompt-time specialist hints, external Amp URL handling, and zero-model Find Threads followed by bounded Read Thread, before costly end-to-end comparison.",
   "accounting_unit": "relative_resource_intensity",
   "non_inferiority_rule": "Every case must preserve its frozen acceptance boundary, choose the expected qualified lane, and never silently substitute a quarantined capability.",
-  "adoption_threshold": "All 13 zero-model policy cases, including marginal-contribution admission, external Amp Thread URL separation, Find Thread, and Read Thread routing, must pass. This suite alone cannot promote a durable model-quality or cost default.",
+  "adoption_threshold": "All 13 zero-model policy cases, including ROI-gated Worker admission, external Amp Thread URL separation, Find Thread, and Read Thread routing, must pass. This suite alone cannot promote a durable model-quality or cost default.",
   "cases": [
     {
       "id": "serial-localized-fix",
@@ -16,17 +16,20 @@
       "expected_worker_admissible": false
     },
     {
-      "id": "isolated-worker-slice",
+      "id": "parallel-worker-with-root-slice",
       "family": "bounded implementation",
       "request": {
-        "objective": "Implement the isolated parser package and run go test.",
+        "objective": "Implement two independent parser packages and run go test.",
         "acceptance_criteria": [
           "Parser fixture passes.",
           "No unrelated paths change."
         ],
         "verification_target": "go test ./parser",
-        "worker_marginal_contribution": "Own the isolated parser implementation so the supervisor only verifies it.",
-        "independent_slices": 1,
+        "worker_marginal_contribution": "Own one parser package while the Supervisor implements the other.",
+        "estimated_worker_seconds": 180,
+        "estimated_parallel_savings_seconds": 60,
+        "estimate_basis": "isolated package implementation with a deterministic package verifier",
+        "independent_slices": 2,
         "checkability": "objective"
       },
       "expected_action": "bounded_worker",
@@ -176,6 +179,9 @@
         ],
         "verification_target": "go test ./parser",
         "worker_marginal_contribution": "Own the isolated parser implementation so the supervisor only verifies it.",
+        "estimated_worker_seconds": 180,
+        "estimated_parallel_savings_seconds": 60,
+        "estimate_basis": "isolated package implementation with a deterministic package verifier",
         "independent_slices": 1,
         "checkability": "objective",
         "lane_health": [

@@ -49,6 +49,13 @@ func TestOrdinaryAndComplexImplementationPromptsStaySilent(t *testing.T) {
 	}
 }
 
+func TestSingleFileVerifiedChangeGetsFastPath(t *testing.T) {
+	got := build(t, "fix internal/catalog/catalog.go and run go test ./internal/catalog")
+	if !strings.Contains(got, "CLAUDEX_FAST_PATH") || !strings.Contains(got, "Skip route_task") {
+		t.Fatalf("missing fast path: %s", got)
+	}
+}
+
 func TestNonPromptEventStaysSilent(t *testing.T) {
 	raw := []byte(`{"hook_event_name":"Stop","prompt":"research today's news"}`)
 	out, err := Build(bytes.NewReader(raw))

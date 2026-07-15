@@ -1,36 +1,57 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="380" viewBox="0 0 1200 380" role="img" aria-labelledby="title desc">
-  <title id="title">claudex-flow</title>
-  <desc id="desc">A bounded execution graph connects a Claude Code supervisor to workers, capabilities, and evidence gates.</desc>
-  <rect width="1200" height="380" rx="24" fill="#0A0B0D"/>
-  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
-    <text x="58" y="56" fill="#8B949E" font-size="16" letter-spacing="2">CLAUDE CODE RUNTIME · v1.4.6</text>
-    <text x="56" y="145" fill="#F5F7FA" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="70" font-weight="750">claudex-flow</text>
-    <text x="60" y="190" fill="#B7BEC8" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="24">Evidence-gated orchestration without agent-count theater.</text>
-    <rect x="58" y="234" width="170" height="46" rx="8" fill="#171A1F" stroke="#353A42"/>
-    <text x="80" y="263" fill="#F5F7FA" font-size="16">SOL SUPERVISOR</text>
-    <path d="M228 257 H330" stroke="#5F6772" stroke-width="2"/>
-    <path d="M330 257 V114 M330 257 V324" stroke="#5F6772" stroke-width="2"/>
-    <circle cx="330" cy="257" r="5" fill="#D7FF64"/>
-    <g transform="translate(690 52)">
-      <rect width="448" height="276" rx="18" fill="#111318" stroke="#2A2F37"/>
-      <text x="28" y="38" fill="#8B949E" font-size="14">ACCEPTED-RESULT PATH</text>
-      <path d="M56 79 H365" stroke="#333943" stroke-width="2"/>
-      <circle cx="56" cy="79" r="10" fill="#D7FF64"/>
-      <circle cx="210" cy="79" r="10" fill="#0A0B0D" stroke="#D7FF64" stroke-width="3"/>
-      <circle cx="365" cy="79" r="10" fill="#D7FF64"/>
-      <text x="28" y="117" fill="#F5F7FA" font-size="16">ADMISSION</text>
-      <text x="178" y="117" fill="#F5F7FA" font-size="16">EXECUTE</text>
-      <text x="331" y="117" fill="#F5F7FA" font-size="16">VERIFY</text>
-      <g transform="translate(28 150)">
-        <rect width="122" height="42" rx="7" fill="#1A1E24"/>
-        <text x="17" y="27" fill="#B7BEC8" font-size="14">WORKER ≤ 3</text>
-        <rect x="136" width="122" height="42" rx="7" fill="#1A1E24"/>
-        <text x="151" y="27" fill="#B7BEC8" font-size="14">CAPABILITY</text>
-        <rect x="272" width="120" height="42" rx="7" fill="#1A1E24"/>
-        <text x="291" y="27" fill="#B7BEC8" font-size="14">OUTCOME</text>
-      </g>
-      <text x="28" y="238" fill="#69717C" font-size="14">scope lease · budget gate · runtime truth</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">ClaudeX Flow</title>
+  <desc id="desc">An efficiency-first Claude Code workflow where Sol supervises, Grok accelerates bounded slices, and evidence decides acceptance.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070A0F"/><stop offset="1" stop-color="#111520"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#36D4FF"/><stop offset="1" stop-color="#F06CFF"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="9" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1200" height="520" rx="28" fill="url(#bg)"/>
+  <path d="M0 105H1200M0 210H1200M0 315H1200M0 420H1200M150 0V520M300 0V520M450 0V520M600 0V520M750 0V520M900 0V520M1050 0V520" stroke="#FFFFFF" stroke-opacity=".035"/>
+  <circle cx="1070" cy="70" r="125" fill="#36D4FF" opacity=".06" filter="url(#glow)"/>
+  <circle cx="920" cy="470" r="145" fill="#F06CFF" opacity=".055" filter="url(#glow)"/>
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+    <text x="72" y="76" fill="#8A93A5" font-size="15" letter-spacing="3">CLAUDE CODE · ORCHESTRATION RUNTIME · V1.7.9</text>
+    <text x="70" y="180" fill="#F7F9FC" font-size="70" font-weight="760" letter-spacing="-4">CLAUDEX</text>
+    <text x="70" y="247" fill="url(#signal)" font-size="70" font-weight="760" letter-spacing="-4">FLOW</text>
+    <text x="74" y="302" fill="#B2BBCB" font-size="20">Sol supervises. Grok accelerates.</text>
+    <text x="74" y="333" fill="#B2BBCB" font-size="20">Evidence decides.</text>
+    <g transform="translate(72 384)">
+      <rect width="178" height="43" rx="21.5" fill="#36D4FF" fill-opacity=".08" stroke="#36D4FF" stroke-opacity=".45"/>
+      <circle cx="23" cy="21.5" r="5" fill="#36D4FF"/>
+      <text x="38" y="27" fill="#DDF8FF" font-size="14">ROOT OWNS ACCEPTANCE</text>
     </g>
-    <text x="58" y="336" fill="#8B949E" font-size="15">DIRECT WHEN POSSIBLE  /  ROUTE ONLY WHEN MARGINAL VALUE IS PROVABLE</text>
+    <g transform="translate(266 384)">
+      <rect width="158" height="43" rx="21.5" fill="#F06CFF" fill-opacity=".08" stroke="#F06CFF" stroke-opacity=".4"/>
+      <circle cx="23" cy="21.5" r="5" fill="#F06CFF"/>
+      <text x="38" y="27" fill="#FCE7FF" font-size="14">BOUNDED WORKERS</text>
+    </g>
+  </g>
+  <g transform="translate(606 70)" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+    <rect width="520" height="380" rx="22" fill="#090D14" stroke="#303846"/>
+    <text x="28" y="42" fill="#717C90" font-size="13" letter-spacing="2">LIVE ROUTE / ACCEPTED PATH</text>
+    <circle cx="472" cy="37" r="5" fill="#36D4FF"/><circle cx="491" cy="37" r="5" fill="#F06CFF" opacity=".75"/>
+    <path d="M104 118H206M310 118H416M258 150V214M258 278V322" stroke="url(#signal)" stroke-width="2.5" fill="none"/>
+    <path d="M206 118l-9-5v10zM416 118l-9-5v10zM258 214l-5-9h10zM258 322l-5-9h10z" fill="#79E5FF"/>
+    <g>
+      <rect x="28" y="86" width="152" height="64" rx="12" fill="#111926" stroke="#36D4FF" stroke-opacity=".65"/>
+      <text x="46" y="112" fill="#36D4FF" font-size="12">INPUT</text><text x="46" y="134" fill="#E8EDF5" font-size="15">TASK CONTRACT</text>
+      <rect x="206" y="86" width="104" height="64" rx="12" fill="#15202A" stroke="#36D4FF"/>
+      <text x="226" y="112" fill="#36D4FF" font-size="12">ROOT</text><text x="226" y="134" fill="#F7F9FC" font-size="15">SOL</text>
+      <rect x="336" y="86" width="152" height="64" rx="12" fill="#201625" stroke="#F06CFF" stroke-opacity=".7"/>
+      <text x="354" y="112" fill="#F06CFF" font-size="12">OPTIONAL</text><text x="354" y="134" fill="#F7E9FA" font-size="15">GROK WORKER</text>
+      <rect x="180" y="214" width="156" height="64" rx="12" fill="#111926" stroke="#36D4FF" stroke-opacity=".65"/>
+      <text x="199" y="240" fill="#92A0B5" font-size="12">INTEGRATE</text><text x="199" y="262" fill="#F7F9FC" font-size="15">SCOPED PATCH</text>
+      <rect x="180" y="322" width="156" height="36" rx="18" fill="url(#signal)"/>
+      <text x="209" y="345" fill="#071017" font-size="13" font-weight="700">VERIFY → STOP</text>
+    </g>
+    <text x="28" y="350" fill="#667287" font-size="11">ZERO-MODEL ROUTING</text>
+    <text x="355" y="350" fill="#667287" font-size="11">ONE ROOT VERIFIER</text>
   </g>
 </svg>

@@ -17,10 +17,10 @@ func TestOpenRouteSurvivesProcessRestartForOutcome(t *testing.T) {
 	a := newTestServer(t)
 	a.openRoutesPathOverride = openPath
 	a.routeLedgerPath = ledger
-	_, plan, err := a.routeTask(context.Background(), nil, router.RouteRequest{
+	_, plan, err := a.routeTask(context.Background(), nil, withRouteROI(router.RouteRequest{
 		Objective: "Implement isolated parser and run go test.", AcceptanceCriteria: []string{"Parser passes."},
 		VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own the isolated implementation so the supervisor only verifies.", IndependentSlices: 1, Checkability: "objective",
-	})
+	}))
 	if err != nil || plan.RouteID == "" {
 		t.Fatalf("route: plan=%#v err=%v", plan, err)
 	}
@@ -38,5 +38,25 @@ func TestOpenRouteSurvivesProcessRestartForOutcome(t *testing.T) {
 	}
 	if rec.State != "accepted" || rec.LedgerStatus != "persisted" {
 		t.Fatalf("unexpected record: %#v", rec)
+	}
+}
+
+func TestIdenticalOpenRouteIsReused(t *testing.T) {
+	s := newTestServer(t)
+	in := withRouteROI(router.RouteRequest{
+		Objective: "Implement two independent parsers.", AcceptanceCriteria: []string{"Parser tests pass."},
+		VerificationTarget: "go test ./parser", WorkerMarginalContribution: "Own one parser while Supervisor owns the other.",
+		IndependentSlices: 2, Checkability: "objective",
+	})
+	_, first, err := s.routeTask(context.Background(), nil, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := s.routeTask(context.Background(), nil, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.RouteID == "" || second.RouteID != first.RouteID || len(s.routes) != 1 {
+		t.Fatalf("identical open route duplicated: first=%q second=%q routes=%d", first.RouteID, second.RouteID, len(s.routes))
 	}
 }
