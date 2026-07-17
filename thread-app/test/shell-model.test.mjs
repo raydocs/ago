@@ -5,6 +5,7 @@ import {
   groupThreadsForRail,
   stableTitleFromThread,
   compactModelName,
+  humanThreadMetadata,
 } from "../public/shell-model.mjs";
 
 const NOW = Date.parse("2026-07-14T12:00:00Z");
@@ -55,4 +56,24 @@ test("compactModelName strips claude- prefix and -build suffix", () => {
   assert.equal(compactModelName("claude-sonnet-4-build"), "sonnet-4");
   assert.equal(compactModelName("gpt-5.6-sol"), "gpt-5.6-sol");
   assert.equal(compactModelName(""), "");
+});
+
+test("humanThreadMetadata exposes only present public contract fields", () => {
+  const metadata = humanThreadMetadata({
+    state: "completed",
+    updated_at: "2026-07-17T10:00:00Z",
+    project_name: "thread-app",
+    model: "gpt-5.6-sol",
+    author: "must not surface",
+    visibility: "unlisted",
+    authenticated: true,
+  }, 12);
+  assert.deepEqual(metadata.map((entry) => entry.key), [
+    "state",
+    "updated_at",
+    "project",
+    "model",
+    "events",
+  ]);
+  assert.equal(metadata.some((entry) => ["author", "visibility", "authenticated"].includes(entry.key)), false);
 });

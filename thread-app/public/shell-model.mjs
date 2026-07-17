@@ -44,3 +44,26 @@ export function compactModelName(model) {
   if (!value) return "";
   return value.replace(/^claude-/, "").replace(/-build$/, "");
 }
+
+/**
+ * Return only public thread metadata that is present in the API contract.
+ * Identity, visibility, authentication, and billing labels are intentionally absent.
+ */
+export function humanThreadMetadata(thread, eventCount) {
+  const record = thread && typeof thread === "object" ? thread : {};
+  const entries = [];
+  const add = (key, value) => {
+    if (value === null || value === undefined || String(value).trim() === "") return;
+    entries.push({ key, value });
+  };
+  add("state", record.state);
+  add("updated_at", record.updated_at);
+  add("started_at", record.started_at);
+  add("project", record.project_name);
+  add("model", record.model);
+  add("effort", record.effort);
+  if (Number.isFinite(Number(eventCount)) && Number(eventCount) >= 0) {
+    entries.push({ key: "events", value: Number(eventCount) });
+  }
+  return entries;
+}

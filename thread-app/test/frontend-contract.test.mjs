@@ -7,11 +7,12 @@ import { fileURLToPath } from "node:url";
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 async function frontendSources() {
-  const [html, javascript] = await Promise.all([
+  const [html, javascript, css] = await Promise.all([
     readFile(path.join(appDir, "public", "index.html"), "utf8"),
     readFile(path.join(appDir, "public", "app.js"), "utf8"),
+    readFile(path.join(appDir, "public", "styles.css"), "utf8"),
   ]);
-  return { html, javascript };
+  return { html, javascript, css };
 }
 
 test("frontend JavaScript only binds selectors present in the Human View DOM", async () => {
@@ -30,7 +31,7 @@ test("frontend JavaScript renders canonical graph events rather than diagnostic 
   assert.doesNotMatch(javascript, /event\.event_type|payload_json/);
 });
 
-test("Amp web shell chrome is present in HTML", async () => {
+test("Human View is the default thread detail shell", async () => {
   const { html } = await frontendSources();
   assert.match(html, /id="session-rail"/);
   assert.match(html, /id="search-toggle"/);
@@ -38,12 +39,14 @@ test("Amp web shell chrome is present in HTML", async () => {
   assert.match(html, /id="organize-menu"/);
   assert.match(html, /id="nav-activity"/);
   assert.match(html, /id="nav-projects"/);
-  assert.match(html, /id="rail-user"/);
   assert.match(html, /id="main-topbar"/);
-  assert.match(html, /id="composer-chrome"/);
-  assert.match(html, /thread-doc-icon/);
-  // Chat-bubble style row icon (Amp web), not only document.
-  assert.match(html, /M21 15a2 2 0 0 1-2 2H7l-4 4V5/);
+  assert.match(html, /id="human-thread-header"/);
+  assert.match(html, /id="human-thread-title"/);
+  assert.match(html, /id="human-thread-meta"/);
+  assert.match(html, /class="view-panel human-view"/);
+  assert.match(html, />Inspect</);
+  assert.doesNotMatch(html, /id="composer-chrome"|id="rail-user"/);
+  assert.doesNotMatch(html, /Unlisted|Signed in|Logged in/);
 });
 
 test("panel handoff chrome: timeline modes + execution strip", async () => {
@@ -61,7 +64,7 @@ test("panel handoff chrome: timeline modes + execution strip", async () => {
   assert.match(html, /id="thread-metadata"[\s\S]*id="timeline-toolbar"/);
 });
 
-test("panel P4/P5: gate badges, observed models, progressive turns", async () => {
+test("Human View keeps gate and usage observability with progressive rendering", async () => {
   const { html, javascript } = await frontendSources();
   assert.match(html, /id="thread-badges"/);
   assert.match(javascript, /detectHandoffSticky/);
@@ -69,20 +72,33 @@ test("panel P4/P5: gate badges, observed models, progressive turns", async () =>
   assert.match(javascript, /underAttributedModels/);
   assert.match(javascript, /Observed executors/);
   assert.match(javascript, /TURN_RENDER_CHUNK/);
+  assert.match(javascript, /LONG_CONTENT_CHARS/);
+  assert.match(javascript, /WORK_CLUSTER_PREVIEW/);
   assert.match(javascript, /badge-gate/);
-  assert.match(javascript, /APP_VERSION = "0\.3\.2"/);
-  assert.match(html, /\?r=p6v1/);
+  assert.match(javascript, /APP_VERSION = "0\.4\.0"/);
+  assert.match(html, /\?r=human-v1/);
 });
 
-test("panel P6 visual: Work strip collapse, topbar flags, no mid-page mode control", async () => {
-  const { html, javascript } = await frontendSources();
-  assert.match(javascript, /work-strip/);
-  assert.match(javascript, /Work · /);
-  assert.match(javascript, /topbar-flag/);
+test("Show Work, turn deep links, and existing observability controls remain available", async () => {
+  const { html, javascript, css } = await frontendSources();
+  assert.match(javascript, /Show Work · \$\{countText\}/);
+  assert.match(javascript, /stableTurnAnchor/);
+  assert.match(javascript, /turnDeepLinkHash/);
+  assert.match(javascript, /Copy link/);
+  assert.match(javascript, /content-expander/);
+  assert.match(javascript, /show-more-work/);
+  assert.match(javascript, /more execution\$\{remaining === 1 \? "" : "s"\} available in Full timeline/);
+  assert.match(javascript, /isFailedStatus\(result\?\.status\) \|\| isFailedStatus\(event\.status\)/);
+  assert.match(css, /\.thread-card:focus:not\(:focus-visible\)/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)/);
   assert.match(html, /class="topbar-flags"/);
-  // Modes only in Details drawer; badges sit in main topbar.
   assert.ok(html.indexOf('id="thread-metadata"') < html.indexOf('id="timeline-toolbar"'));
-  assert.ok(html.indexOf('id="main-topbar"') < html.indexOf('id="thread-badges"'));
-  assert.ok(html.indexOf('id="thread-badges"') < html.indexOf('id="event-list"'));
+  assert.ok(html.indexOf('id="thread-metadata"') < html.indexOf('id="execution-strip"'));
+  for (const id of [
+    "thread-list", "thread-search", "timeline-toolbar", "usage-tab", "usage-export-link",
+    "export-markdown-link", "export-json-link", "copy-thread-md", "archive-button",
+  ]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
   assert.match(javascript, /return "—"/);
 });

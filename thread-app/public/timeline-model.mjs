@@ -36,6 +36,154 @@ export function isExecutionTool(name) {
   );
 }
 
+function validTime(value) {
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
+}
+
+function turnStatus(events) {
+  const statuses = events
+    .map((event) => String(event?.status || "").trim().toLowerCase())
+    .filter(Boolean);
+  for (const status of ["failed", "error", "blocked", "cancelled", "running", "active", "completed", "closed"]) {
+    if (statuses.includes(status)) return status;
+  }
+  return statuses.at(-1) || "";
+}
+
+export function stableTurnAnchor(turn, index = 0) {
+  const fallback = `turn-${index + 1}`;
+  const raw = String(turn?.id || fallback).trim() || fallback;
+  const safe = raw.replace(/[^a-zA-Z0-9_-]/g, "-");
+  return safe.startsWith("turn-") ? safe : `turn-${safe}`;
+}
+
+export function turnDeepLinkHash(sessionID, turn, index = 0) {
+  return `#/thread/${encodeURIComponent(String(sessionID || ""))}/turn/${encodeURIComponent(stableTurnAnchor(turn, index))}`;
+}
+
+/**
+ * Build deterministic Human View turns from already sorted, mode-filtered events.
+ * Tool results represented by their call, and worker calls represented by worker cards,
+ * are folded into the adjacent assistant work rather than duplicated.
+ */
+export function buildHumanTurns(events) {
+  const list = Array.isArray(events) ? events : [];
+  const orderByEvent = new WeakMap();
+  list.forEach((event, index) => {
+    if (event && typeof event === "object") orderByEvent.set(event, index);
+  });
+  const resultsByCall = new Map();
+  const callIDs = new Set(list
+    .filter((event) => event.type === "tool_call")
+    .map((event) => event.event_id || event.tool_use_id)
+    .filter(Boolean));
+  const represented = new Set();
+
+  for (const event of list) {
+    if (event.type === "worker") {
+      if (event.raw?.call_event_id) represented.add(event.raw.call_event_id);
+      if (event.raw?.result_event_id) represented.add(event.raw.result_event_id);
+    }
+    if (event.type === "tool_result") {
+      const parent = event.parent_event_id || event.tool_use_id;
+      if (parent && !resultsByCall.has(parent)) resultsByCall.set(parent, event);
+    }
+  }
+
+  const turns = [];
+  let current = null;
+  const createTurn = (userEvent, seedEvent) => ({
+    id: userEvent?.event_id || seedEvent?.event_id || `turn-${turns.length + 1}`,
+    user: userEvent || null,
+    assistantMessages: [],
+    activity: [],
+    processNotes: [],
+    finalAnswers: [],
+    startedAt: userEvent?.started_at || seedEvent?.started_at || null,
+    endedAt: null,
+    durationMs: null,
+    status: "",
+  });
+  const finalize = () => {
+    if (!current) return;
+    const boundaries = [];
+    const sourceEvents = [];
+    const collect = (event) => {
+      if (!event) return;
+      sourceEvents.push(event);
+      const start = validTime(event.started_at);
+      const end = validTime(event.ended_at);
+      if (start != null) boundaries.push(start);
+      if (end != null) boundaries.push(end);
+      const duration = Number(event.duration_ms);
+      if (start != null && Number.isFinite(duration) && duration > 0) boundaries.push(start + duration);
+    };
+    collect(current.user);
+    for (const message of current.assistantMessages) collect(message);
+    for (const item of current.activity) {
+      collect(item.event);
+      collect(item.result);
+    }
+    if (boundaries.length) {
+      const start = Math.min(...boundaries);
+      const end = Math.max(...boundaries);
+      current.startedAt = current.startedAt || new Date(start).toISOString();
+      current.endedAt = new Date(end).toISOString();
+      if (end > start) current.durationMs = end - start;
+    }
+    current.status = turnStatus(sourceEvents);
+
+    if (!current.assistantMessages.length) {
+      turns.push(current);
+      current = null;
+      return;
+    }
+    if (!current.activity.length) {
+      current.finalAnswers = current.assistantMessages.slice();
+    } else {
+      const lastAssistant = current.assistantMessages.at(-1);
+      const lastAssistantOrder = orderByEvent.get(lastAssistant) ?? -1;
+      const lastActivityOrder = current.activity.reduce(
+        (latest, item) => Math.max(latest, orderByEvent.get(item.event) ?? -1),
+        -1,
+      );
+      if (lastAssistantOrder > lastActivityOrder) {
+        current.finalAnswers = [lastAssistant];
+        current.processNotes = current.assistantMessages.slice(0, -1);
+      } else {
+        current.processNotes = current.assistantMessages.slice();
+      }
+    }
+    turns.push(current);
+    current = null;
+  };
+
+  for (const event of list) {
+    if (represented.has(event.event_id)) continue;
+    if (event.type === "tool_result" && callIDs.has(event.parent_event_id || event.tool_use_id)) continue;
+    if (event.type === "message" && event.role === "user") {
+      finalize();
+      current = createTurn(event, event);
+      continue;
+    }
+    if (!current) current = createTurn(null, event);
+    if (event.type === "message" && event.role === "assistant") {
+      current.assistantMessages.push(event);
+    } else if (event.type === "tool_call") {
+      current.activity.push({ kind: "tool", event, result: resultsByCall.get(event.event_id || event.tool_use_id) });
+    } else if (event.type === "worker") {
+      current.activity.push({ kind: "execution", event });
+    } else if (event.type === "message") {
+      current.activity.push({ kind: "message", event });
+    } else {
+      current.activity.push({ kind: "system", event });
+    }
+  }
+  finalize();
+  return turns;
+}
+
 /**
  * @param {"decision"|"full"|"errors"} mode
  */
@@ -49,8 +197,16 @@ export function filterEventsByMode(events, mode = "decision") {
       return false;
     });
   }
-  // decision: messages, workers, compact, errors, gate/workflow, non-housekeeping tools
-  // (tool results paired with calls are still dropped later by deriveTurns)
+  // decision: messages, workers, compact, errors, gate/workflow, non-housekeeping tools.
+  // Keep results paired with visible calls so expanded Show Work retains output/error detail;
+  // buildHumanTurns folds those result rows into the call instead of duplicating them.
+  const visibleCallIDs = new Set();
+  for (const event of list) {
+    if (event.type !== "tool_call") continue;
+    if (!isFailedStatus(event.status) && isHousekeepingTool(event.tool_name)) continue;
+    const callID = event.event_id || event.tool_use_id;
+    if (callID) visibleCallIDs.add(callID);
+  }
   return list.filter((event) => {
     if (event.type === "message") return true;
     if (event.type === "worker") return true;
@@ -58,11 +214,11 @@ export function filterEventsByMode(events, mode = "decision") {
     if (event.type === "error") return true;
     if (event.type === "gate" || event.type === "workflow") return true;
     if (isFailedStatus(event.status)) return true;
-    if (event.type === "tool_call") {
-      if (isHousekeepingTool(event.tool_name)) return false;
-      return true;
+    if (event.type === "tool_call") return !isHousekeepingTool(event.tool_name);
+    if (event.type === "tool_result") {
+      const parent = event.parent_event_id || event.tool_use_id;
+      return Boolean(parent && visibleCallIDs.has(parent));
     }
-    if (event.type === "tool_result") return false;
     return true;
   });
 }

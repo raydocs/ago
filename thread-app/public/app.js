@@ -3,6 +3,7 @@ import {
   groupThreadsForRail,
   stableTitleFromThread,
   compactModelName,
+  humanThreadMetadata,
 } from "./shell-model.mjs";
 import {
   filterEventsByMode,
@@ -13,12 +14,17 @@ import {
   underAttributedModels,
   cacheHitRate,
   honestCostLabel,
-  isHousekeepingTool,
-  shortToolName,
+  isFailedStatus,
+  buildHumanTurns,
+  stableTurnAnchor,
+  turnDeepLinkHash,
 } from "./timeline-model.mjs";
 
-const APP_VERSION = "0.3.2";
+const APP_VERSION = "0.4.0";
 const TURN_RENDER_CHUNK = 8;
+const LONG_CONTENT_CHARS = 2400;
+const LONG_CONTENT_LINES = 36;
+const WORK_CLUSTER_PREVIEW = 12;
 const state = {
   threads: [],
   currentID: null,
@@ -30,6 +36,8 @@ const state = {
   refreshing: false,
   pollFailures: 0,
   renderToken: 0,
+  pendingTurnAnchor: "",
+  pendingEventID: "",
   outline: {
     marks: [],
     anchors: [],
@@ -62,7 +70,7 @@ const emptyState = $("#empty-state");
 const drawerScrim = $("#drawer-scrim");
 const mobileQuery = window.matchMedia("(max-width: 900px)");
 const housekeepingTools = new Set(["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "TaskOutput"]);
-const MAX_ACTIVITY_PREVIEW = 40;
+const workRevealers = new WeakMap();
 
 document.addEventListener("DOMContentLoaded", () => {
   boot().catch((error) => showBootError(error));
@@ -72,10 +80,6 @@ async function boot() {
   try {
     bindEvents();
     restoreRailPreference();
-    const userName = $("#user-name");
-    const userEmail = $("#user-email");
-    if (userName) userName.textContent = "local";
-    if (userEmail) userEmail.textContent = "Claude X workspace";
     schedulePoll();
     await refreshAll(true);
     hideBootLoading();
@@ -539,12 +543,16 @@ function renderThreads() {
 }
 
 function openFromHash() {
-  const match = location.hash.match(/^#\/thread\/([^/]+)(?:\/(usage))?$/);
+  const match = location.hash.match(/^#\/thread\/([^/]+)(?:\/(usage)|\/turn\/([^/]+))?$/);
   if (match) {
     let id;
+    let turnAnchor = "";
     try { id = decodeURIComponent(match[1]); } catch { id = match[1]; }
+    try { turnAnchor = match[3] ? decodeURIComponent(match[3]) : ""; } catch { turnAnchor = match[3] || ""; }
+    state.pendingTurnAnchor = turnAnchor;
     selectThread(id, match[2] === "usage" ? "usage" : "thread", false);
   } else if (state.threads.length) {
+    state.pendingTurnAnchor = "";
     selectThread(state.threads[0].session_id, "thread", false);
   }
 }
@@ -552,7 +560,10 @@ function openFromHash() {
 function selectThread(id, view = "thread", updateHash = true) {
   state.currentID = id;
   state.view = view;
-  if (updateHash) updateLocationHash();
+  if (updateHash) {
+    state.pendingTurnAnchor = "";
+    updateLocationHash();
+  }
   renderThreads();
   renderViewState();
   // Amp app keeps the sidebar open while reading.
@@ -643,30 +654,22 @@ function renderDetail(graph) {
   if (topbar) topbar.hidden = false;
   const title = $("#detail-title");
   if (title) title.textContent = stableTitle(thread);
+  renderHumanHeader(thread, graph.events || []);
 
-  // Amp web: no secondary meta strip competing with the sticky topbar.
-  const metaLine = $("#detail-project");
-  if (metaLine) {
-    metaLine.hidden = true;
-    metaLine.textContent = "";
-  }
-
-  const topUser = $("#topbar-user");
+  const topModel = $("#topbar-model");
   const topEffort = $("#topbar-effort");
   const topSep = document.querySelector(".topbar-sep");
   const modelLabel = compactModel(thread.model);
   const effortLabel = String(thread.effort || "").trim();
-  if (topUser) topUser.textContent = modelLabel || "local";
+  if (topModel) {
+    topModel.textContent = modelLabel;
+    topModel.hidden = !modelLabel;
+  }
   if (topEffort) {
     topEffort.textContent = effortLabel;
     topEffort.hidden = !effortLabel;
   }
-  if (topSep) topSep.hidden = !effortLabel;
-
-  const composer = $("#composer-chrome");
-  if (composer) composer.hidden = false;
-
-  // Footer account chip stays stable (local workspace), not per-thread model.
+  if (topSep) topSep.hidden = !modelLabel || !effortLabel;
 
   const base = `/api/threads/${encodeURIComponent(thread.session_id)}`;
   const jsonLink = $("#export-json-link");
@@ -709,6 +712,39 @@ function syncTimelineModeUI() {
     btn.classList.toggle("is-active", active);
     btn.setAttribute("aria-selected", String(active));
   });
+}
+
+function renderHumanHeader(thread, events) {
+  const title = $("#human-thread-title");
+  const meta = $("#human-thread-meta");
+  if (title) title.textContent = stableTitle(thread);
+  if (!meta) return;
+  meta.replaceChildren();
+  const entries = humanThreadMetadata(thread, Array.isArray(events) ? events.length : undefined);
+  for (const entry of entries) {
+    const item = document.createElement("span");
+    item.className = `human-meta-item human-meta-${entry.key}`;
+    if (entry.key === "state") {
+      item.dataset.state = String(entry.value || "");
+      item.textContent = stateLabel(entry.value);
+    } else if (entry.key === "updated_at" || entry.key === "started_at") {
+      const time = document.createElement("time");
+      time.dateTime = String(entry.value);
+      const prefix = entry.key === "updated_at" ? "Updated" : "Started";
+      time.textContent = `${prefix} ${formatDate(entry.value)} (${relativeTime(entry.value)})`;
+      meta.append(time);
+      continue;
+    } else if (entry.key === "project") {
+      item.textContent = String(entry.value);
+    } else if (entry.key === "model") {
+      item.textContent = compactModel(entry.value);
+    } else if (entry.key === "effort") {
+      item.textContent = String(entry.value);
+    } else if (entry.key === "events") {
+      item.textContent = `${number(entry.value)} event${Number(entry.value) === 1 ? "" : "s"}`;
+    }
+    if (item.textContent) meta.append(item);
+  }
 }
 
 function renderThreadBadges(graph) {
@@ -775,7 +811,8 @@ function renderExecutionStrip(graph) {
 
   const list = document.createElement("div");
   list.className = "execution-strip-list";
-  for (const item of summary.items.slice(0, 12)) {
+  const visibleItems = summary.items.slice(0, WORK_CLUSTER_PREVIEW);
+  for (const item of visibleItems) {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = `execution-chip${item.failed ? " is-failed" : ""}`;
@@ -792,9 +829,21 @@ function renderExecutionStrip(graph) {
     ].filter(Boolean).join(" · ");
     chip.title = item.summary || chip.textContent;
     if (item.event_id) {
-      chip.addEventListener("click", () => focusEvent(item.event_id));
+      chip.addEventListener("click", () => {
+        state.pendingEventID = item.event_id;
+        closeMetadata();
+        if (state.timelineMode !== "full") setTimelineMode("full");
+        else renderTurns(state.current);
+      });
     }
     list.append(chip);
+  }
+  if (summary.items.length > visibleItems.length) {
+    const remaining = summary.items.length - visibleItems.length;
+    const note = document.createElement("p");
+    note.className = "execution-strip-more";
+    note.textContent = `${remaining} more execution${remaining === 1 ? "" : "s"} available in Full timeline.`;
+    list.append(note);
   }
   details.append(list);
   host.append(details);
@@ -914,133 +963,7 @@ function renderParticipantStrip(participants) {
   }
 }
 
-/* ── Turn model ── */
-
-function deriveTurns(events) {
-  const list = Array.isArray(events) ? events : [];
-  const resultsByCall = new Map();
-  const callIDs = new Set(list.filter((event) => event.type === "tool_call").map((event) => event.event_id || event.tool_use_id));
-  const represented = new Set();
-
-  for (const event of list) {
-    if (event.type === "worker") {
-      if (event.raw?.call_event_id) represented.add(event.raw.call_event_id);
-      if (event.raw?.result_event_id) represented.add(event.raw.result_event_id);
-    }
-    if (event.type === "tool_result") {
-      const parent = event.parent_event_id || event.tool_use_id;
-      if (parent && !resultsByCall.has(parent)) resultsByCall.set(parent, event);
-    }
-  }
-
-  const turns = [];
-  let current = null;
-
-  const flush = () => {
-    if (!current) return;
-    finalizeTurn(current);
-    turns.push(current);
-    current = null;
-  };
-
-  const ensureTurn = (event) => {
-    if (current) return current;
-    current = createTurn(null, event);
-    return current;
-  };
-
-  for (const event of list) {
-    if (represented.has(event.event_id)) continue;
-    if (event.type === "tool_result" && callIDs.has(event.parent_event_id || event.tool_use_id)) continue;
-
-    if (event.type === "message" && event.role === "user") {
-      flush();
-      current = createTurn(event, event);
-      continue;
-    }
-
-    const turn = ensureTurn(event);
-    if (event.type === "message" && event.role === "assistant") {
-      turn.assistantMessages.push(event);
-      continue;
-    }
-    if (event.type === "tool_call") {
-      turn.activity.push({ kind: "tool", event, result: resultsByCall.get(event.event_id || event.tool_use_id) });
-      continue;
-    }
-    if (event.type === "worker") {
-      turn.activity.push({ kind: "execution", event });
-      continue;
-    }
-    if (event.type === "message") {
-      turn.activity.push({ kind: "message", event });
-      continue;
-    }
-    turn.activity.push({ kind: "system", event });
-  }
-  flush();
-  return turns;
-}
-
-function createTurn(userEvent, seedEvent) {
-  return {
-    id: userEvent?.event_id || seedEvent?.event_id || `turn-${Math.random().toString(36).slice(2, 8)}`,
-    user: userEvent || null,
-    assistantMessages: [],
-    activity: [],
-    startedAt: userEvent?.started_at || seedEvent?.started_at || null,
-    endedAt: null,
-    durationMs: null,
-  };
-}
-
-function finalizeTurn(turn) {
-  const timestamps = [];
-  if (turn.user?.started_at) timestamps.push(Date.parse(turn.user.started_at));
-  for (const message of turn.assistantMessages) {
-    if (message.started_at) timestamps.push(Date.parse(message.started_at));
-    if (message.ended_at) timestamps.push(Date.parse(message.ended_at));
-  }
-  for (const item of turn.activity) {
-    const event = item.event;
-    if (event?.started_at) timestamps.push(Date.parse(event.started_at));
-    if (event?.ended_at) timestamps.push(Date.parse(event.ended_at));
-    if (item.result?.started_at) timestamps.push(Date.parse(item.result.started_at));
-    if (item.result?.ended_at) timestamps.push(Date.parse(item.result.ended_at));
-    if (typeof event?.duration_ms === "number") timestamps.push(Date.parse(event.started_at || 0) + event.duration_ms);
-  }
-  const valid = timestamps.filter(Number.isFinite);
-  if (valid.length) {
-    const start = Math.min(...valid);
-    const end = Math.max(...valid);
-    turn.startedAt = turn.startedAt || new Date(start).toISOString();
-    turn.endedAt = new Date(end).toISOString();
-    turn.durationMs = Math.max(0, end - start);
-  } else if (turn.user?.started_at && turn.assistantMessages.at(-1)?.started_at) {
-    const start = Date.parse(turn.user.started_at);
-    const end = Date.parse(turn.assistantMessages.at(-1).started_at);
-    if (Number.isFinite(start) && Number.isFinite(end) && end >= start) {
-      turn.durationMs = end - start;
-      turn.endedAt = turn.assistantMessages.at(-1).started_at;
-    }
-  }
-
-  // Process notes: non-final assistant messages that appear before tools, or short bridge text.
-  turn.processNotes = [];
-  turn.finalAnswers = [];
-  if (!turn.assistantMessages.length) return;
-  if (!turn.activity.length) {
-    turn.finalAnswers = turn.assistantMessages.slice();
-    return;
-  }
-  if (turn.assistantMessages.length === 1) {
-    turn.finalAnswers = turn.assistantMessages.slice();
-    return;
-  }
-  // Keep the last non-empty assistant message as the answer; earlier ones as process notes.
-  turn.finalAnswers = [turn.assistantMessages.at(-1)];
-  turn.processNotes = turn.assistantMessages.slice(0, -1);
-}
+/* ── Human View turn model ── */
 
 function eventsForHumanView(graph) {
   const events = Array.isArray(graph.events) ? graph.events : [];
@@ -1117,14 +1040,14 @@ function renderTurns(graph) {
   state._compactIndex = compactIndex;
 
   // Progressive paint for d791-scale threads (P5): keep first paint interactive.
-  const turns = deriveTurns(events);
+  const turns = buildHumanTurns(events);
   let index = 0;
   const paintChunk = () => {
     if (token !== state.renderToken) return;
     const frag = document.createDocumentFragment();
     const end = Math.min(index + TURN_RENDER_CHUNK, turns.length);
     for (; index < end; index += 1) {
-      frag.append(renderTurn(turns[index], graph));
+      frag.append(renderTurn(turns[index], graph, index));
     }
     list.append(frag);
     if (index < turns.length) {
@@ -1135,6 +1058,15 @@ function renderTurns(graph) {
       if (token !== state.renderToken) return;
       rebuildOutlineMarks();
       updateOutlineThumb();
+      if (state.pendingTurnAnchor) {
+        focusTurn(state.pendingTurnAnchor, { updateHash: false });
+        state.pendingTurnAnchor = "";
+      }
+      if (state.pendingEventID) {
+        const eventID = state.pendingEventID;
+        state.pendingEventID = "";
+        focusEvent(eventID);
+      }
     });
   };
   paintChunk();
@@ -1448,66 +1380,89 @@ function updateOutlineThumb(opts = {}) {
   paintOutlinePlayhead(opts);
 }
 
-function renderTurn(turn, graph) {
+function renderTurn(turn, graph, index = 0) {
   const card = document.createElement("section");
+  const anchor = stableTurnAnchor(turn, index);
   card.className = "turn-card";
+  card.id = anchor;
   card.dataset.turnId = turn.id;
+  card.append(renderTurnHeader(turn, anchor));
 
   if (turn.user) card.append(renderUserBubble(turn.user));
 
-  // Amp: short bridge lines can sit above Show Work; longer mid-process text lives inside Work.
-  const outsideNotes = [];
-  const insideNotes = [];
-  for (const note of turn.processNotes || []) {
-    const text = String(note.content || note.summary || "");
-    if (text.length <= 160 && !turn.activity.length) outsideNotes.push(note);
-    else insideNotes.push(note);
-  }
-  for (const note of outsideNotes) card.append(renderAssistantNote(note));
-
   const workItems = [];
-  const alwaysVisible = [];
-  let sawTask = false;
-  for (const note of insideNotes) {
+  for (const note of turn.processNotes || []) {
     workItems.push({ kind: "message", event: note });
   }
-  for (const item of turn.activity) {
-    // Worker/Agent/compact/error stay on the main path (not buried in Show Work).
-    if (item.kind === "execution" || item.kind === "system") {
-      alwaysVisible.push(item);
-      continue;
-    }
-    if (item.kind === "tool" && shouldCollapseHousekeeping(item.event)) {
-      if (sawTask) continue;
-      sawTask = true;
-    }
-    workItems.push(item);
-  }
-  const byTime = (a, b) => (Date.parse(a.event?.started_at) || 0) - (Date.parse(b.event?.started_at) || 0);
-  workItems.sort(byTime);
-  alwaysVisible.sort(byTime);
+  workItems.push(...turn.activity);
+  workItems.sort((a, b) => (Date.parse(a.event?.started_at) || 0) - (Date.parse(b.event?.started_at) || 0));
 
-  // Surface executions/compacts before collapsed tool work.
-  for (const item of alwaysVisible) {
-    card.append(renderActivityItem(item, graph));
-  }
-
-  if (workItems.length || (turn.durationMs > 0 && !alwaysVisible.length)) {
-    card.append(renderWorkedFor(turn, workItems, graph));
-  }
+  if (workItems.length) card.append(renderWorkedFor(turn, workItems, graph));
 
   for (const answer of turn.finalAnswers || []) {
     card.append(renderAssistantAnswer(answer));
   }
 
-  if (!turn.user && !(turn.finalAnswers || []).length && !workItems.length && !alwaysVisible.length) {
+  if (!turn.user && !(turn.finalAnswers || []).length && !workItems.length) {
     card.append(inlineState("Empty turn"));
   }
   return card;
 }
 
-function shouldCollapseHousekeeping(event) {
-  return isHousekeepingTool(event.tool_name) || housekeepingTools.has(shortTool(event.tool_name));
+function renderTurnHeader(turn, anchor) {
+  const header = document.createElement("header");
+  header.className = "turn-header";
+  const meta = document.createElement("div");
+  meta.className = "turn-meta";
+  if (turn.startedAt) meta.append(timestampNode(turn.startedAt));
+  if (turn.durationMs > 0) meta.append(metaSeparator(), textMeta(formatDuration(turn.durationMs), "turn-duration"));
+  if (turn.status) meta.append(metaSeparator(), textMeta(stateLabel(turn.status), "turn-status"));
+
+  const actions = document.createElement("div");
+  actions.className = "turn-actions";
+  const link = document.createElement("a");
+  link.className = "turn-anchor-link";
+  link.href = turnDeepLinkHash(state.currentID, { id: anchor });
+  link.textContent = "#";
+  link.setAttribute("aria-label", "Link to this turn");
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    history.replaceState(null, "", link.href);
+    focusTurn(anchor, { updateHash: false });
+  });
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "copy-turn-link";
+  copy.textContent = "Copy link";
+  copy.addEventListener("click", async () => {
+    const url = new URL(location.href);
+    url.hash = turnDeepLinkHash(state.currentID, { id: anchor }).slice(1);
+    await copyText(url.toString());
+    copy.textContent = "Copied";
+    setTimeout(() => { copy.textContent = "Copy link"; }, 1200);
+  });
+  actions.append(link, copy);
+  header.append(meta, actions);
+  return header;
+}
+
+function timestampNode(value) {
+  const time = document.createElement("time");
+  time.dateTime = String(value);
+  time.textContent = formatDate(value);
+  time.title = String(value);
+  return time;
+}
+
+function metaSeparator() {
+  return document.createTextNode(" · ");
+}
+
+function textMeta(value, className) {
+  const span = document.createElement("span");
+  span.className = className;
+  span.textContent = value;
+  return span;
 }
 
 function renderActivityItem(item, graph) {
@@ -1522,10 +1477,8 @@ function renderAssistantNote(event) {
   article.className = "assistant-note";
   article.id = eventAnchor(event.event_id);
   article.dataset.eventId = event.event_id || "";
-  const content = document.createElement("div");
-  content.className = "message-content";
-  content.append(renderMarkdown(event.content || event.summary || ""));
-  article.append(content);
+  article.append(renderMessageMeta("Assistant work note", event));
+  article.append(renderExpandableContent(event.content || event.summary || "", { label: "Show full note" }));
   return article;
 }
 
@@ -1534,49 +1487,117 @@ function renderUserBubble(event) {
   article.className = "user-bubble";
   article.id = eventAnchor(event.event_id);
   article.dataset.eventId = event.event_id || "";
-  const body = document.createElement("div");
-  body.className = "user-text";
-  body.textContent = event.content || event.summary || "";
-  article.append(body);
+  article.append(renderMessageMeta("User", event));
+  article.append(renderExpandableContent(event.content || event.summary || "", {
+    className: "user-text",
+    label: "Show full message",
+    plain: true,
+  }));
   return article;
 }
 
+function renderMessageMeta(role, event) {
+  const meta = document.createElement("div");
+  meta.className = "message-meta";
+  const label = document.createElement("strong");
+  label.textContent = role;
+  meta.append(label);
+  if (event.started_at) meta.append(metaSeparator(), timestampNode(event.started_at));
+  return meta;
+}
+
+function renderExpandableContent(source, options = {}) {
+  const text = String(source || "");
+  const className = options.className || "message-content";
+  const container = document.createElement("div");
+  container.className = className;
+  const lines = text.split("\n");
+  const long = text.length > LONG_CONTENT_CHARS || lines.length > LONG_CONTENT_LINES;
+  const appendContent = (host, value) => {
+    if (options.plain) host.textContent = value;
+    else host.append(renderMarkdown(value));
+  };
+  if (!long) {
+    appendContent(container, text);
+    return container;
+  }
+
+  container.classList.add("is-expandable");
+  const preview = document.createElement("div");
+  preview.className = "content-preview";
+  const clippedLines = lines.slice(0, LONG_CONTENT_LINES);
+  let clipped = clippedLines.join("\n").slice(0, LONG_CONTENT_CHARS).trimEnd();
+  if (clipped.length < text.length) clipped += "\n…";
+  appendContent(preview, clipped);
+
+  const details = document.createElement("details");
+  details.className = "content-expander";
+  const summary = document.createElement("summary");
+  summary.textContent = options.label || "Show full content";
+  const full = document.createElement("div");
+  full.className = "expanded-content";
+  let mounted = false;
+  details.addEventListener("toggle", () => {
+    preview.hidden = details.open;
+    summary.textContent = details.open ? "Collapse content" : (options.label || "Show full content");
+    if (details.open && !mounted) {
+      appendContent(full, text);
+      mounted = true;
+    }
+  });
+  details.append(summary, full);
+  container.append(preview, details);
+  return container;
+}
+
 function renderWorkedFor(turn, activityItems, graph) {
-  if (!activityItems.length && !(turn.durationMs > 0)) return document.createDocumentFragment();
+  if (!activityItems.length) return document.createDocumentFragment();
 
   const details = document.createElement("details");
   details.className = "worked-for";
   const summary = document.createElement("summary");
   const label = document.createElement("span");
   label.className = "worked-label";
-  const closedText = turn.durationMs > 0
-    ? `Worked for ${formatDuration(turn.durationMs)}`
-    : "Show Work";
+  const eventCount = activityItems.length;
+  const countText = `${eventCount} event${eventCount === 1 ? "" : "s"}`;
+  const closedText = `Show Work · ${countText}`;
   label.textContent = closedText;
   summary.append(label);
 
   const body = document.createElement("div");
   body.className = "worked-body";
   let mounted = false;
+  let remainingClusters = [];
+  let moreButton = null;
+  const revealAll = () => {
+    if (!mounted) mount();
+    if (!remainingClusters.length) return;
+    for (const cluster of remainingClusters) body.insertBefore(renderWorkCluster(cluster, graph), moreButton);
+    remainingClusters = [];
+    moreButton?.remove();
+    moreButton = null;
+  };
   const mount = () => {
     if (mounted) return;
     mounted = true;
     body.replaceChildren();
-    if (!activityItems.length) {
-      body.append(inlineState("No tool activity recorded for this turn."));
-      return;
-    }
-    // Amp stream: grouped Ran/Explored/Edited rows, with notes interleaved.
     const clusters = clusterActivity(activityItems);
-    let rendered = 0;
-    for (const cluster of clusters) {
-      if (rendered >= MAX_ACTIVITY_PREVIEW && cluster.kind !== "note") continue;
-      body.append(renderWorkCluster(cluster, graph));
-      rendered += cluster.items?.length || 1;
+    const initial = clusters.slice(0, WORK_CLUSTER_PREVIEW);
+    remainingClusters = clusters.slice(initial.length);
+    for (const cluster of initial) body.append(renderWorkCluster(cluster, graph));
+    if (remainingClusters.length) {
+      const remaining = remainingClusters.length;
+      moreButton = document.createElement("button");
+      moreButton.type = "button";
+      moreButton.className = "show-more-work";
+      moreButton.textContent = `Show ${remaining} more work group${remaining === 1 ? "" : "s"}`;
+      moreButton.addEventListener("click", revealAll);
+      body.append(moreButton);
     }
   };
+  workRevealers.set(details, revealAll);
   details.addEventListener("toggle", () => {
-    label.textContent = details.open ? "Hide Work" : closedText;
+    label.textContent = details.open ? `Hide Work · ${countText}` : closedText;
     if (details.open) mount();
   });
   details.append(summary, body);
@@ -1608,9 +1629,8 @@ function clusterActivity(activityItems) {
       clusters.push({ kind: "note", items: [item] });
       continue;
     }
-    // Skip pure task-management noise entirely from the Amp work stream.
-    if (category === "task") continue;
-    // Explore groups read+search together like Amp.
+    // Explore groups read+search together while preserving every recorded event.
+
     const groupKey = category === "read" || category === "search" ? "explore" : category;
     const last = clusters.at(-1);
     if (last && last.kind === groupKey && groupKey !== "worker" && groupKey !== "agent") {
@@ -1658,12 +1678,7 @@ function renderWorkCluster(cluster, graph) {
   summary.append(label);
   const body = document.createElement("div");
   body.className = "work-cluster-body";
-  let mounted = false;
-  details.addEventListener("toggle", () => {
-    if (!details.open || mounted) return;
-    mounted = true;
-    for (const item of cluster.items) body.append(renderActivityItem(item, graph));
-  });
+  for (const item of cluster.items) body.append(renderActivityItem(item, graph));
   details.append(summary, body);
   return details;
 }
@@ -1716,10 +1731,10 @@ function renderAssistantAnswer(event) {
   });
   toolbar.append(copy);
 
-  const content = document.createElement("div");
-  content.className = "message-content";
-  content.append(renderMarkdown(event.content || event.summary || ""));
-  article.append(toolbar, content);
+  article.append(renderMessageMeta("Assistant", event));
+  article.append(toolbar, renderExpandableContent(event.content || event.summary || "", {
+    label: "Show full response",
+  }));
   return article;
 }
 
@@ -1729,7 +1744,8 @@ function renderProcessNote(event) {
 
 function renderTool(event, result) {
   const details = document.createElement("details");
-  details.className = `tool-event activity-item${result?.status === "failed" || event.status === "failed" ? " failed" : ""}`;
+  const failed = isFailedStatus(result?.status) || isFailedStatus(event.status);
+  details.className = `tool-event activity-item${failed ? " failed" : ""}`;
   details.id = eventAnchor(event.event_id);
   details.dataset.eventId = event.event_id || "";
   const tool = shortTool(event.tool_name);
@@ -1816,7 +1832,7 @@ function renderToolBody(event, result) {
     if (input.cwd || input.working_directory) nodes.push(fieldBlock("Working directory", input.cwd || input.working_directory));
     const exit = firstDefined(input.exit_code, recordValue(result?.raw).exit_code, result?.raw?.exitCode);
     if (exit !== undefined) nodes.push(fieldBlock("Exit code", String(exit)));
-    nodes.push(fieldBlock("Output", stringifyOutput(output) || "No visible output."));
+    nodes.push(fieldBlock("Output", compactOutput(output, 4000) || "No visible output."));
     return nodes;
   }
 
@@ -1858,7 +1874,10 @@ function renderToolBody(event, result) {
   const rawSummary = document.createElement("summary");
   rawSummary.textContent = "Show raw JSON";
   const rawPre = document.createElement("pre");
-  rawPre.textContent = JSON.stringify({ input: event.raw, result: result?.raw ?? result?.content ?? null }, null, 2);
+  rawPre.textContent = compactOutput(
+    JSON.stringify({ input: event.raw, result: result?.raw ?? result?.content ?? null }, null, 2),
+    6000,
+  );
   raw.append(rawSummary, rawPre);
   nodes.push(raw);
   return nodes;
@@ -2471,13 +2490,49 @@ function focusUsageDimension(dimension, value) {
   requestAnimationFrame(() => focusEvent(target.event_id));
 }
 
+function focusTurn(anchor, { updateHash = true } = {}) {
+  const node = document.getElementById(anchor);
+  if (!node) return false;
+  if (updateHash && state.currentID) {
+    history.replaceState(null, "", turnDeepLinkHash(state.currentID, { id: anchor }));
+  }
+  node.scrollIntoView({ behavior: preferredScrollBehavior(), block: "start" });
+  node.tabIndex = -1;
+  node.focus({ preventScroll: true });
+  node.classList.add("event-highlight");
+  setTimeout(() => node.classList.remove("event-highlight"), 1600);
+  return true;
+}
+
+function preferredScrollBehavior() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+}
+
 function focusEvent(eventID) {
-  const node = document.getElementById(eventAnchor(eventID));
+  let node = document.getElementById(eventAnchor(eventID));
+  if (!node && state.current) {
+    const turns = buildHumanTurns(eventsForHumanView(state.current));
+    const index = turns.findIndex((turn) => {
+      const events = [turn.user, ...(turn.assistantMessages || [])];
+      for (const item of turn.activity || []) events.push(item.event, item.result);
+      return events.some((event) => event?.event_id === eventID);
+    });
+    if (index >= 0) {
+      const turnNode = document.getElementById(stableTurnAnchor(turns[index], index));
+      const worked = turnNode?.querySelector("details.worked-for");
+      if (worked) {
+        worked.open = true;
+        workRevealers.get(worked)?.();
+        requestAnimationFrame(() => focusEvent(eventID));
+      }
+    }
+    return;
+  }
   if (!node) return;
   const worked = node.closest("details.worked-for");
   if (worked) worked.open = true;
   if (node instanceof HTMLDetailsElement) node.open = true;
-  node.scrollIntoView({ behavior: "smooth", block: "center" });
+  node.scrollIntoView({ behavior: preferredScrollBehavior(), block: "center" });
   node.tabIndex = -1;
   node.focus({ preventScroll: true });
   node.classList.add("event-highlight");
