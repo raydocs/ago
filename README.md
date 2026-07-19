@@ -6,6 +6,29 @@ Ago turns one user objective into a live execution board. The board is not a pas
 
 > 输入一个目标，Ago 自动生成看板、拆解任务、分配 Agent，并持续监控和验收，直到项目完成。
 
+## The simplest mental model
+
+**Ago combines automatic agent routing, repository-aware context engineering,
+an intelligent project board, and durable issue-style work items.**
+
+Conceptually, it brings together four proven interaction patterns:
+
+- **Amp-like automatic capability routing** — use the best available model or
+  agent for each kind of work; customers do not select models themselves;
+- **RepoPrompt-like context engineering** — understand the repository and
+  assemble a focused context package for each task instead of sending the whole
+  codebase or conversation;
+- **Linear-like board orchestration** — visualize dependencies and progress
+  while the board automatically schedules, monitors, retries, and re-plans;
+- **GitHub Issues-like durable work items** — every task has an identity,
+  contract, owner, discussion, status, artifacts, history, and acceptance
+  evidence that tools and automations can reference.
+
+These are product inspirations, not integrations or affiliations. In Ago they
+form one execution loop: the issue-style task defines the work, the context
+engine prepares its inputs, capability routing selects its agent, and the board
+supervises it through verified completion.
+
 ## The product
 
 Most agent products put one long conversation at the center. As work grows, that conversation accumulates plans, code, logs, tool output, corrections, and unfinished branches until its context becomes the bottleneck.

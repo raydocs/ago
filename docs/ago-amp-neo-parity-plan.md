@@ -30,6 +30,22 @@ foundation. It is an implementation baseline, not Ago's product identity. Ago's
 primary differentiation is board-native autonomous orchestration; automatic
 capability/model selection is one policy within that system.
 
+The concise product model is:
+
+```text
+automatic capability routing (Amp pattern)
+  + repository context engineering (RepoPrompt pattern)
+  + autonomous project board (Linear pattern)
+  + durable collaborative work items (GitHub Issues pattern)
+  = Ago
+```
+
+These names describe public product patterns, not affiliations or source-code
+dependencies. Ago joins the patterns into one control loop: a durable work item
+defines the contract, the context engine assembles its bounded inputs, the
+router assigns the best eligible capability, and the board supervises execution
+through acceptance.
+
 This is clean-room behavioral parity:
 
 - use Amp's public documentation and observable behavior as the specification;
@@ -48,6 +64,9 @@ This is clean-room behavioral parity:
   worker agents receive bounded task-specific context.
 - Work hierarchy: project board -> workstream/subproject -> task -> agent
   thread/attempt. Any oversized task can be refined again before dispatch.
+- Work-item contract: each task behaves like a durable issue with stable
+  identity, owner, status, discussion/events, dependencies, artifacts, attempts,
+  acceptance criteria, and automation triggers.
 - Context engine: repository files, symbols, architecture, rules, prior
   decisions, and upstream artifacts are selected into task-specific context
   packages rather than copied wholesale into prompts.
