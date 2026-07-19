@@ -1,4 +1,4 @@
-# Ago — Amp Neo Parity Plan
+# Ago — Product and Delivery Plan
 
 Status: active
 Plan version: 1.0
@@ -6,13 +6,27 @@ Started: 2026-07-18
 
 ## 1. Product Contract
 
-Ago is an independent, local-first coding-agent product. A user opens a local
-repository, states an objective, and receives an implemented and verified
-result without choosing providers, models, agents, or harness configuration.
+Ago is an intelligent project board that plans, delegates, monitors, and
+finishes work with agents. A user opens a repository and states an objective.
+Ago turns that objective into a durable work graph with tasks, dependencies,
+acceptance criteria, assigned agents, live status, artifacts, and verification.
 
-Ago will first reproduce the public behavior of rebuilt Amp/Neo. Differentiation
-comes only after the parity foundation is reliable. The first planned
-differentiator is stage-level automatic model selection.
+The board is itself an orchestration agent rather than a passive task list. It
+automatically dispatches runnable work, observes durable agent progress,
+re-plans around failures or changed evidence, integrates results, and owns the
+project-level completion decision. Users do not choose providers, models, agent
+topology, or harness configuration.
+
+Board state is the durable project memory. Each worker receives a bounded task
+contract and relevant evidence instead of inheriting one ever-growing root
+conversation. This prevents long projects from failing because one context is
+full while preserving the history required to monitor, resume, and verify the
+whole project.
+
+Amp/Neo parity supplies the reliable thread, client, diff, plugin, and execution
+foundation. It is an implementation baseline, not Ago's product identity. Ago's
+primary differentiation is board-native autonomous orchestration; automatic
+capability/model selection is one policy within that system.
 
 This is clean-room behavioral parity:
 
@@ -25,6 +39,14 @@ This is clean-room behavioral parity:
 ## 2. Fixed Decisions
 
 - Product name: **Ago**.
+- Primary interaction: one user objective creates or updates an Ago board.
+- Coordination authority: the board agent owns decomposition, dependencies,
+  assignment, monitoring, re-planning, integration, and final acceptance.
+- Context policy: project history and evidence remain durable on board tasks;
+  worker agents receive bounded task-specific context.
+- Assignment policy: users do not manually choose models or spawn agents for
+  ordinary work. Ago selects an eligible capability and executor from policy,
+  availability, cost, and verification requirements.
 - Initial execution: local machine and local repository.
 - Initial client: macOS desktop app; headless daemon comes before the UI.
 - Default tool policy: execute automatically, matching Amp's advanced-user
@@ -42,8 +64,8 @@ This is clean-room behavioral parity:
   GLM is allowed when evaluation supports it.
 - Amp research and implementation child threads launched by the project use
   Amp `medium` unless the user explicitly changes that policy.
-- Existing ClaudeX/claudex-flow behavior remains available while Ago is built.
-  Rename or migration work happens only when a parity slice requires it.
+- Existing ClaudeX/claudex-flow commands remain as a compatibility layer while
+  Ago's board-native commands and clients become the primary surface.
 - Delivery order follows Amp's published rebuilt-era dependency chain: Neo local
   runtime and plugins, synchronized clients, diffs, custom agents, managed orbs,
   long-thread retrieval, user-managed runners, workload identity, then
@@ -53,35 +75,32 @@ This is clean-room behavioral parity:
   protected and must not be overwritten, reverted, staged, or folded into Ago
   changes without explicit authorization.
 
-## 3. Existing Assets And Gaps
+## 3. Existing Foundation And Product Gap
 
-The current repository is not a blank slate. Reuse candidates include:
+The current repository is not a blank slate. Implemented foundation includes:
 
-- Go model catalog, router, route evaluation, lane health, and usage ledger;
-- Claude execution and bounded repair workflow;
-- transcript parser and sanitized Root/Parent/Child thread graph;
-- thread read/find/usage support;
-- compaction auditing and supervisor gates;
-- Cloudflare thread archive and event ingest;
-- existing Amp-style UI studies and parity reports.
+- durable Ago threads, ordered events, mailbox controls, and restart recovery;
+- local execution, plugin lifecycle, bounded repair, and supervisor gates;
+- macOS, iOS, Web/PWA, and CLI projections over one authoritative daemon;
+- attachments, usage, verification, Git review, staging, and safe revert;
+- authenticated relay transport and recent-passkey remote mutation gates;
+- model catalog, route evaluation, lane health, and usage infrastructure;
+- transcript retrieval, compaction auditing, and parent/child graph assets.
 
-The largest gaps relative to rebuilt Amp are:
+The largest remaining product gaps are:
 
-1. existing thread data is primarily observed from Claude transcripts rather
-   than owned by an Ago durable thread runtime;
-2. there is no Ago headless local daemon that owns agent execution independently
-   from a UI;
-3. there is no canonical command mailbox with queue, steer, interrupt, and
-   idempotency semantics;
-4. there is no executor abstraction covering local, named runner, and orb;
-5. remote web control is archival/read-oriented rather than a scoped command
-   plane;
-6. child agents are currently worker sessions, not fully durable independent
-   threads with authenticated reply routes and file transfer;
-7. no Ago desktop app consumes a stable command/event protocol;
-8. plugin behavior is not exposed through an Ago-owned lifecycle API;
-9. model routing exists, but it is not yet integrated into an Ago-owned
-   stage/thread runtime with accepted-result evaluation.
+1. no durable board aggregate yet owns task nodes, dependencies, readiness,
+   assignment, evidence, and project-level completion;
+2. child agents are not yet fully durable independent Ago threads attached to
+   board tasks with authenticated reply routes and bounded handoffs;
+3. the scheduler does not yet automatically lease every runnable task to an
+   eligible agent/executor and recover expired work;
+4. board clients do not yet provide the complete live project view and control
+   surface across task status, dependencies, blockers, artifacts, and checks;
+5. managed cloud orbs and named runners are not yet available through the common
+   executor contract;
+6. automatic capability routing is not yet evaluated and promoted as a
+   board-stage policy against held-out project outcomes.
 
 ## 4. Target Architecture
 
@@ -89,6 +108,14 @@ The largest gaps relative to rebuilt Amp are:
 Desktop / CLI / Web / Mobile
             |
             | versioned commands + ordered events
+            v
+Ago Board Control Plane
+- objective and project completion contract
+- task graph and dependency readiness
+- automatic agent/executor assignment
+- live status, blockers, evidence, and artifacts
+- lease expiry, retry, re-plan, and integration
+            |
             v
 Ago Thread Control Plane
 - durable thread records
@@ -120,6 +147,10 @@ Ago Agent Runtime
 
 ### 4.1 Trust boundaries
 
+- The board agent is the coordination authority, but it may mutate work only
+  through versioned board/thread commands and durable evidence.
+- A worker cannot mark its own task or project accepted. Board acceptance is
+  derived from the frozen criteria and verifier results.
 - Desktop renderer is untrusted presentation code and communicates only through
   the Ago protocol.
 - The local daemon owns SQLite, thread state, worker lifecycle, permissions,
@@ -145,6 +176,15 @@ A durable thread contains:
 - compaction snapshots;
 - artifacts, changed files, verification, and usage;
 - creation, update, archive, and terminal timestamps.
+
+A durable board contains:
+
+- stable board ID, project identity, objective, and completion contract;
+- task nodes with immutable task contracts and dependency edges;
+- readiness, assignment, lease, attempt, blocker, and terminal state;
+- attached worker thread IDs and bounded context/handoff references;
+- artifacts, changed paths, verification evidence, cost, and accepted result;
+- board-level decisions, re-plans, and project completion evidence.
 
 Public thread states initially match Amp's observable surface:
 
@@ -304,28 +344,46 @@ Exit gate:
 - 5,000-message transcript performance remains within an explicit CPU/memory/UI
   latency budget.
 
-### Phase 3 — Custom agents and persistent child threads
+### Phase 3 — Board-native orchestration and persistent child agents
 
-Goal: build custom and built-in agent handles on the plugin/thread substrate,
-matching Amp's local custom-agent release before remote executor orchestration.
+Goal: make the Ago board the autonomous coordination authority. One objective
+must become a durable task graph whose runnable nodes are assigned to persistent
+child-agent threads with bounded context, observable progress, and evidence-based
+acceptance.
 
 Deliverables:
 
+- durable board, task, dependency, attempt, assignment, and evidence records;
+- objective-to-board planning with explicit task contracts and project exit gate;
+- dependency-aware readiness and automatic assignment of runnable work;
+- board-agent monitoring over durable events rather than worker prompt claims;
+- bounded task briefs and artifact/evidence references instead of copied history;
+- lease expiry, safe retry, blocker propagation, and evidence-driven re-planning;
+- project-level integration and acceptance that workers cannot self-approve;
 - agent-definition snapshots: model, instructions, tools, effort, label/color;
 - built-in and custom agent handles;
 - one-shot `run` and persistent `createThread` APIs;
 - asynchronous message acceptance separated from response waiting;
 - parent-thread linkage, observable state, and cancellation;
 - selectable custom main-agent modes;
-- configured-concurrency background child threads visible in the same sidebar.
+- configured-concurrency background child threads visible on the board and in
+  the same project sidebar.
 
 Exit gate:
 
+- one user objective creates a board with valid tasks and acyclic dependencies;
+- every runnable task is assigned automatically without the user choosing an
+  agent or model;
+- blocked dependencies prevent dispatch and completion unlocks dependents;
+- the board can recover after coordinator restart without duplicate assignment;
+- a failed or expired task is retried or re-planned only from durable evidence;
+- board completion requires every mandatory task plus the project exit gate;
 - a custom agent can run once or create a persistent child thread;
 - appending to a child returns after durable acceptance rather than waiting for
   inference;
 - waiting for a response is an explicit operation;
-- parent completion does not implicitly cancel or join independent children.
+- parent completion does not implicitly cancel or join independent children;
+- a long project completes while each worker sees only bounded task context.
 
 ### Phase 4 — Amp-style managed orbs
 
