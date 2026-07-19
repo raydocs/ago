@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ago Amp Neo Parity — Implementation Notes</title>
+  <style>
+    body { color: #202124; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.55; margin: 0 auto; max-width: 960px; padding: 40px 24px; }
+    h1, h2 { line-height: 1.2; }
+    code { background: #f1f3f4; border-radius: 4px; padding: 2px 5px; }
+    .meta, .timeline { background: #f8f9fa; border: 1px solid #dadce0; border-radius: 8px; padding: 16px; }
+    .timeline { max-height: 420px; overflow: auto; padding: 8px; }
+    .event { background: #fff; border: 1px solid #e8eaed; border-radius: 8px; margin: 8px 0; padding: 12px 14px; }
+    .event-head { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+    .badge, .phase, .actor { border-radius: 999px; display: inline-block; font-size: 12px; font-weight: 700; line-height: 1; padding: 5px 8px; text-transform: uppercase; }
+    .badge { background: #e8f0fe; color: #174ea6; }
+    .status-done, .status-validated { background: #e6f4ea; color: #137333; }
+    .status-blocked, .status-failed { background: #fce8e6; color: #c5221f; }
+    .status-decision { background: #fef7e0; color: #b06000; }
+    .phase, .actor { background: #f1f3f4; color: #3c4043; font-weight: 600; }
+    .event time { color: #5f6368; font-size: 13px; }
+    li { margin: 6px 0; }
+  </style>
+</head>
+<body>
+  <h1>Ago Amp Neo Parity</h1>
+  <div class="meta">
+    <p><strong>Goal ID:</strong> <code>ago-amp-neo-parity</code></p>
+    <p><strong>Started:</strong> 2026-07-18T21:57:27Z</p>
+    <p><strong>Plan:</strong> <code>docs/ago-amp-neo-parity-plan.md</code></p>
+    <p><strong>Objective:</strong> Build Ago to clean-room behavioral parity with rebuilt Amp/Neo, then prove automatic model selection improves accepted outcomes.</p>
+  </div>
+
+  <h2>Resume Here</h2>
+  <ul>
+    <li><strong>Status:</strong> [doing] Phases 0–1 and Phase 2A–D are complete. Phase 2 exit conformance and frozen requirement remediation are active; the full goal remains active through Phases 3–6.</li>
+    <li><strong>Current phase:</strong> Phase 2 — unified authoritative client projection, CLI/macOS/Web/Mobile renderers, thread-bound Git diff operations, and 5,000-message performance evidence.</li>
+    <li><strong>Completed:</strong> Phase 1 now includes schema-v6 atomic thread creation with immutable agent/provenance/initial-message state, durable headless execution and mailbox controls, automatic compaction with immutable originals, Gate-0 Seatbelt supervision, strict duplex Pi with a trusted credential-bearing provider boundary, lifecycle plugins with <code>ctx.ai.ask</code>, dynamic tools/commands, and durable reconnectable dialogs.</li>
+    <li><strong>Active work:</strong> Requirement-by-requirement Phase 2 exit remediation. Root integrated durable project-scoped catalog/search/archive, strict message contracts, snapshot-member-validated diff comments, the production UIResult codec fix, and stronger real-daemon retry/restart/reconnect conformance. Medium-only workers own isolated attachment persistence, passkey authorization, outbound remote bridge, verification/usage ledger, duplicate-aware diff projection, macOS completion, Web comments, and signed release tooling.</li>
+    <li><strong>Blockers:</strong> Phase 2 audit remains red until attachment upload/ownership, usage/check producers, authenticated remote bridge plus passkey middleware, actual hunk review/comments in both GUIs, signed test release, and real cross-client 5,000 rendering evidence are integrated. These are active implementation gaps, not an external impasse.</li>
+    <li><strong>Next exact action:</strong> Review and integrate the active medium worker outputs, wire strict ownership/auth boundaries into daemon production startup, then rerun broad race/client/performance/release gates and the complete 14-deliverable/5-exit-gate audit.</li>
+    <li><strong>Last validation:</strong> At the 2026-07-19T10:40Z checkpoint, focused comment/catalog/message contract tests and Swift UIResult tests pass; the strengthened real-daemon Git conformance passes under <code>-race</code> with exact lost-response retry, stale conflict, cross-session projection equality, worktree/index preservation, store/daemon restart, cursor reconnect, and no duplicate sequence evidence. The earlier broad race, Web 5,000, Go benchmark, Swift build, diff check, and protected fingerprint evidence remains valid but must be rerun after active integrations.</li>
+    <li><strong>Protected paths:</strong> <code>thread-app/src/index.ts</code>, <code>thread-app/test/thread-api.test.mjs</code>, unrelated untracked outputs.</li>
+  </ul>
+
+  <h2>Decisions Outside The Spec</h2>
+  <ul>
+    <li>Use the existing <code>rw8/Orchestrate</code> repository as Ago's implementation base instead of creating a third codebase.</li>
+    <li>Do not perform an immediate all-repository rename from ClaudeX to Ago; create Ago-owned protocol boundaries first and migrate assets deliberately.</li>
+    <li>Use clean-room public behavior parity, not Amp branding or proprietary implementation.</li>
+    <li>Start with a headless local daemon even though the first customer surface is a desktop app; this preserves the later runner/orb path.</li>
+  </ul>
+
+  <h2>Changes And Tradeoffs</h2>
+  <ul>
+    <li>Added a long-running full goal because Amp parity spans multiple independently verifiable phases.</li>
+    <li>The current Cloudflare thread app is treated as a reusable archive/sync asset, not yet as Ago's canonical writable control plane.</li>
+    <li>The public <code>claudex-local-orchestrator</code> remains a coexistence dependency and routing lab: reuse its model-role policy, gateway/usage parsing, doctor/smoke patterns, and bounded agent profiles, but not its Claude session state, usage JSONL, prompt-prefix compaction detection, or launchd process state as Ago authority.</li>
+    <li>The deployed ClaudeX Threads system and this workspace's <code>thread-app</code>, <code>threadsync</code>, <code>threadgraph</code>, <code>threadread</code>, and <code>threadfind</code> are suitable Phase 2/5 projections, ingest, graph, export, redaction, and retrieval assets. D1 remains a read/archive replica until it consumes Ago's canonical event protocol.</li>
+    <li>Runtime foundation research recommends an Ago-owned thin durable runtime with pinned Pi packages behind an adapter. OpenCode supplies optional diff/desktop patterns; Codex supplies protocol, sandbox, approval, and executor patterns. None of their session or transport schemas becomes Ago's canonical model.</li>
+    <li>The research worker's “do not recommend GLM” note is superseded by the user's explicit decision: GLM remains eligible for later held-out Ago routing evaluation.</li>
+    <li>The Neo UX audit freezes the local v1 loop as workspace/executor → durable thread → background multi-thread observation → queue/steer/interrupt → Git-backed Changes → Activity/archive. Desktop, CLI, web, and mobile must be renderers over shared commands/read models, never separate thread products.</li>
+    <li>Existing transcript-derived thread graph remains useful for migration and import, but Ago must own future thread state directly.</li>
+    <li>Chronicle evidence corrected delivery order: managed orbs precede generalized named runners; truth-preserving retrieval and orb OIDC are explicit parity phases before Agent-to-Agent.</li>
+    <li>Pi integration is conditionally approved only through a tiny Ago-owned TypeScript SDK sidecar pinned to <code>earendil-works/pi</code> commit <code>3da591ab…21</code> / packages <code>0.80.10</code>. It must use <code>SessionManager.inMemory()</code>, <code>noTools:"builtin"</code>, Ago-owned transcript/tool persistence, and exhaustive event normalization. Stock <code>pi --mode rpc</code> fails the authority boundary.</li>
+    <li>The deterministic Pi gate is now accepted: package integrities match the researched lock, public imports compile, all seven behavior tests execute, and the adapter creates no Pi JSONL authority. Promotion to a credentialed provider remains a separate smoke gate.</li>
+    <li>Trusted plugins run in one supervised Bun child per workspace/runtime generation over bidirectional versioned JSONL. This is a reload/failure boundary, not a security sandbox. Ago owns policy folding, tool execution, thread state, and rendering; built-in <code>ago.permission.default</code> is pinned last.</li>
+    <li>Automatic macOS tools must use a pipe-only broker and tiny per-job supervisor with a deny-default parameterized Seatbelt profile, exact derived environment, synthetic HOME/TMP, network disabled, bounded head/tail output, immutable launch digest, and process-group TERM→grace→KILL. Saved PIDs/PGIDs are audit-only and no broad unsandboxed fallback is allowed.</li>
+    <li>Daemon restart never blindly reruns an active turn with unknown side effects. Startup now records a visible <code>turn.failed</code> orphan-reconciliation event; graceful SIGTERM first persists cancellation, terminates the process group, and waits for cancellation settlement.</li>
+  </ul>
+
+  <h2>Validation</h2>
+  <ul>
+    <li>[done] TDD red evidence: focused package initially failed because Ago protocol types were absent, then failed on missing root provenance and invalid runner-ID acceptance.</li>
+    <li>[done] <code>go test ./internal/agoprotocol</code> passed.</li>
+    <li>[done] <code>go test ./...</code> passed.</li>
+    <li>[done] Durable store TDD: initial package compile failed with missing store types; SQLite implementation then passed atomic create, persisted idempotency, changed-retry rejection, independent per-thread sequence allocation, replay cursor, concurrent threads, and close/reopen recovery tests.</li>
+    <li>[done] <code>go test ./internal/agothreadstore ./internal/agoprotocol</code> and the full Go suite passed after adding the pure-Go SQLite dependency.</li>
+    <li>[done] Durable mailbox TDD: RED compilation proved the mailbox contract was absent; implementation now covers idle start, busy FIFO queue, queue promotion to steer, safe-point consumption, dequeue, stale expected-turn rejection, normal turn completion/drain, atomic interrupt replacement, cancellation settlement, command idempotency, ordered replay, and queue/active-turn recovery after reopen.</li>
+    <li>[done] Mailbox/store race-enabled focused tests and the full repository Go suite passed.</li>
+    <li>[done] Revision-fenced queued editing and concurrent dequeue-versus-completion are deterministic: one command wins the expected sequence, the loser receives <code>ConflictError</code>, and a queue item is accepted at most once.</li>
+    <li>[done] Store schema v4 migrates pre-mailbox databases in place, adds compaction records, and rejects unknown newer schemas without touching data.</li>
+    <li>[done] First headless coordinator runs and drains queued turns with no UI client, propagates interrupt cancellation before replacement launch, and persists executor failure as thread error.</li>
+    <li>[done] Schema v3 persists absolute workspace, mode, and explicit local/orb/runner execution identity; coordinator dispatch receives that materialized identity.</li>
+    <li>[done] Local process executor sends one typed request over stdin without shell interpolation, uses the thread workspace, filters ambient secrets, propagates child failure, and terminates its process group with SIGTERM/SIGKILL escalation without waiting the full grace after exit.</li>
+    <li>[done] Unix socket tests prove stale socket replacement, live-daemon exclusion, and refusal to overwrite non-socket user data.</li>
+    <li>[done] Real built daemon accepted create/submit over a Unix socket, completed after the submitting client disconnected, shut down, restarted from the same SQLite database, and replayed the exact four-event history ending in <code>turn.completed</code>.</li>
+    <li>[done] Startup recovery test proves an orphaned active turn becomes an explicit error without executor redispatch; graceful coordinator shutdown tests prove cancel-requested precedes cancel-settled and returns the mailbox to idle.</li>
+    <li>[done] Compaction is an immutable audit event plus materialized record. Tests prove idempotency, monotonic boundaries, future/regressing rejection, summary+tail inference projection, preservation of every original event, and equivalent projection after close/reopen.</li>
+    <li>[done] Frozen plugin protocol now uses <code>tool.execute</code>/<code>command.execute</code>, typed initialize registrations, nested semantic UI, notification-only cancellation, string error discriminants, generation/deadline correlation, strict direction checks, and bounded JSONL decoding.</li>
+    <li>[done] Real Bun child loads trusted TypeScript modules, registers/disposes resources, appends ordinary built-in <code>ago.permission.default</code> last, invokes default allow policy, handles conservative headless UI and AbortSignal cancellation, and preserves stdout as protocol-only JSONL.</li>
+    <li>[done] Go plugin generation manager initializes G+1 before publication, keeps G on candidate failure, rejects stale/malformed/default-less generations and registration collisions, then cancels/disposes/terminates G. Actual Bun G1→G2 replacement is covered under the race detector.</li>
+    <li>[done] Parent policy fold treats allow as advisory, validates every modified and final input, terminates on deny/synthesize, fails closed on plugin/unknown/malformed decisions, and ignores malformed post-execution result replacements after logging.</li>
+    <li>[done] A real synchronous infinite-loop policy test exceeds its deadline, fails closed, cannot cooperate with AbortSignal, and forces atomic whole-child replacement from G1 to G2.</li>
+    <li>[done] Model-aware automatic compaction computes 90% of input capacity after reserved output tokens, calls the summarizer only at threshold, records the current immutable boundary, and leaves original events queryable.</li>
+    <li>[done] Exact Pi <code>0.80.10</code> package pins and researched SHA-512 integrities are present in <code>pi-adapter/bun.lock</code>; source imports only documented package roots and the public import surface compiles against installed declarations.</li>
+    <li>[done] Seven non-todo Pi adapter tests prove in-memory Ago transcript restoration/restart equivalence, closed typed text events, one correlated external tool round-trip, steer timing, follow-up timing, abort settlement with no later work, and deterministic compaction context rebuild without a Pi session file.</li>
+    <li>[done] Pi's exact <code>AgentSessionEvent</code> union is compile-time exhaustive at the normalization boundary; unknown runtime discriminants remain rejected rather than escaping into Ago events.</li>
+    <li>[pending:user-only] Credentialed real-provider Pi smoke: supported provider environment variables were all unset at 2026-07-18T23:58:17Z; no fake success and no credential persistence.</li>
+    <li>[done] Automatic-tool launch plans now fail closed unless executable/cwd/roots/synthetic HOME/TMP are canonical absolute paths, network is disabled, TTY is off, deadline/output budgets are positive, and a one-use nonce plus profile identity/hash is present. Tests mutate every security-relevant field and prove the SHA-256 launch digest changes.</li>
+    <li>[done] Pipe-only broker wire and actual <code>ago-supervisor</code now exist. The supervisor verifies the launch/profile digests, receives a dedicated liveness FD, creates synthetic directories/profile with restricted modes, invokes absolute <code>/usr/bin/sandbox-exec</code> without a shell, captures bounded head/tail output, and owns process-group TERM→grace→KILL. <code>cmd/ago</code selects <code>BrokerExecutor</code> whenever a local executor is configured; no unsandboxed fallback remains in that production path.</li>
+    <li>[done] Gate-0 root cause and fix are proven: crash reports stopped in <code>dyld4::CacheFinder</code>, and the matching kernel Seatbelt record denied <code>file-read-data /</code>. The profile now grants only <code>(literal "/")</code> root-vnode data access, not <code>(subpath "/")</code>; direct probes prove undeclared files remain denied. Temporary <code>DYLD_PRINT_LIBRARIES</code> and broad diagnostic roots were removed. Workspace read, outside denial, network denial, bounded output, deadline cancellation, and liveness cancellation all pass.</li>
+    <li>[done] Fresh built-binary broker E2E: <code>ago</code> and <code>ago-supervisor</code> ran with canonical paths and <code>/bin/cat</code> as the local sidecar; after the submit client exited, the daemon completed independently. Reconnect replay returned exactly four immutable events ending in <code>turn.completed</code>, and retrying the same idempotency key returned the original result without duplicate events.</li>
+    <li>[done] Executable Pi boundary: a real Bun child accepts a strict bounded initialize-first JSONL protocol, reconstructs only the Ago transcript in <code>SessionManager.inMemory()</code>, streams closed Ago events on stdout, remains duplex during active prompts for abort/tool/steer commands, fails closed on malformed/oversized/unknown input, and leaves no Pi session file. Thirteen Pi tests and typecheck pass.</li>
+    <li>[done] Daemon mailbox control routes now expose queued edit, dequeue, steer, interrupt, and cancel through the existing durable store/coordinator state machine. Integration tests prove idempotent route retry, expected-sequence 409, cancellation settlement, and interrupt replacement launch.</li>
+    <li>[done] Ago-native headless CLI now supports create, list, open, submit, watch, replay, edit, dequeue, steer, interrupt, and cancel over the protected Unix socket. Watch advances its reconnect cursor only after output and de-duplicates replayed sequences. Built-binary CLI E2E completed after disconnect and an identical retry added no event.</li>
+    <li>[done] Sandboxed session transport now uses digest-bound protocol budgets and dedicated control/event FDs. Real Seatbelt supervisor tests prove exact flat Pi initialize/prompt/event framing plus steer and abort delivery; strict malformed/bounded parsing remains fail-closed. The earlier RED was test-harness <code>PASS</code> output contaminating JSONL, fixed only by making the helper exit before harness output.</li>
+    <li>[done] Coordinator streaming execution persists ordered closed Pi lifecycle/text/assistant events before terminal turn settlement with active-turn fencing. Launch requests now carry the authoritative SQLite context projection, and the broker reconstructs strict summary+tail Pi transcript while omitting and verifying the separately sent current prompt. Pi restart tests prove Ago recovery summaries become Pi compaction-aware context without Pi persistence.</li>
+    <li>[done] Coordinator steer now promotes and durably accepts a queued input at a store safe point before serialized duplex delivery; route retries do not duplicate the control. Tool requests are durable before policy/dispatch, raw confirmed results are durable after execution, observer-folded agent-visible results are separately durable before delivery, and Pi acknowledgment remains a later event. Result-observer failures preserve the confirmed result.</li>
+    <li>[done] Production pre-inference preparation estimates model input once, applies the frozen <code>(context-output reserve)*0.90</code> gate, excludes the current prompt from the compaction boundary, records one bounded structured <code>AGO_RECOVERY_V1</code> capsule with a source digest, reloads summary+tail, and retains immutable originals. Explicit-boundary tests prove threshold and duplicate behavior.</li>
+    <li>[done] Schema-v5 durable plugin dialogs have transactional request/resolve events, revision and thread-sequence fencing, deterministic listing, exactly-one-winner resolution, idempotent retry, reopen/stale-dialog recovery, plugin UI invocation correlation, daemon and CLI list/resolve surfaces, and real Bun reconnect evidence.</li>
+    <li>[done] Phase 1 frozen blocker A is closed: typed bounded cancellable plugin <code>ctx.ai.ask</code> reverse RPC carries authoritative generation/plugin/invocation/thread/turn/deadline correlation. A dedicated sandboxed Pi classifier uses Ago-hidden routing and trusted inherited provider pipes; malformed/stale results fail closed and invocation/generation retirement cancels pending asks.</li>
+    <li>[done] Phase 1 frozen blocker B is closed: schema-v6 atomic creation commits canonical project/workspace, immutable agent snapshot, executor intent, server-authored provenance, initial message, and ordered <code>thread.created</code>/<code>message.accepted</code>/<code>turn.started</code> in one transaction before launch and acknowledgement. Retry, changed retry, rollback, reopen, concurrency, and duplicate-launch behavior are covered.</li>
+    <li>[done] Production Pi launch now validates and grants the adapter package root containing <code>package.json</code>/<code>node_modules</code> and runs Bun with that package cwd while retaining an unrelated canonical agent workspace in initialize. The real compiled-supervisor/Seatbelt/Bun E2E passes with adapter-only application read scope.</li>
+    <li>[done] Provider and event JSONL readers now use a shared <code>ReadSlice</code>-based max+1 frame reader. A non-EOF reader proves provider, supervisor-proxy, and broker-scanner paths reject at the configured bound without another read or unbounded allocation.</li>
+    <li>[done] A supervisor FD-finalizer race introduced by provider pipes was reproduced under <code>GOGC=1</code>: direct non-protocol calls wrapped arbitrary process FDs 6/7 and could close live test/runtime descriptors. The direct path no longer creates those wrappers; the formerly failing supervisor tests pass 100 iterations under low GC plus the broad suite.</li>
+    <li>[done] Final blocker-only Oracle review returned <code>Phase 1 closeable — Yes</code>; Phase 1 is closed and Phase 2 activated. Live credential smoke remains deferred by policy rather than counted as deterministic Phase 1 evidence.</li>
+    <li>[done] Protected thread-app paths remain modified only by their pre-existing user changes; this slice did not edit them.</li>
+  </ul>
+
+  <h2>Active Research Threads</h2>
+  <ul>
+    <li>Chronicle timeline: <code>T-019f7737-b9b6-739b-8bfb-da4a40dadc64</code></li>
+    <li>Neo protocol: <code>T-019f7737-e127-766a-a9eb-1c62687bd14c</code></li>
+    <li>Agent-to-agent: <code>T-019f7737-e7ce-7709-8c99-7eaa5980b997</code> — received</li>
+    <li>Runtime foundation: <code>T-019f7737-ed89-744e-944a-425e02f4b448</code></li>
+    <li>UX parity: <code>T-019f7737-f7ab-751f-a667-7fd66aa4735b</code></li>
+    <li>Pi SDK boundary: <code>T-019f7761-171f-72dd-bd4c-21714898cbdf</code> — received</li>
+    <li>Trusted plugin substrate: <code>T-019f7761-2672-741c-ba0e-10c901180edf</code> — received</li>
+    <li>macOS sandbox/broker: <code>T-019f7761-1df1-7578-9b51-87aa09fc82eb</code> — research gathered; synthesis re-requested</li>
+  </ul>
+
+  <h2>Progress Timeline</h2>
+  <div id="progress-timeline" class="timeline"></div>
+
+  <h2>Next Goal Candidates</h2>
+  <ul>
+    <li>None yet. Complete the parity goal phases before splitting differentiation into a successor goal.</li>
+  </ul>
+
+  <script>
+    const progressEvents = [
+      {
+        ts: "2026-07-18T21:57:27Z",
+        status: "created",
+        phase: "goal-start",
+        actor: "agent",
+        summary: "Created the Ago Amp Neo parity ledger and complete implementation plan."
+      },
+      {
+        ts: "2026-07-18T21:57:27Z",
+        status: "decision",
+        phase: "product-contract",
+        actor: "user",
+        summary: "Product named Ago; GLM remains eligible; Amp child threads use medium rather than small."
+      },
+      {
+        ts: "2026-07-18T21:57:27Z",
+        status: "doing",
+        phase: "phase-0",
+        actor: "agent",
+        summary: "Started contract and baseline phase; next slice is the Ago-owned thread command/event protocol."
+      },
+      {
+        ts: "2026-07-18T22:03:41Z",
+        status: "validated",
+        phase: "phase-0-protocol",
+        actor: "agent",
+        summary: "Test-drove and validated Ago schema-v1 commands/events, authenticated inter-thread provenance, explicit executor placement, and normal/steer queue classes; focused and full Go suites pass."
+      },
+      {
+        ts: "2026-07-18T22:09:33Z",
+        status: "done",
+        phase: "phase-0",
+        actor: "agent",
+        summary: "Completed the public parity matrix and runtime conformance contract, corrected the plan to Amp's actual orbs-before-runners chronology, and advanced to the durable local runtime phase."
+      },
+      {
+        ts: "2026-07-18T22:20:00Z",
+        status: "decision",
+        phase: "reuse-boundaries",
+        actor: "agent",
+        summary: "Assessed claudex-local-orchestrator and ClaudeX Threads: preserve the live ClaudeX launcher/gateway, reuse routing and archive projections, and keep Ago's SQLite command/event store as the new authoritative runtime boundary."
+      },
+      {
+        ts: "2026-07-18T22:24:39Z",
+        status: "validated",
+        phase: "phase-1-store",
+        actor: "agent",
+        summary: "Test-drove Ago's SQLite durable thread store with atomic thread creation, command idempotency, changed-retry rejection, per-thread ordering, replay cursors, concurrent thread isolation, and restart recovery; focused and full Go suites pass."
+      },
+      {
+        ts: "2026-07-18T22:31:46Z",
+        status: "validated",
+        phase: "phase-1-mailbox",
+        actor: "agent",
+        summary: "Test-drove the authoritative mailbox and turn state machine: busy queue, safe-point steer, dequeue, stale-turn fencing, normal drain, interrupt replacement, cancellation, replay ordering, idempotency, and restart recovery pass under the race detector and full Go suite."
+      },
+      {
+        ts: "2026-07-18T22:44:43Z",
+        status: "validated",
+        phase: "phase-1-coordinator",
+        actor: "agent",
+        summary: "Added revision-fenced queue editing/race resolution, in-place SQLite schema migration, and a no-UI coordinator that drains turns, cancels before interrupt replacement, and persists executor failures; focused race and full Go suites pass."
+      },
+      {
+        ts: "2026-07-18T23:08:36Z",
+        status: "validated",
+        phase: "phase-1-daemon-recovery",
+        actor: "agent",
+        summary: "Validated the schema-v3 execution identity, Unix-socket daemon, secret-filtered process executor, graceful process-group cancellation, no-client completion, identical restart replay, and fail-without-rerun orphan reconciliation; focused race and full Go suites pass."
+      },
+      {
+        ts: "2026-07-18T23:33:02Z",
+        status: "validated",
+        phase: "phase-1-compaction-plugins",
+        actor: "agent",
+        summary: "Added schema-v4 immutable compaction projection and the real supervised Bun plugin generation: frozen bidirectional JSONL, ordinary default permission plugin, conservative headless UI, cancellation, reverse cleanup, and atomic generation replacement pass Bun and race-enabled Go tests."
+      },
+      {
+        ts: "2026-07-18T23:58:17Z",
+        status: "validated",
+        phase: "phase-1-pi-adapter",
+        actor: "agent",
+        summary: "Accepted the exact-pinned Pi 0.80.10 deterministic sidecar gate: seven live tests prove in-memory restoration/restart, closed events, external tools, steer/follow-up timing, abort settlement, and compaction rebuild; public-import typecheck and all Go/Bun regressions pass. Real-provider smoke remains credential-gated."
+      },
+      {
+        ts: "2026-07-19T01:10:34Z",
+        status: "validated",
+        phase: "phase-1-gate-0",
+        actor: "agent",
+        summary: "Fixed macOS dyld startup with a literal root-vnode read grant, removed broad diagnostics, passed all sandbox security/cancellation controls, and validated built-daemon disconnect/reconnect completion with duplicate-free idempotent replay."
+      },
+      {
+        ts: "2026-07-19T01:30:03Z",
+        status: "validated",
+        phase: "phase-1-controls-pi-process",
+        actor: "agent",
+        summary: "Added the executable strict-duplex Pi process boundary, all durable mailbox HTTP controls, thread listing, and the complete Ago headless CLI; full Go, plugin, Pi, typecheck, built-daemon CLI E2E, and protected-worktree checks pass."
+      },
+      {
+        ts: "2026-07-19T02:30:00Z",
+        status: "validated",
+        phase: "phase-1-pi-production-bridge",
+        actor: "agent",
+        summary: "Validated digest-bound duplex Pi transport through the real Seatbelt supervisor, durable ordered coordinator event append, and authoritative summary+tail transcript reconstruction with the current prompt sent exactly once."
+      },
+      {
+        ts: "2026-07-19T02:50:00Z",
+        status: "validated",
+        phase: "phase-1-safe-boundaries-compaction",
+        actor: "agent",
+        summary: "Connected exactly-once durable steer delivery, request-before-dispatch and result-before-delivery tool boundaries, fail-open plugin result observers, lifecycle hooks, production automatic compaction, and schema-v5 durable dialog storage; combined Go/Bun/typecheck checks pass."
+      },
+      {
+        ts: "2026-07-19T04:20:00Z",
+        status: "validated",
+        phase: "phase-1-dialog-recovery-workspace-plugins",
+        actor: "agent",
+        summary: "Validated a real Bun command UI request through durable HTTP reconnect/resolution, strict typed UI results, generation-retirement cancellation, stale-dialog daemon recovery, and workspace-canonical plugin discovery/isolation substrate. Replaced fail-all orphan handling with safe inference-boundary resume while unresolved tool side effects still fail without replay; execution-attempt event keys fence restart output. Focused race suites pass; Phase 1 remains active pending production command routing, full workspace-registry E2E, structured compaction capsule, and fresh built restart E2E."
+      },
+      {
+        ts: "2026-07-19T05:15:00Z",
+        status: "validated",
+        phase: "phase-1-dynamic-plugin-tools",
+        actor: "agent",
+        summary: "Completed workspace-bound plugin command routes/CLI and dynamic registered plugin tools across the production catalog, coordinator durable request/completion/prepared-result boundary, strict broker/Pi initialize contract, real Seatbelt duplex correlation, and restart transcript reconstruction. Added a bounded AGO_RECOVERY_V2 capsule, fresh-built daemon crash/restart/reconnect completion evidence, and strict registered-tool call/result recovery checks. Full race-enabled Ago package suites, go test ./..., plugin-runtime, 22 Pi tests, Pi typecheck, uncached built restart E2E, diff check, and protected fingerprint all pass. Phase 1 remains active for requirement-by-requirement lifecycle/policy audit."
+      },
+      {
+        ts: "2026-07-19T06:10:00Z",
+        status: "validated",
+        phase: "phase-1-conformance-audit",
+        actor: "agent",
+        summary: "Closed audit gaps with durable awaiting-approval activity, dialog list/resolve CLI, exact success/error/cancel lifecycle evidence, real Bun malformed-policy fail-closed, concurrent thread execution, steer/completion and interrupt/completion races, a representative plugin code-change artifact, and actual structured compaction transcript capture from the fresh-built sandboxed sidecar. Replaced a flaky Pi wall-clock sleep with settlement-driven process synchronization. Broad Go/plugin/Pi checks pass; protected fingerprint is unchanged. Oracle review found two remaining Phase 1 contract blockers: plugin ai.ask classifier support and atomic thread creation containing immutable agent/provenance/initial-message identity. session.start once-per-thread behavior is now implemented and tested."
+      },
+      {
+        ts: "2026-07-19T08:00:00Z",
+        status: "done",
+        phase: "phase-1",
+        actor: "agent",
+        summary: "Closed Phase 1 after implementing typed cancellable plugin ai.ask, trusted credential-isolated Pi provider pipes, schema-v6 atomic thread creation with server-authored provenance, production package-root Bun launch, truly bounded non-EOF JSONL framing, and the supervisor FD-finalizer race fix. Full sequential Go race/all-package, plugin 9/9, Pi 22/22, typecheck, fresh-built restart, diff, and protected-fingerprint gates pass; blocker-only Oracle returned Phase 1 closeable — Yes."
+      },
+      {
+        ts: "2026-07-19T08:55:00Z",
+        status: "validated",
+        phase: "phase-2-projection-clients-git-snapshot",
+        actor: "agent",
+        summary: "Added the schema-v1 authoritative reconnect projection and migrated CLI watch/open plus independent Swift macOS and responsive Web/Mobile PWA clients. Root review fixed strict daemon dialog DTO and diff projection compatibility. Added a local-only Git binding/snapshot core with deterministic HEAD/index/content digests, staged/unstaged projection, protected-path and hostile-config controls, and schema-v7 durable snapshots/comments in the same client projection transaction. Focused race-enabled store/Git/daemon/CLI, Swift test/build, Web test/typecheck/build, diff-check, and protected fingerprint pass. Phase 2 remains active: daemon Git refresh integration, safe stage/unstage/revert, cross-client daemon conformance, and frozen 5,000-message budgets remain."
+      },
+      {
+        ts: "2026-07-19T08:42:42Z",
+        status: "doing",
+        phase: "phase-2-git-operation-journal",
+        actor: "agent",
+        summary: "New root re-anchored from the canonical local worktree, recreated the native active workflow, and personally reran the focused Go race, Swift, Web, diff, and protected-fingerprint baseline successfully. Phase 2A now implements a durable prepared-before-side-effect Git journal; all Amp workers are restricted to GPT medium and non-overlapping owned paths."
+      },
+      {
+        ts: "2026-07-19T09:13:03Z",
+        status: "validated",
+        phase: "phase-2-git-operation-journal",
+        actor: "agent",
+        summary: "Root closed Phase 2A after replacing the unsafe first draft with schema-v8 typed identities, created-vs-replay side-effect ownership, semantic request and plan hashes, exact binding/snapshot/unit fencing, unresolved-worktree exclusion, identity-derived reconciliation with resolvable unknown outcomes, FULL SQLite durability, and durable sequence events without idempotency-key leakage. Root race validation and protected fingerprint pass. Phase 2B is active."
+      },
+      {
+        ts: "2026-07-19T09:29:00Z",
+        status: "validated",
+        phase: "phase-2-cas-stage-unstage",
+        actor: "agent",
+        summary: "Closed Phase 2B with schema-v9 durable private snapshot artifacts and v8 row-preserving migration, server-snapshot-only unit resolution, standalone alternate-index planning, exact real-index CAS publication through index.lock, protected/unsafe/stale fail-closed behavior, durable prepare/publish/reconcile orchestration, and identity-only crash recovery that never replays unknown work. Root race suites, 5,000-message Go and Web budgets, Web typecheck/build, diff check, and protected fingerprint pass. Phase 2C–D is active."
+      },
+      {
+        ts: "2026-07-19T09:44:00Z",
+        status: "doing",
+        phase: "phase-2-revert-clients",
+        actor: "agent",
+        summary: "Added strict daemon stage/unstage routes and sequence/generation/revision/digest fencing, plus CLI, Web, and Swift mutation transports that send only opaque server unit IDs. Added schema-v10 immutable Ago-owned write receipts with exact typed before/after identities, component-aware overlap, idempotency, and protected-path rejection. Root race/client gates pass. Receipt-only revert and a real declared-write broker remain active; opaque plugin or arbitrary dirty state is not treated as Ago-owned."
+      },
+      {
+        ts: "2026-07-19T10:09:00Z",
+        status: "doing",
+        phase: "phase-2-revert-clients",
+        actor: "agent",
+        summary: "Integrated receipt-only revert through durable Git prepare/reconcile, strict daemon route, and CLI/Web/Swift receipt-only transports. Exact retry does not republish, staged overlap fails closed, non-overlapping later text edits survive, and multi-path publication now rolls back earlier paths when a later publish fails while preserving outcome-unknown evidence if rollback cannot be proved. Broad race/client/performance gates and the protected fingerprint pass. The explicit production declared-write broker and visible controls remain active."
+      },
+      {
+        ts: "2026-07-19T10:40:00Z",
+        status: "doing",
+        phase: "phase-2-exit-remediation",
+        actor: "agent",
+        summary: "The frozen 14-deliverable/5-gate audit correctly blocked Phase 2 exit. Root added project-scoped search/archive, strict typed messages that reject unresolved references, snapshot-member-validated comments, correct plugin UIResult clients, and stronger real-daemon retry/restart/cursor conformance. Medium-only isolated lanes are closing attachments, checks/cost, passkey/authenticated bridge, actual hunk review, macOS UX, and signed release gaps."
+      },
+      {
+        ts: "2026-07-19T11:25:00Z",
+        status: "validated",
+        phase: "phase-2-provider-usage-release",
+        actor: "agent",
+        summary: "Root inspected and reran the credential-free signed macOS release tooling gates successfully. Integrated strict Pi assistant provider_usage decoding and durable accepted-turn usage recording with exact retry deduplication, preserving optional cache-write-1h and reasoning token buckets; race suites for coordinator, local executor, and thread store pass. Phase 2 remains active for attachment/message ownership, verifier production wiring, and authenticated durable remote bridge composition."
+      },
+      {
+        ts: "2026-07-19T11:40:00Z",
+        status: "validated",
+        phase: "phase-2-attachments-verification-auth",
+        actor: "agent",
+        summary: "Integrated immutable same-thread/project attachment upload and submit authorization, latest-binding no-follow file-mention resolution, and private production attachment storage. Added the server-owned check-id-only ago_verify tool using a deny-default Seatbelt executor and durable truthful verification ledger. Root race-tested daemon/store/cmd/verifier and a real supervisor execution. Durable passkey credentials/signCount and bridge replay state now survive restart with process-safe CAS; bridge edge-case and file-state race/vet gates pass. Remaining Phase 2 blocker is optional production bridge composition plus the final 19-row audit and actual-process conformance."
+      },
+      {
+        ts: "2026-07-19T12:00:00Z",
+        status: "doing",
+        phase: "phase-2-release-conformance",
+        actor: "agent",
+        summary: "Production outbound bridge composition is now all-or-nothing configured, TLS-pinned, durable, explicit-publication-only, and recent-passkey-gated for mutations; focused race suites pass. CLI attachment/file-mention parity and the Web production-parser conformance entrypoint are green. The fresh frozen audit now leaves product/release gaps rather than core Git/data gaps: Apple attachment UI and live conformance, iOS target, complete bundle-relative app artifact, real signing/notarization credentials, macOS 5,000 evidence, and external relay deployment. Medium-only lanes are actively closing the code-addressable portions."
+      },
+      {
+        ts: "2026-07-19T12:20:00Z",
+        status: "validated",
+        phase: "phase-2-mobile-bundle-relay",
+        actor: "agent",
+        summary: "Closed major code-addressable release gaps: secure authenticated loopback TCP enables closed-bundle daemon access; deployable durable ago-relay now supplies authenticated browser enqueue/result and daemon poll APIs; AgoMobile is a real iOS SwiftUI target and simulator binary; Apple attachment/file-mention UX, closed-manifest integrity launcher, Web/Swift conformance entrypoints, 5,000-event Swift budget, complete 8-component AgoDesktop.app bundle, and credential-free signing/update fixture gates pass. Remaining blockers are live relay/passkey client conformance, one-daemon three-client digest proof, and external Developer ID/notary/final update-key credentials."
+      },
+      {
+        ts: "2026-07-19T13:15:00Z",
+        status: "validated",
+        phase: "phase-2-exit-proof",
+        actor: "agent",
+        summary: "Closed the remaining code-addressable Phase 2 proof gaps: deployable relay and daemon expose exact WebAuthn challenge/assertion actions with operator-provisioned credentials and single-use bound grants; Web navigator.credentials and iOS ASAuthorization consume them without persistence; bundled macOS launches and authenticates to its private loopback daemon; and one integration test now compares byte-identical canonical projection digests from the actual CLI, Bun Web parser/store, and compiled AgoDesktop against one daemon. Broad Go race, Web 34/34, Swift 30/30, Pi 25/25, bundle/update fixture, representative write-check-review-revert, diff, and protected-file gates pass. Phase 2 cannot honestly exit until external Developer ID/notary/update-signing credentials produce a verified distributable and an operator deploys the TLS relay/credentials for live remote smoke."
+      }
+    ];
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    document.getElementById("progress-timeline").innerHTML = progressEvents.map((event) => {
+      const status = escapeHtml(event.status || "event");
+      return `<article class="event"><div class="event-head"><span class="badge status-${status}">${status}</span><span class="phase">${escapeHtml(event.phase)}</span><span class="actor">${escapeHtml(event.actor)}</span><time>${escapeHtml(event.ts)}</time></div><p>${escapeHtml(event.summary)}</p></article>`;
+    }).join("");
+  </script>
+</body>
+</html>

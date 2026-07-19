@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#101412">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="src/style.css">
+  <title>Ago Threads</title>
+</head>
+<body>
+  <header>
+    <strong>Ago</strong>
+    <form id="connect">
+      <label>Server <input id="base" value="http://localhost:8080" inputmode="url"></label>
+      <label>Thread ID <input id="thread" required></label>
+      <button>Connect</button>
+    </form>
+    <output id="status" aria-live="polite">Offline</output>
+  </header>
+  <nav aria-label="Projects and threads">
+    <h2>Threads</h2>
+    <p id="project">Connect to a thread</p>
+    <label>Project <select id="project-switch"><option value="">All projects</option></select></label>
+    <label>Search <input id="thread-search" type="search" placeholder="Search threads"></label>
+    <label>Thread <select id="thread-switch"><option value="">Choose a thread</option></select></label>
+    <div class="nav-actions"><button id="refresh-threads" type="button">Refresh</button><button id="archive" type="button">Archive</button></div>
+    <button id="enable-notifications" type="button">Enable notifications</button>
+    <div class="nav-links"><a href="#timeline">Timeline</a><a href="#diff">Changes</a><a href="#queue">Queue</a><a href="#dialogs">Requests</a></div>
+  </nav>
+  <main>
+    <section id="summary"><h1 id="title">Thread</h1><span id="activity">offline</span><p id="executor"></p></section>
+    <form id="composer">
+      <h2>Message</h2>
+      <label class="wide">Text <textarea name="message" placeholder="Ask Ago…"></textarea></label>
+      <details><summary>Attachment and file mention</summary><div class="composer-meta">
+        <label>Attachment ID <input name="attachment"></label><label>SHA-256 <input name="sha256"></label><label>Filename <input name="filename"></label><label>Media type <input name="media-type"></label><label>Bytes <input name="size" type="number" min="0"></label>
+        <label>Repository path <input name="mention"></label>
+      </div></details>
+      <button>Send</button>
+    </form>
+    <div class="facts"><section id="verification"><h2>Verification</h2><div>No authoritative verification event yet.</div></section><section id="usage"><h2>Reported usage and cost</h2><div>No authoritative usage event yet.</div></section></div>
+    <section id="timeline"><h2>Activity</h2><ol></ol></section>
+    <section id="diff"><h2>Changes</h2><div></div></section>
+    <section id="queue"><h2>Queue</h2><div></div></section>
+    <section id="dialogs"><h2>Requests</h2><div></div></section>
+  </main>
+  <script type="module" src="src/app.ts"></script>
+</body>
+</html>

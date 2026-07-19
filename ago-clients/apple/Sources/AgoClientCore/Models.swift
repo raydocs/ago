@@ -1,0 +1,120 @@
+import Foundation
+
+public enum JSONValue: Codable, Equatable, Sendable {
+    case null, bool(Bool), number(Double), string(String), array([JSONValue]), object([String: JSONValue])
+    public init(from decoder: Decoder) throws { let c = try decoder.singleValueContainer(); if c.decodeNil(){self = .null} else if let v=try? c.decode(Bool.self){self = .bool(v)} else if let v=try? c.decode(Double.self){self = .number(v)} else if let v=try? c.decode(String.self){self = .string(v)} else if let v=try? c.decode([JSONValue].self){self = .array(v)} else {self = .object(try c.decode([String:JSONValue].self))} }
+    public func encode(to encoder: Encoder) throws { var c=encoder.singleValueContainer(); switch self { case .null:try c.encodeNil(); case .bool(let v):try c.encode(v); case .number(let v):try c.encode(v); case .string(let v):try c.encode(v); case .array(let v):try c.encode(v); case .object(let v):try c.encode(v) } }
+    public var objectValue:[String:JSONValue]? { if case .object(let v)=self{return v}; return nil }
+    public var arrayValue:[JSONValue]? { if case .array(let v)=self{return v}; return nil }
+    public var stringValue:String? { if case .string(let v)=self{return v}; return nil }
+    public var boolValue:Bool? { if case .bool(let v)=self{return v}; return nil }
+    public static func parse(_ text:String) throws -> JSONValue { try JSONDecoder().decode(JSONValue.self,from:Data(text.utf8)) }
+    public var formatted:String { let encoder=JSONEncoder(); encoder.outputFormatting=[.prettyPrinted,.sortedKeys,.withoutEscapingSlashes]; return (try? String(decoding:encoder.encode(self),as:UTF8.self)) ?? "null" }
+}
+
+public enum Activity:String,Codable,Equatable,Sendable { case idle,running,error; case awaitingApproval="awaiting-approval" }
+public enum ArchiveFilter:String,Codable,Equatable,Sendable { case active,archived,all }
+public struct ThreadCatalogEntry:Codable,Equatable,Sendable,Identifiable {
+    public let threadID,projectID,title,workspace:String; public let lastSequence:UInt64; public let activity:Activity; public let createdAt,updatedAt:String; public let archived:Bool; public let archivedAt:String
+    public var id:String{threadID}
+    enum CodingKeys:String,CodingKey {case threadID="thread_id",projectID="project_id",title,workspace,lastSequence="last_sequence",activity,createdAt="created_at",updatedAt="updated_at",archived,archivedAt="archived_at"}
+}
+public struct ThreadCatalogPage:Codable,Equatable,Sendable { public let schemaVersion:Int; public let threads:[ThreadCatalogEntry]; public let nextCursor:String?; enum CodingKeys:String,CodingKey {case schemaVersion="schema_version",threads,nextCursor="next_cursor"} }
+public enum ThreadCatalogDecoder {
+    private static let allowedKeys:Set<String>=["schema_version","threads","next_cursor"]
+    public static func decode(_ data:Data)throws->ThreadCatalogPage { let raw=try JSONSerialization.jsonObject(with:data); guard let object=raw as? [String:Any] else{throw ProjectionError.inconsistent("thread catalog is not an object")}; let unknown=Set(object.keys).subtracting(allowedKeys).sorted(); guard unknown.isEmpty else{throw ProjectionError.unknownTopLevelFields(unknown)}; let page=try JSONDecoder().decode(ThreadCatalogPage.self,from:data); guard page.schemaVersion==1 else{throw ProjectionError.unsupportedSchema(page.schemaVersion)}; return page }
+}
+
+public enum UIResultValue:Codable,Equatable,Sendable {
+    case bool(Bool),string(String)
+    public init(from decoder:Decoder)throws { let value=try decoder.singleValueContainer(); if let bool=try? value.decode(Bool.self){self = .bool(bool);return}; self = .string(try value.decode(String.self)) }
+    public func encode(to encoder:Encoder)throws { var value=encoder.singleValueContainer(); switch self{case .bool(let bool):try value.encode(bool);case .string(let string):try value.encode(string)} }
+}
+public enum UIResult:Codable,Equatable,Sendable {
+    case ok(UIResultValue),cancelled,unavailable,timeout
+    enum CodingKeys:String,CodingKey {case status,value}
+    public init(from decoder:Decoder)throws { let values=try decoder.container(keyedBy:CodingKeys.self); let status=try values.decode(String.self,forKey:.status); switch status{case "ok":self = .ok(try values.decode(UIResultValue.self,forKey:.value));case "cancelled":self = .cancelled;case "unavailable":self = .unavailable;case "timeout":self = .timeout;default:throw DecodingError.dataCorruptedError(forKey:.status,in:values,debugDescription:"unsupported UI result status")} }
+    public func encode(to encoder:Encoder)throws { var values=encoder.container(keyedBy:CodingKeys.self); switch self{case .ok(let value):try values.encode("ok",forKey:.status);try values.encode(value,forKey:.value);case .cancelled:try values.encode("cancelled",forKey:.status);case .unavailable:try values.encode("unavailable",forKey:.status);case .timeout:try values.encode("timeout",forKey:.status)} }
+    public var jsonValue:JSONValue { switch self{case .ok(.bool(let value)):return .object(["status":.string("ok"),"value":.bool(value)]);case .ok(.string(let value)):return .object(["status":.string("ok"),"value":.string(value)]);case .cancelled:return .object(["status":.string("cancelled")]);case .unavailable:return .object(["status":.string("unavailable")]);case .timeout:return .object(["status":.string("timeout")])} }
+}
+
+public struct Provenance: Codable, Equatable, Sendable { public let rootThreadID,parentThreadID,sourceThreadID,replyToThreadID:String?; enum CodingKeys:String,CodingKey {case rootThreadID="root_thread_id",parentThreadID="parent_thread_id",sourceThreadID="source_thread_id",replyToThreadID="reply_to_thread_id"} }
+public struct ExecutorTarget: Codable, Equatable, Sendable { public let type:String; public let runnerID:String?; enum CodingKeys:String,CodingKey {case type,runnerID="runner_id"} }
+public struct ProjectIdentity: Codable, Equatable, Sendable { public let projectID:String; public let displayName:String?; enum CodingKeys:String,CodingKey {case projectID="project_id",displayName="display_name"} }
+public struct AgentSnapshot: Codable, Equatable, Sendable { public let definitionID,version,displayName:String; public let systemInstructions,systemInstructionsRef,systemInstructionsDigest:String?; public let capabilities:[String]?; public let defaultMode:String; public let provenance:String?; enum CodingKeys:String,CodingKey {case definitionID="definition_id",version,displayName="display_name",systemInstructions="system_instructions",systemInstructionsRef="system_instructions_ref",systemInstructionsDigest="system_instructions_digest",capabilities,defaultMode="default_mode",provenance} }
+public struct ThreadMetadata: Codable, Equatable, Sendable { public let threadID:String; public let lastSequence:UInt64; public let title,workspace,mode:String; public let executor:ExecutorTarget; public let project:ProjectIdentity; public let agent:AgentSnapshot; public let provenance:Provenance?; enum CodingKeys:String,CodingKey {case threadID="thread_id",lastSequence="last_sequence",title,workspace,mode,executor,project,agent,provenance} }
+public struct QueueItem: Codable, Equatable, Sendable { public let queueItemID:String; public let position:UInt64; public let `class`,state:String; public let content:JSONValue; enum CodingKeys:String,CodingKey {case queueItemID="queue_item_id",position,`class`,state,content} }
+public struct Mailbox: Codable, Equatable, Sendable { public let threadID:String; public let lastSequence:UInt64; public let activity:String; public let activeTurnID:String?; public let cancelRequested:Bool; public let queue:[QueueItem]; public let events:[AgoEvent]?; enum CodingKeys:String,CodingKey {case threadID="thread_id",lastSequence="last_sequence",activity,activeTurnID="active_turn_id",cancelRequested="cancel_requested",queue,events} }
+public struct AgoEvent: Codable, Equatable, Sendable { public let schemaVersion:Int; public let eventID,threadID:String; public let sequence:UInt64; public let type,visibility:String; public let provenance:Provenance?; public let payload:JSONValue; enum CodingKeys:String,CodingKey {case schemaVersion="schema_version",eventID="event_id",threadID="thread_id",sequence,type,visibility,provenance,payload} }
+public enum TimelineBlockKind:String,Equatable,Sendable { case text,thinking; case toolCall="tool-call",toolResult="tool-result" }
+public struct TimelineBlock:Identifiable,Equatable,Sendable { public let kind:TimelineBlockKind; public let sequence:UInt64; public let text,title,callID:String?; public let detail:JSONValue?; public let failed,streaming:Bool; public var id:String{"\(sequence)-\(kind.rawValue)-\(callID ?? "")"} }
+public enum VerificationStatus:String,Codable,Equatable,Sendable { case passed,failed,unknown }
+public enum ProviderUsageStatus:String,Codable,Equatable,Sendable { case provisional,final }
+public struct ProviderTokenUsage:Codable,Equatable,Sendable { public let inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,totalTokens:Decimal; enum CodingKeys:String,CodingKey {case inputTokens="input_tokens",outputTokens="output_tokens",cacheReadTokens="cache_read_tokens",cacheWriteTokens="cache_write_tokens",totalTokens="total_tokens"} }
+public struct ProviderCost:Codable,Equatable,Sendable { public let input,output,cacheRead,cacheWrite,total:Decimal; enum CodingKeys:String,CodingKey {case input,output,cacheRead="cache_read",cacheWrite="cache_write",total} }
+public struct ProviderUsageRecord:Codable,Equatable,Sendable { public let recordID:String; public let createdSequence:UInt64; public let threadID,idempotencyKey,provider,model,requestID:String; public let status:ProviderUsageStatus; public let usage:ProviderTokenUsage; public let cost:ProviderCost; enum CodingKeys:String,CodingKey {case recordID="record_id",createdSequence="created_sequence",threadID="thread_id",idempotencyKey="idempotency_key",provider,model,requestID="request_id",status,usage,cost} }
+public struct VerificationCheck:Codable,Equatable,Sendable { public let recordID:String; public let createdSequence:UInt64; public let threadID,idempotencyKey,checkID,command:String; public let status:VerificationStatus; public let outputSummary:String; enum CodingKeys:String,CodingKey {case recordID="record_id",createdSequence="created_sequence",threadID="thread_id",idempotencyKey="idempotency_key",checkID="check_id",command,status,outputSummary="output_summary"} }
+public struct EventNotification:Equatable,Sendable { public let title,body,tag:String }
+public enum EventProjection {
+    public static func timeline(_ events:[AgoEvent])->[TimelineBlock] {
+        let completedTurns=Set(events.filter{$0.type=="assistant.completed"}.compactMap{object($0.payload)?["turn_id"]?.stringValue})
+        var result:[TimelineBlock]=[],streams:[String:(UInt64,String)]=[:]
+        for event in events {
+            guard let payload=object(event.payload) else{continue}
+            if event.type=="assistant.text-delta",let nested=payload["event"].flatMap(object),let delta=nested["delta"]?.stringValue {
+                let turn=payload["turn_id"]?.stringValue ?? event.eventID; guard !completedTurns.contains(turn) else{continue}; let prior=streams[turn]?.1 ?? ""; streams[turn]=(event.sequence,prior+delta); continue
+            }
+            if event.type=="assistant.completed",let nested=payload["event"].flatMap(object),let message=nested["message"].flatMap(object),let content=message["content"]?.arrayValue {
+                for item in content { guard let block=object(item),let type=block["type"]?.stringValue else{continue}; if type=="text",let text=block["text"]?.stringValue{result.append(TimelineBlock(kind:.text,sequence:event.sequence,text:text,title:nil,callID:nil,detail:nil,failed:false,streaming:false))}; if type=="thinking",let text=block["thinking"]?.stringValue{result.append(TimelineBlock(kind:.thinking,sequence:event.sequence,text:text,title:nil,callID:nil,detail:nil,failed:false,streaming:false))} }; continue
+            }
+            if event.type=="tool.requested",let nested=payload["event"].flatMap(object),let call=nested["callId"]?.stringValue,let name=nested["name"]?.stringValue,let input=nested["input"] { result.append(TimelineBlock(kind:.toolCall,sequence:event.sequence,text:nil,title:name,callID:call,detail:input,failed:false,streaming:false)); continue }
+            if event.type=="tool.completed" || event.type=="tool.failed",let call=payload["call_id"]?.stringValue,let name=payload["name"]?.stringValue,let output=payload["output"] { result.append(TimelineBlock(kind:.toolResult,sequence:event.sequence,text:nil,title:name,callID:call,detail:output,failed:event.type=="tool.failed" || payload["error"]?.boolValue==true,streaming:false)); continue }
+            if event.type=="message.accepted",let content=payload["content"].flatMap(object),let text=content["text"]?.stringValue { result.append(TimelineBlock(kind:.text,sequence:event.sequence,text:text,title:nil,callID:nil,detail:nil,failed:false,streaming:false)) }
+        }
+        result += streams.values.filter{!$0.1.isEmpty}.map{TimelineBlock(kind:.text,sequence:$0.0,text:$0.1,title:nil,callID:nil,detail:nil,failed:false,streaming:true)}
+        return result.sorted{$0.sequence < $1.sequence}
+    }
+    public static func providerUsage(_ events:[AgoEvent])->ProviderUsageRecord? { guard let event=events.last(where:{$0.type=="provider.usage-recorded"}) else{return nil}; return try? decode(event.payload,as:ProviderUsageRecord.self,allowed:["record_id","created_sequence","thread_id","idempotency_key","provider","model","request_id","status","usage","cost"],nested:["usage":["input_tokens","output_tokens","cache_read_tokens","cache_write_tokens","total_tokens"],"cost":["input","output","cache_read","cache_write","total"]]) }
+    public static func verification(_ events:[AgoEvent])->VerificationCheck? { guard let event=events.last(where:{$0.type=="verification.check-recorded"}) else{return nil}; return try? decode(event.payload,as:VerificationCheck.self,allowed:["record_id","created_sequence","thread_id","idempotency_key","check_id","command","status","output_summary"]) }
+    public static func notification(_ event:AgoEvent)->EventNotification? { guard event.type=="plugin.dialog.requested",let payload=object(event.payload),Set(payload.keys)==["dialog_id","thread_id","turn_id","plugin_id","generation","invocation_id","deadline","request_type","request","state","revision","requested_sequence"],payload["request_type"]?.stringValue=="notify",let request=payload["request"].flatMap(object),Set(request.keys).isSubset(of:["kind","title","message","confirmLabel","helpText","initialValue","submitLabel","options"]),request["kind"]?.stringValue=="notify",let title=request["title"]?.stringValue,let message=request["message"]?.stringValue else{return nil}; return EventNotification(title:title,body:message,tag:event.eventID) }
+    private static func object(_ value:JSONValue)->[String:JSONValue]? { value.objectValue }
+    private static func decode<T:Decodable>(_ value:JSONValue,as type:T.Type,allowed:Set<String>,nested:[String:Set<String>]=[:])throws->T { let data=try JSONEncoder().encode(value); guard let object=try JSONSerialization.jsonObject(with:data) as? [String:Any],Set(object.keys)==allowed else{throw ProjectionError.inconsistent("authoritative event payload fields changed")}; for (key,keys) in nested{guard let child=object[key] as? [String:Any],Set(child.keys)==keys else{throw ProjectionError.inconsistent("authoritative event nested payload fields changed")}}; return try JSONDecoder().decode(type,from:data) }
+}
+public struct PluginDialog: Codable, Equatable, Sendable { public let dialogID,threadID,turnID,pluginID:String; public let generation:UInt64; public let invocationID:String; public let deadline:Date; public let requestType:String; public let request:JSONValue; public let state:String; public let revision,requestedSequence:UInt64; public let resolvedSequence:UInt64?; public let resolverID:String?; public let response:JSONValue?; enum CodingKeys:String,CodingKey {case dialogID="dialog_id",threadID="thread_id",turnID="turn_id",pluginID="plugin_id",generation,invocationID="invocation_id",deadline,requestType="request_type",request,state,revision,requestedSequence="requested_sequence",resolvedSequence="resolved_sequence",resolverID="resolver_id",response} }
+public struct ToolRegistration: Codable, Equatable, Sendable { public let name,description:String; public let inputSchema:JSONValue }
+public struct CommandRegistration: Codable, Equatable, Sendable { public let id,title:String; public let category,description:String? }
+public struct PluginRegistration: Codable, Equatable, Sendable { public let pluginId:String; public let tools:[ToolRegistration]; public let commands:[CommandRegistration]; public let hooks:[String] }
+public struct PluginProjection: Codable, Equatable, Sendable { public let available:Bool; public let generation:Int64; public let registrations:[PluginRegistration] }
+public struct ExecutorProjection: Codable, Equatable, Sendable { public let target:ExecutorTarget; public let activity:String; public let activeTurnID:String?; enum CodingKeys:String,CodingKey {case target,activity,activeTurnID="active_turn_id"} }
+public struct SerializedIndexIdentity:Codable,Equatable,Sendable { public let exists:Bool; public let digest:String?; public let size:Int64 }
+public struct GitHunk:Codable,Equatable,Sendable { public let id,header,patch:String; public let oldStart,oldLines,newStart,newLines,occurrence:Int; enum CodingKeys:String,CodingKey {case id,header,patch,oldStart="old_start",oldLines="old_lines",newStart="new_start",newLines="new_lines",occurrence} }
+public struct GitChange:Codable,Equatable,Sendable { public let id,path:String; public let oldPath:String?; public let contentDigest,status:String; public let oldMode,newMode:String?; public let binary,protected,mutationSupported:Bool; public let hunks:[GitHunk]; enum CodingKeys:String,CodingKey {case id,path,oldPath="old_path",contentDigest="content_digest",status,oldMode="old_mode",newMode="new_mode",binary,protected,mutationSupported="mutation_supported",hunks}; public init(from decoder:Decoder)throws{let c=try decoder.container(keyedBy:CodingKeys.self);id=try c.decode(String.self,forKey:.id);path=try c.decode(String.self,forKey:.path);oldPath=try c.decodeIfPresent(String.self,forKey:.oldPath);contentDigest=try c.decode(String.self,forKey:.contentDigest);status=try c.decode(String.self,forKey:.status);oldMode=try c.decodeIfPresent(String.self,forKey:.oldMode);newMode=try c.decodeIfPresent(String.self,forKey:.newMode);binary=try c.decode(Bool.self,forKey:.binary);protected=try c.decode(Bool.self,forKey:.protected);mutationSupported=try c.decode(Bool.self,forKey:.mutationSupported);hunks=try c.decodeIfPresent([GitHunk].self,forKey:.hunks) ?? []} }
+public struct GitSnapshotProjection:Codable,Equatable,Sendable { public let schemaVersion:Int; public let repositoryID,worktreeID,digest,headOID,indexDigest:String; public let serializedIndex:SerializedIndexIdentity; public let staged,unstaged:[GitChange]; enum CodingKeys:String,CodingKey {case schemaVersion="schema_version",repositoryID="repository_id",worktreeID="worktree_id",digest,headOID="head_oid",indexDigest="index_digest",serializedIndex="serialized_index",staged,unstaged} }
+public struct GitSnapshot:Codable,Equatable,Sendable { public let threadID,environmentID:String; public let executorGeneration:UInt64; public let repositoryID,worktreeID:String; public let revision:UInt64; public let digest,headOID,indexDigest:String; public let projection:GitSnapshotProjection; public let createdSequence:UInt64; public let createdAt:String; enum CodingKeys:String,CodingKey {case threadID="thread_id",environmentID="environment_id",executorGeneration="executor_generation",repositoryID="repository_id",worktreeID="worktree_id",revision,digest,headOID="head_oid",indexDigest="index_digest",projection,createdSequence="created_sequence",createdAt="created_at"} }
+public struct GitComment:Codable,Equatable,Sendable { public let threadID,commentID:String; public let snapshotGeneration,snapshotRevision:UInt64; public let snapshotDigest,fileID:String; public let hunkID:String?; public let actor,body:String; public let createdSequence:UInt64; public let createdAt:String; enum CodingKeys:String,CodingKey {case threadID="thread_id",commentID="comment_id",snapshotGeneration="snapshot_generation",snapshotRevision="snapshot_revision",snapshotDigest="snapshot_digest",fileID="file_id",hunkID="hunk_id",actor,body,createdSequence="created_sequence",createdAt="created_at"} }
+public struct GitDiffProjection: Codable, Equatable, Sendable { public let snapshot:GitSnapshot?; public let comments:[GitComment] }
+public struct ThreadProjection: Codable, Equatable, Sendable { public let schemaVersion:Int; public let thread:ThreadMetadata; public let mailbox:Mailbox; public let events:[AgoEvent]; public let dialogs:[PluginDialog]; public let diff:GitDiffProjection; public let requestedAfterSequence,nextAfterSequence,snapshotSequence:UInt64; public let hasMore:Bool; public let plugins:PluginProjection; public let executor:ExecutorProjection; enum CodingKeys:String,CodingKey {case schemaVersion="schema_version",thread,mailbox,events,dialogs,diff,requestedAfterSequence="requested_after_sequence",nextAfterSequence="next_after_sequence",snapshotSequence="snapshot_sequence",hasMore="has_more",plugins,executor} }
+
+public enum ProjectionError: Error, Equatable { case unsupportedSchema(Int); case unknownTopLevelFields([String]); case inconsistent(String) }
+public enum ProjectionDecoder {
+    private static let allowedKeys:Set<String> = ["schema_version","thread","mailbox","events","dialogs","diff","requested_after_sequence","next_after_sequence","snapshot_sequence","has_more","plugins","executor"]
+    public static func decode(_ data:Data) throws -> ThreadProjection {
+        let object = try JSONSerialization.jsonObject(with:data)
+        guard let dictionary=object as? [String:Any] else { throw ProjectionError.inconsistent("projection is not an object") }
+        let unknown=Set(dictionary.keys).subtracting(allowedKeys).sorted()
+        guard unknown.isEmpty else { throw ProjectionError.unknownTopLevelFields(unknown) }
+        let d=JSONDecoder()
+        d.dateDecodingStrategy = .custom { decoder in
+            let value=try decoder.singleValueContainer().decode(String.self)
+            let formatter=ISO8601DateFormatter(); formatter.formatOptions=[.withInternetDateTime]
+            if let dot=value.firstIndex(of:"."), value.hasSuffix("Z") {
+                let whole=String(value[..<dot])+"Z"
+                let fraction=value[value.index(after:dot)..<value.index(before:value.endIndex)]
+                if let date=formatter.date(from:whole), let nanos=UInt64(fraction.prefix(9).padding(toLength:9,withPad:"0",startingAt:0)) { return date.addingTimeInterval(Double(nanos)/1_000_000_000) }
+            }
+            if let date=formatter.date(from:value) { return date }
+            throw DecodingError.dataCorruptedError(in:try decoder.singleValueContainer(),debugDescription:"Invalid RFC3339 timestamp")
+        }
+        let page=try d.decode(ThreadProjection.self,from:data); guard page.schemaVersion == 1 else { throw ProjectionError.unsupportedSchema(page.schemaVersion) }; guard page.events.allSatisfy({$0.schemaVersion == 1}) else { throw ProjectionError.unsupportedSchema(page.events.first{$0.schemaVersion != 1}!.schemaVersion) }; if let snapshot=page.diff.snapshot { guard snapshot.projection.schemaVersion==1 else{throw ProjectionError.unsupportedSchema(snapshot.projection.schemaVersion)}; guard snapshot.repositoryID==snapshot.projection.repositoryID,snapshot.worktreeID==snapshot.projection.worktreeID,snapshot.digest==snapshot.projection.digest,snapshot.headOID==snapshot.projection.headOID,snapshot.indexDigest==snapshot.projection.indexDigest else{throw ProjectionError.inconsistent("Git snapshot projection identity mismatch")} }; return page
+    }
+}

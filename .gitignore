@@ -14,6 +14,10 @@ thread-app/node_modules/
 thread-app/.wrangler/
 thread-app/.test-dist/
 thread-app/thread-app/.test-dist/
+ago-clients/apple/.build/
+ago-clients/web/dist/
+ago-clients/web/node_modules/
+pi-adapter/node_modules/
 outputs/*.tar.gz
 outputs/claudex-flow-darwin-arm64
 dist/claudex-flow-*-darwin-*

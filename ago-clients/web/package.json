@@ -1,0 +1,1 @@
+{"name":"@ago/web-mobile-pwa","private":true,"type":"module","scripts":{"test":"bun test","typecheck":"tsc --noEmit","build":"rm -rf dist && bun build src/app.ts src/style.css --outdir dist --target browser --minify && cp index.html manifest.webmanifest sw.js dist/"},"devDependencies":{"@types/bun":"^1.2.19","typescript":"^5.8.3"}}
