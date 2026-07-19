@@ -10,6 +10,8 @@ Ago is an intelligent project board that plans, delegates, monitors, and
 finishes work with agents. A user opens a repository and states an objective.
 Ago turns that objective into a durable work graph with tasks, dependencies,
 acceptance criteria, assigned agents, live status, artifacts, and verification.
+Before planning, Ago builds a repository map and reusable context packages from
+the codebase, architecture, project rules, and current state.
 
 The board is itself an orchestration agent rather than a passive task list. It
 automatically dispatches runnable work, observes durable agent progress,
@@ -44,6 +46,11 @@ This is clean-room behavioral parity:
   assignment, monitoring, re-planning, integration, and final acceptance.
 - Context policy: project history and evidence remain durable on board tasks;
   worker agents receive bounded task-specific context.
+- Work hierarchy: project board -> workstream/subproject -> task -> agent
+  thread/attempt. Any oversized task can be refined again before dispatch.
+- Context engine: repository files, symbols, architecture, rules, prior
+  decisions, and upstream artifacts are selected into task-specific context
+  packages rather than copied wholesale into prompts.
 - Assignment policy: users do not manually choose models or spawn agents for
   ordinary work. Ago selects an eligible capability and executor from policy,
   availability, cost, and verification requirements.
@@ -111,10 +118,17 @@ Desktop / CLI / Web / Mobile
             v
 Ago Board Control Plane
 - objective and project completion contract
-- task graph and dependency readiness
+- hierarchical work graph and dependency readiness
 - automatic agent/executor assignment
 - live status, blockers, evidence, and artifacts
 - lease expiry, retry, re-plan, and integration
+            |
+            v
+Ago Repository Context Engine
+- repository map, symbols, and architecture
+- relevant-file and constraint selection
+- task-specific context packages
+- upstream decisions and artifact references
             |
             v
 Ago Thread Control Plane
@@ -180,7 +194,8 @@ A durable thread contains:
 A durable board contains:
 
 - stable board ID, project identity, objective, and completion contract;
-- task nodes with immutable task contracts and dependency edges;
+- hierarchical workstream/task nodes with immutable task contracts, parent
+  links, and dependency edges;
 - readiness, assignment, lease, attempt, blocker, and terminal state;
 - attached worker thread IDs and bounded context/handoff references;
 - artifacts, changed paths, verification evidence, cost, and accepted result;
@@ -354,7 +369,10 @@ acceptance.
 Deliverables:
 
 - durable board, task, dependency, attempt, assignment, and evidence records;
-- objective-to-board planning with explicit task contracts and project exit gate;
+- repository mapping and task-specific context packages with file, symbol,
+  architecture, constraint, decision, and upstream-artifact references;
+- objective-to-board recursive planning with workstreams, explicit task
+  contracts, refinement of oversized tasks, and a project exit gate;
 - dependency-aware readiness and automatic assignment of runnable work;
 - board-agent monitoring over durable events rather than worker prompt claims;
 - bounded task briefs and artifact/evidence references instead of copied history;
@@ -367,11 +385,17 @@ Deliverables:
 - parent-thread linkage, observable state, and cancellation;
 - selectable custom main-agent modes;
 - configured-concurrency background child threads visible on the board and in
-  the same project sidebar.
+  the same project sidebar;
+- a high-level board/progress view and a drill-down engineering view for agent
+  threads, context, code, diffs, logs, artifacts, and checks.
 
 Exit gate:
 
 - one user objective creates a board with valid tasks and acyclic dependencies;
+- every dispatched task has a bounded repository context package and an
+  explicit input, output, owner, dependencies, and completion contract;
+- an oversized task can be split into linked child tasks without copying the
+  full project history into any child thread;
 - every runnable task is assigned automatically without the user choosing an
   agent or model;
 - blocked dependencies prevent dispatch and completion unlocks dependents;

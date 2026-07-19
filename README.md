@@ -40,6 +40,12 @@ Ago puts a durable board at the center instead.
               └────────────────────┘
 ```
 
+The key architectural decision is to move orchestration memory out of any one
+model's context window. Repository understanding, the work graph, decisions,
+progress, artifacts, and verification live in durable system state. Models can
+then be selected for what they do best without asking one of them to remember
+and repeatedly reread the entire project.
+
 ## Why a board
 
 ### 1. The system can see and operate the whole project
@@ -58,17 +64,65 @@ Agent execution is not owned by a UI session. Threads, task state, events, artif
 
 Workers do not declare the project finished merely because they produced text. Every board item carries observable acceptance criteria and verification evidence. Ago integrates results, detects conflicts or stale work, runs checks, and closes the project only when the board's completion contract is satisfied.
 
+## One project, many specialized agents
+
+Different agents are good at different kinds of work. A UI specialist may be
+the best choice for interface design, an orchestration specialist for planning
+and dependency analysis, and another agent for focused implementation. Ago
+treats those as capabilities rather than forcing the whole project through one
+model.
+
+The user does not need to select those models manually. The board evaluates the
+task contract, required tools, available context, historical quality, cost, and
+current lane health, then assigns an eligible agent. Model names can change;
+the durable task and its acceptance criteria remain stable.
+
+## Hierarchical work, bounded context
+
+Ago does not flatten a large project into one enormous checklist. It can refine
+work recursively while keeping every level linked:
+
+```text
+Project board
+├── Workstream / subproject
+│   ├── Task
+│   │   ├── Agent thread / attempt
+│   │   └── Evidence and verification
+│   └── Task
+└── Workstream / subproject
+    └── Task
+```
+
+Each task has a clear input, output, dependency set, owner, and completion
+contract. A child agent receives a repository context package assembled for
+that task—relevant files, symbols, decisions, and upstream artifacts—rather
+than the full history of the root project. If a task is still too broad, the
+board can split it again before execution.
+
 ## Core workflow
 
-1. **Input** — The user describes an outcome, not an agent topology.
-2. **Board generation** — Ago creates tasks, dependencies, acceptance criteria, risk boundaries, and verification steps.
-3. **Automatic assignment** — The board assigns runnable tasks to suitable agents and execution environments.
-4. **Continuous supervision** — Ago consumes durable progress events, detects blockers, retries safe work, and re-plans when evidence changes.
-5. **Integration** — Results are reconciled into the shared project with ownership and stale-state checks.
-6. **Verification** — Checks, diffs, costs, and artifacts are reviewed against the original objective.
-7. **Completion** — The board closes only when required tasks and the project-level exit gate are proven.
+1. **Input** — The user submits a repository and describes an outcome, not an agent topology.
+2. **Repository understanding** — Ago maps relevant files, symbols, architecture, constraints, and existing project state to build reusable context packages.
+3. **Board generation** — Ago recursively creates workstreams and tasks with dependencies, acceptance criteria, risk boundaries, and verification steps.
+4. **Automatic assignment** — The board assigns runnable tasks to suitable agents and execution environments according to capability.
+5. **Continuous supervision** — Ago consumes durable progress events, detects blockers, retries safe work, and re-plans when evidence changes.
+6. **Integration** — Results are reconciled into the shared project with ownership and stale-state checks.
+7. **Verification** — Checks, diffs, costs, and artifacts are reviewed against the original objective.
+8. **Completion** — The board closes only when required tasks and the project-level exit gate are proven.
 
 Users should not need to choose a model or manually spawn agents. Ago owns routing and orchestration policy; the interface exposes the work and its evidence.
+
+## What the user sees
+
+Ago presents the same project at two levels:
+
+- **Board and progress view** — workstreams, active agents, dependencies,
+  blockers, completion estimates, checks, and what is expected to happen next;
+- **Engineering detail view** — agent threads, source context, tool events,
+  changed files, diffs, logs, artifacts, and verification evidence.
+
+A user can supervise the outcome from the board without reading implementation
+details, or drill all the way down to the code whenever intervention is useful.
 
 ## What exists today
 
@@ -95,7 +149,11 @@ Clients: macOS / iOS / Web / CLI
                    │
                    ▼
 Ago Board Control Plane
-  board · tasks · dependencies · assignment · status · evidence
+  project · workstreams · tasks · dependencies · assignment · status
+                   │
+                   ▼
+Repository Context Engine
+  files · symbols · architecture · decisions · task context packages
                    │
                    ▼
 Ago Durable Thread Runtime
