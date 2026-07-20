@@ -2,6 +2,7 @@ package agoboardprotocol
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -239,7 +240,16 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 				return current, nil, fmt.Errorf("duplicate evidence id %q", item.ID)
 			}
 		}
-		evidence := Evidence{ID: command.Evidence.ID, TaskID: command.TaskID, AttemptID: command.AttemptID, WorkerID: command.Actor.ID, Artifact: command.Evidence.Artifact, Summary: command.Evidence.Summary, State: EvidenceSubmitted}
+		if err := validateEvidenceResult(command.Evidence.Result); err != nil {
+			return current, nil, err
+		}
+		result := cloneEvidenceResult(command.Evidence.Result)
+		// The generation is recorded so a reader can tell which attempt
+		// produced this evidence without ever seeing the fencing token.
+		if _, attempt, found := findAttempt(next, command.AttemptID); found {
+			result.Generation = attempt.Generation
+		}
+		evidence := Evidence{ID: command.Evidence.ID, TaskID: command.TaskID, AttemptID: command.AttemptID, WorkerID: command.Actor.ID, Artifact: command.Evidence.Artifact, Summary: command.Evidence.Summary, State: EvidenceSubmitted, Result: result}
 		next.Evidence = append(next.Evidence, evidence)
 		attemptIndex, _, _ := findAttempt(next, command.AttemptID)
 		next.Attempts[attemptIndex].EvidenceID = evidence.ID
@@ -277,6 +287,13 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 			return current, nil, fmt.Errorf("active lease not found")
 		}
 		if command.Type == CommandEvidenceAccept {
+			// Deterministic checks outrank judgement. A verifier may not accept
+			// work whose own recorded required tests did not pass, however
+			// confident its reasoning is.
+			if failed := evidence.Result.FailedRequiredTests(); len(failed) > 0 {
+				return current, nil, fmt.Errorf("evidence %q cannot be accepted: required tests failed: %v", evidence.ID, failed)
+			}
+			next.Evidence[evidenceIndex].Verdict, next.Evidence[evidenceIndex].VerdictReason = "accept", command.Reason
 			next.Tasks[taskIndex].State, next.Tasks[taskIndex].AcceptedEvidenceID = TaskPassed, evidence.ID
 			next.Attempts[attemptIndex].State, next.Evidence[evidenceIndex].State = AttemptPassed, EvidenceAccepted
 			next.Leases[leaseIndex].State = LeaseCompleted
@@ -293,6 +310,7 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 				return current, nil, err
 			}
 			next.Evidence[evidenceIndex].State = EvidenceRejected
+			next.Evidence[evidenceIndex].Verdict, next.Evidence[evidenceIndex].VerdictReason = "reject", command.Reason
 			emit(Event{Type: EventEvidenceRejected, Task: taskPointer(next.Tasks[taskIndex]), Attempt: attemptPointer(next.Attempts[attemptIndex]), Evidence: evidencePointer(next.Evidence[evidenceIndex]), Lease: leasePointer(next.Leases[leaseIndex]), PreviousState: TaskVerifying, CurrentState: next.Tasks[taskIndex].State, Reason: command.Reason})
 		}
 	case CommandAttemptFail:
@@ -579,6 +597,9 @@ func cloneBoard(value Board) Board {
 	value.Attempts = append([]Attempt(nil), value.Attempts...)
 	value.Leases = append([]Lease(nil), value.Leases...)
 	value.Evidence = append([]Evidence(nil), value.Evidence...)
+	for index := range value.Evidence {
+		value.Evidence[index].Result = cloneEvidenceResult(value.Evidence[index].Result)
+	}
 	return value
 }
 func taskPointer(value Task) *Task {
@@ -589,3 +610,62 @@ func dependencyPointer(value Dependency) *Dependency { return &value }
 func attemptPointer(value Attempt) *Attempt          { return &value }
 func leasePointer(value Lease) *Lease                { return &value }
 func evidencePointer(value Evidence) *Evidence       { return &value }
+
+// validateEvidenceResult keeps structured evidence bounded and free of paths
+// that could describe work outside the repository.
+func validateEvidenceResult(result EvidenceResult) error {
+	if len(result.ChangedFiles) > maxEvidenceItems || len(result.Commands) > maxEvidenceItems ||
+		len(result.Tests) > maxEvidenceItems || len(result.Artifacts) > maxEvidenceItems ||
+		len(result.Warnings) > maxEvidenceItems {
+		return fmt.Errorf("structured evidence exceeds %d items in a section", maxEvidenceItems)
+	}
+	for _, file := range result.ChangedFiles {
+		if file.Path == "" {
+			return fmt.Errorf("a changed file requires a path")
+		}
+		if !relativeRepositoryPath(file.Path) {
+			return fmt.Errorf("changed file %q must be a repository-relative path", file.Path)
+		}
+	}
+	for _, test := range result.Tests {
+		if test.Name == "" {
+			return fmt.Errorf("a test record requires a name")
+		}
+	}
+	for _, artifact := range result.Artifacts {
+		if artifact.ID == "" || artifact.SHA256 == "" {
+			return fmt.Errorf("an artifact reference requires an id and a digest")
+		}
+		if artifact.Bytes < 0 {
+			return fmt.Errorf("artifact %q has a negative size", artifact.ID)
+		}
+	}
+	return nil
+}
+
+// maxEvidenceItems bounds each section so one attempt cannot make the aggregate
+// unbounded.
+const maxEvidenceItems = 256
+
+func relativeRepositoryPath(value string) bool {
+	if value == "" || strings.HasPrefix(value, "/") || strings.Contains(value, "\\") {
+		return false
+	}
+	if value == ".." || strings.HasPrefix(value, "../") || strings.Contains(value, "/../") || strings.HasSuffix(value, "/..") {
+		return false
+	}
+	// A Windows-style drive letter is absolute too.
+	if len(value) >= 2 && value[1] == ':' {
+		return false
+	}
+	return true
+}
+
+func cloneEvidenceResult(result EvidenceResult) EvidenceResult {
+	result.ChangedFiles = append([]ChangedFile(nil), result.ChangedFiles...)
+	result.Commands = append([]CommandRecord(nil), result.Commands...)
+	result.Tests = append([]TestRecord(nil), result.Tests...)
+	result.Artifacts = append([]ArtifactRef(nil), result.Artifacts...)
+	result.Warnings = append([]string(nil), result.Warnings...)
+	return result
+}

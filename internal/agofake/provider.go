@@ -11,8 +11,13 @@ package agofake
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"strings"
 
+	"claudexflow/internal/agoartifact"
 	"claudexflow/internal/agoboardprotocol"
 	"claudexflow/internal/agoboardruntime"
 )
@@ -80,11 +85,25 @@ func (e Error) Error() string { return e.Message }
 // FailureClass satisfies the interface the scheduler uses to classify errors.
 func (e Error) FailureClass() agoboardprotocol.FailureClass { return e.Class }
 
+// ArtifactWriter is the narrow slice of the artifact store the fake needs. It
+// takes a byte stream, never a path.
+type ArtifactWriter interface {
+	Put(context.Context, agoartifact.PutInput, io.Reader) (agoartifact.Descriptor, error)
+}
+
 // Provider implements both the executor and the verifier boundaries. They are
-// separate interfaces and are registered under separate identities, so the
-// state machine still refuses a worker's attempt to review its own evidence.
+// separate interfaces registered under separate identities, so the state
+// machine still refuses a worker's attempt to review its own evidence.
 type Provider struct {
-	script Script
+	script    Script
+	artifacts ArtifactWriter
+}
+
+// WithArtifacts makes the fake store its command output as managed artifacts,
+// so evidence references real bytes rather than describing them.
+func (provider *Provider) WithArtifacts(writer ArtifactWriter) *Provider {
+	provider.artifacts = writer
+	return provider
 }
 
 func New(script Script) (*Provider, error) {
@@ -137,10 +156,73 @@ func (provider *Provider) Execute(ctx context.Context, dispatch agoboardruntime.
 			}
 		}
 	}
+	summary := fmt.Sprintf("任务《%s》在第 %d 次尝试完成。", dispatch.Task.Title, dispatch.AttemptNumber)
+	testCommand := "go test ./..."
+	// A verifier-feedback run deliberately reports an unsatisfied required
+	// check on its first attempt, so the deterministic gate is what stops it.
+	requiredPassed := true
+	if outcome == OutcomeVerifierRetryWithFeedback && dispatch.AttemptNumber <= 1 {
+		requiredPassed = false
+	}
+	result := agoboardprotocol.EvidenceResult{
+		Summary: summary,
+		ChangedFiles: []agoboardprotocol.ChangedFile{{
+			Path:       changedPathFor(dispatch),
+			BeforeHash: deterministicHash("before", dispatch.Task.ID),
+			AfterHash:  deterministicHash("after", dispatch.Task.ID, fmt.Sprint(dispatch.AttemptNumber)),
+		}},
+		Commands: []agoboardprotocol.CommandRecord{{
+			Display: testCommand, ExitCode: exitCodeFor(requiredPassed), DurationMS: 120,
+		}},
+		Tests: []agoboardprotocol.TestRecord{{
+			Name: "任务验收测试", Command: testCommand,
+			Passed: requiredPassed, ExitCode: exitCodeFor(requiredPassed), Required: true,
+		}},
+	}
+	if provider.artifacts != nil {
+		log := fmt.Sprintf("$ %s\nexit code: %d\n任务《%s》第 %d 次尝试的输出。\n",
+			testCommand, exitCodeFor(requiredPassed), dispatch.Task.Title, dispatch.AttemptNumber)
+		descriptor, err := provider.artifacts.Put(ctx, agoartifact.PutInput{
+			Type: "text/plain; charset=utf-8", DisplayName: dispatch.Task.ID + "-output.log",
+		}, strings.NewReader(log))
+		if err != nil {
+			return agoboardruntime.ExecutionResult{}, Error{
+				Class:   agoboardprotocol.FailureTransient,
+				Message: fmt.Sprintf("保存执行输出失败：%v", err),
+			}
+		}
+		result.Commands[0].OutputArtifactID = descriptor.ID
+		result.Artifacts = append(result.Artifacts, agoboardprotocol.ArtifactRef{
+			ID: descriptor.ID, Type: descriptor.Type, DisplayName: descriptor.DisplayName,
+			Bytes: descriptor.Bytes, SHA256: descriptor.SHA256,
+		})
+	}
 	return agoboardruntime.ExecutionResult{
 		Artifact: fmt.Sprintf("artifact://ago-fake/%s/%d", dispatch.Task.ID, dispatch.AttemptNumber),
-		Summary:  fmt.Sprintf("任务《%s》在第 %d 次尝试完成。", dispatch.Task.Title, dispatch.AttemptNumber),
+		Summary:  summary,
+		Result:   result,
 	}, nil
+}
+
+// changedPathFor keeps the declared change inside the task's own path scope, so
+// evidence never describes work outside what the plan authorized.
+func changedPathFor(dispatch agoboardruntime.Dispatch) string {
+	if len(dispatch.Task.PathScopes) > 0 {
+		return dispatch.Task.PathScopes[0]
+	}
+	return "README.md"
+}
+
+func exitCodeFor(passed bool) int {
+	if passed {
+		return 0
+	}
+	return 1
+}
+
+func deterministicHash(parts ...string) string {
+	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return hex.EncodeToString(digest[:])
 }
 
 // Verify is the independent acceptance decision. It runs under the verifier

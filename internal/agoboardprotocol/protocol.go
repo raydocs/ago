@@ -8,11 +8,11 @@ import (
 	"time"
 )
 
-// SchemaVersion 2 adds scheduler-owned durable data: lease generation and
-// fencing tokens, repository identity, access mode, retry accounting, and board
-// pause control. Boards persisted at version 1 are upgraded by the store's
-// migration, which is the only supported path forward.
-const SchemaVersion = 2
+// SchemaVersion 3 adds structured evidence: changed files with before and after
+// hashes, command and test records, artifact references, warnings, and the
+// verifier's verdict. Boards persisted at an earlier version are upgraded by
+// the store's migration, which is the only supported path forward.
+const SchemaVersion = 3
 
 // MaxAttempts bounds automatic retry. The state machine enforces it so no
 // scheduler, however buggy, can create an extra attempt.
@@ -233,6 +233,78 @@ type Lease struct {
 	ExpiresAt  time.Time `json:"expires_at,omitempty"`
 }
 
+// ChangedFile records one repository modification. Paths are
+// repository-relative; an absolute path or a parent reference is rejected.
+type ChangedFile struct {
+	Path       string `json:"path"`
+	BeforeHash string `json:"before_hash,omitempty"`
+	AfterHash  string `json:"after_hash,omitempty"`
+}
+
+// CommandRecord is one command an executor ran. Output is not inlined: it is
+// referenced as a bounded artifact so evidence cannot grow without limit.
+type CommandRecord struct {
+	Display          string `json:"display"`
+	ExitCode         int    `json:"exit_code"`
+	DurationMS       int64  `json:"duration_ms"`
+	OutputArtifactID string `json:"output_artifact_id,omitempty"`
+}
+
+// TestRecord is a deterministic check. A required test that did not pass is a
+// hard stop: no model verdict may accept over it.
+type TestRecord struct {
+	Name     string `json:"name"`
+	Command  string `json:"command"`
+	Passed   bool   `json:"passed"`
+	ExitCode int    `json:"exit_code"`
+	Required bool   `json:"required"`
+}
+
+// ArtifactRef points at bytes held in the managed artifact store. The size and
+// digest are recorded so a later read can prove the bytes did not change.
+type ArtifactRef struct {
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	DisplayName string `json:"display_name"`
+	Bytes       int64  `json:"bytes"`
+	SHA256      string `json:"sha256"`
+}
+
+// EvidenceResult is what an attempt actually produced. It carries no
+// credential: the fencing token that authorized the attempt is referenced only
+// by generation, never by value.
+type EvidenceResult struct {
+	Summary      string          `json:"summary"`
+	Generation   uint64          `json:"generation"`
+	ChangedFiles []ChangedFile   `json:"changed_files,omitempty"`
+	Commands     []CommandRecord `json:"commands,omitempty"`
+	Tests        []TestRecord    `json:"tests,omitempty"`
+	Artifacts    []ArtifactRef   `json:"artifacts,omitempty"`
+	Warnings     []string        `json:"warnings,omitempty"`
+}
+
+// RequiredTestsPassed reports whether every required check succeeded. It is the
+// deterministic gate that outranks a model's judgement.
+func (result EvidenceResult) RequiredTestsPassed() bool {
+	for _, test := range result.Tests {
+		if test.Required && !test.Passed {
+			return false
+		}
+	}
+	return true
+}
+
+// FailedRequiredTests names the checks blocking acceptance.
+func (result EvidenceResult) FailedRequiredTests() []string {
+	var failed []string
+	for _, test := range result.Tests {
+		if test.Required && !test.Passed {
+			failed = append(failed, test.Name)
+		}
+	}
+	return failed
+}
+
 type Evidence struct {
 	ID        string        `json:"id"`
 	TaskID    string        `json:"task_id"`
@@ -241,6 +313,11 @@ type Evidence struct {
 	Artifact  string        `json:"artifact"`
 	Summary   string        `json:"summary"`
 	State     EvidenceState `json:"state"`
+	// Result is the structured record a user inspects to see why work was
+	// accepted. Verdict and VerdictReason are the independent decision.
+	Result        EvidenceResult `json:"result,omitempty"`
+	Verdict       string         `json:"verdict,omitempty"`
+	VerdictReason string         `json:"verdict_reason,omitempty"`
 }
 
 type CommandType string
@@ -325,11 +402,12 @@ type LeaseSpec struct {
 }
 
 type EvidenceSpec struct {
-	ID        string `json:"id"`
-	TaskID    string `json:"task_id"`
-	AttemptID string `json:"attempt_id"`
-	Artifact  string `json:"artifact"`
-	Summary   string `json:"summary"`
+	ID        string         `json:"id"`
+	TaskID    string         `json:"task_id"`
+	AttemptID string         `json:"attempt_id"`
+	Artifact  string         `json:"artifact"`
+	Summary   string         `json:"summary"`
+	Result    EvidenceResult `json:"result,omitempty"`
 }
 
 type EventType string

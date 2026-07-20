@@ -43,6 +43,9 @@ type Dispatch struct {
 type ExecutionResult struct {
 	Artifact string `json:"artifact"`
 	Summary  string `json:"summary"`
+	// Result is the structured evidence a user inspects. The executor states
+	// what it changed, ran, and produced; it never decides acceptance.
+	Result agoboardprotocol.EvidenceResult `json:"result,omitempty"`
 }
 
 type Review struct {

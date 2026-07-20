@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agoplanner"
+	"claudexflow/internal/agoredact"
 )
 
 // DefaultLimits are the safe initial concurrency bounds.
@@ -52,6 +54,10 @@ type Options struct {
 	// OnCycle observes each completed cycle. It is intended for tests and
 	// diagnostics and must not block.
 	OnCycle func(Cycle)
+	// Redactor strips credential-shaped content from executor output before it
+	// becomes durable evidence. A nil value is replaced with one seeded from
+	// the process environment, so redaction is never accidentally off.
+	Redactor *agoredact.Redactor
 }
 
 // Cycle records what one scheduler pass did.
@@ -87,6 +93,9 @@ func New(options Options) (*Scheduler, error) {
 	}
 	if options.Limits == (agoboardstore.SlotLimits{}) {
 		options.Limits = DefaultLimits
+	}
+	if options.Redactor == nil {
+		options.Redactor = agoredact.NewFromEnvironment(os.Getenv)
 	}
 	return &Scheduler{options: options}, nil
 }
@@ -234,14 +243,33 @@ func (scheduler *Scheduler) dispatch(ctx context.Context, boardID string, claim 
 	}
 
 	evidenceID := "evidence:" + claim.AttemptID
+	// Executor output is untrusted text. Redact before it becomes durable, so a
+	// credential that leaked into a summary or a command line never reaches
+	// SQLite, the event stream, or a browser.
+	structured := redactEvidence(scheduler.options.Redactor, result.Result)
+	structured.Summary = scheduler.options.Redactor.String(firstNonEmpty(structured.Summary, result.Summary))
 	submitted, err := scheduler.applyFrom(ctx, boardID, claim, started.Board.Version, agoboardprotocol.CommandEvidenceSubmit, func(command *agoboardprotocol.Command) {
 		command.Evidence = &agoboardprotocol.EvidenceSpec{
 			ID: evidenceID, TaskID: claim.TaskID, AttemptID: claim.AttemptID,
-			Artifact: result.Artifact, Summary: result.Summary,
+			Artifact: scheduler.options.Redactor.String(result.Artifact),
+			Summary:  structured.Summary,
+			Result:   structured,
 		}
 	})
 	if err != nil {
 		return fmt.Errorf("submit evidence: %w", err)
+	}
+
+	// Deterministic checks are consulted before the verifier is even asked:
+	// a failed required test is not a matter of opinion.
+	if failed := structured.FailedRequiredTests(); len(failed) > 0 {
+		_, err := scheduler.applyVerifier(ctx, boardID, claim, submitted.Board.Version, agoboardprotocol.CommandEvidenceReject, func(command *agoboardprotocol.Command) {
+			command.Evidence = &agoboardprotocol.EvidenceSpec{ID: evidenceID}
+			command.Reason = fmt.Sprintf("必需的检查未通过：%v", failed)
+			command.FailureClass = agoboardprotocol.FailureVerifierFeedback
+			command.NextEligibleAt = scheduler.nextEligible(attemptNumber)
+		})
+		return err
 	}
 
 	review, err := scheduler.options.Verifier.Verify(ctx, work, result)
@@ -256,7 +284,7 @@ func (scheduler *Scheduler) dispatch(ctx context.Context, boardID string, claim 
 	}
 	_, err = scheduler.applyVerifier(ctx, boardID, claim, submitted.Board.Version, commandType, func(command *agoboardprotocol.Command) {
 		command.Evidence = &agoboardprotocol.EvidenceSpec{ID: evidenceID}
-		command.Reason = review.Reason
+		command.Reason = scheduler.options.Redactor.String(review.Reason)
 		if !review.Accepted {
 			command.FailureClass = rejectionClass(review)
 			command.NextEligibleAt = scheduler.nextEligible(attemptNumber)
@@ -349,4 +377,35 @@ func rejectionClass(review agoboardruntime.Review) agoboardprotocol.FailureClass
 		return agoboardprotocol.FailureVerifierFeedback
 	}
 	return review.FailureClass
+}
+
+// redactEvidence removes credential-shaped content from every field an
+// executor controls. Hashes, sizes, and exit codes are machine-generated and
+// are left alone.
+func redactEvidence(redactor *agoredact.Redactor, result agoboardprotocol.EvidenceResult) agoboardprotocol.EvidenceResult {
+	result.Summary = redactor.String(result.Summary)
+	result.Warnings = redactor.Strings(result.Warnings)
+	for index := range result.Commands {
+		result.Commands[index].Display = redactor.String(result.Commands[index].Display)
+	}
+	for index := range result.Tests {
+		result.Tests[index].Name = redactor.String(result.Tests[index].Name)
+		result.Tests[index].Command = redactor.String(result.Tests[index].Command)
+	}
+	for index := range result.Artifacts {
+		result.Artifacts[index].DisplayName = redactor.String(result.Artifacts[index].DisplayName)
+	}
+	for index := range result.ChangedFiles {
+		result.ChangedFiles[index].Path = redactor.String(result.ChangedFiles[index].Path)
+	}
+	return result
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

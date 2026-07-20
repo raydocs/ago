@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const CurrentSchemaVersion = 3
+const CurrentSchemaVersion = 4
 
 // Sentinel errors let transport layers map durable store outcomes onto their
 // own status codes without matching on message text.
@@ -33,6 +33,9 @@ var initialSchema string
 
 //go:embed migrations/002_scheduler.sql
 var schedulerSchema string
+
+//go:embed migrations/003_evidence.sql
+var evidenceSchema string
 
 type Store struct{ db *sql.DB }
 
@@ -145,14 +148,27 @@ definition_json BLOB NOT NULL
 		}
 		version = 2
 	}
+	// Every DDL step runs before any data backfill. A backfill re-projects
+	// whole aggregates through syncProjection, which always writes the current
+	// column set, so running one against a half-migrated schema would fail on
+	// columns a later step has not added yet.
+	upgraded := false
 	if version == 2 {
 		if _, err := tx.ExecContext(ctx, schedulerSchema); err != nil {
 			return fmt.Errorf("migrate scheduler schema: %w", err)
 		}
-		if err := backfillSchedulerFields(ctx, tx); err != nil {
-			return fmt.Errorf("backfill scheduler fields: %w", err)
+		version, upgraded = 3, true
+	}
+	if version == 3 {
+		if _, err := tx.ExecContext(ctx, evidenceSchema); err != nil {
+			return fmt.Errorf("migrate evidence schema: %w", err)
 		}
-		version = 3
+		version, upgraded = 4, true
+	}
+	if upgraded {
+		if err := upgradeAggregates(ctx, tx); err != nil {
+			return fmt.Errorf("upgrade board aggregates: %w", err)
+		}
 	}
 	if version != CurrentSchemaVersion {
 		return fmt.Errorf("board store schema version %d cannot be migrated to %d", version, CurrentSchemaVersion)
@@ -168,18 +184,20 @@ definition_json BLOB NOT NULL
 	return nil
 }
 
-// backfillSchedulerFields upgrades every stored board aggregate to protocol
-// schema 2 and re-projects it into the new columns.
+// upgradeAggregates brings every stored board up to the current protocol
+// version and re-projects it. It runs once, after all DDL, so it always writes
+// the final column set.
 //
-// The policy is deliberately conservative about authority: no historical
-// attempt or lease is given a generation or fencing token. An executor that was
-// running before the upgrade therefore holds no credential any command can
-// satisfy, so it cannot influence the graph after the upgrade; the scheduler's
-// reconciler is left to expire those leases and create a properly fenced
-// attempt. Nothing is deleted, and no attempt or event is rewritten.
-func backfillSchedulerFields(ctx context.Context, tx *sql.Tx) error {
-	// leases.expires_at was, until this migration, the only fact living solely
-	// in SQL. Read it before the aggregate becomes canonical for it.
+// The policy is conservative about authority: no historical attempt or lease is
+// given a generation or fencing token. An executor that was running across the
+// upgrade therefore holds no credential any command can satisfy and cannot
+// influence the graph; the scheduler's reconciler expires those leases and
+// creates a properly fenced attempt. Nothing is deleted, no event is rewritten,
+// and no historical acceptance is retroactively described as having passed
+// deterministic checks that were never run.
+func upgradeAggregates(ctx context.Context, tx *sql.Tx) error {
+	// leases.expires_at was, before schema 3, the only fact living solely in
+	// SQL. Read it before the aggregate becomes canonical for it.
 	deadlines := make(map[string]int64)
 	rows, err := tx.QueryContext(ctx, `SELECT board_id,lease_id,expires_at FROM leases`)
 	if err != nil {
@@ -217,8 +235,8 @@ func backfillSchedulerFields(ctx context.Context, tx *sql.Tx) error {
 			boards.Close()
 			return err
 		}
-		// Schema-1 JSON decodes into the schema-2 struct with zero values for
-		// every new field, which is exactly the "no authority" state we want.
+		// Older JSON decodes into the current struct with zero values for every
+		// new field, which is exactly the "no authority" state we want.
 		var board agoboardprotocol.Board
 		if err := json.Unmarshal(encoded, &board); err != nil {
 			boards.Close()
@@ -253,6 +271,22 @@ func backfillSchedulerFields(ctx context.Context, tx *sql.Tx) error {
 			if lease.ExpiresAt.IsZero() {
 				if expiry, found := deadlines[id+"\x00"+lease.ID]; found && expiry > 0 {
 					lease.ExpiresAt = time.Unix(0, expiry).UTC()
+				}
+			}
+		}
+		for index := range board.Evidence {
+			evidence := &board.Evidence[index]
+			if evidence.Result.Summary == "" {
+				evidence.Result.Summary = evidence.Summary
+			}
+			// Record the verdict the historical state already implies, without
+			// claiming any deterministic check backed it.
+			if evidence.Verdict == "" {
+				switch evidence.State {
+				case agoboardprotocol.EvidenceAccepted:
+					evidence.Verdict = "accept"
+				case agoboardprotocol.EvidenceRejected:
+					evidence.Verdict = "reject"
 				}
 			}
 		}
@@ -984,8 +1018,25 @@ access_mode=excluded.access_mode,repository_id=excluded.repository_id`,
 	}
 	for _, value := range board.Evidence {
 		encoded, _ := json.Marshal(value)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO evidence VALUES(?,?,?,?,?,?) ON CONFLICT(board_id,evidence_id) DO UPDATE SET state=excluded.state,evidence_json=excluded.evidence_json`, board.ID, value.ID, value.TaskID, value.AttemptID, value.State, encoded); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO evidence(board_id,evidence_id,task_id,attempt_id,state,evidence_json,required_tests_passed,verdict)
+VALUES(?,?,?,?,?,?,?,?)
+ON CONFLICT(board_id,evidence_id) DO UPDATE SET
+state=excluded.state,evidence_json=excluded.evidence_json,
+required_tests_passed=excluded.required_tests_passed,verdict=excluded.verdict`,
+			board.ID, value.ID, value.TaskID, value.AttemptID, value.State, encoded,
+			boolToInt(value.Result.RequiredTestsPassed()), value.Verdict); err != nil {
 			return err
+		}
+		for _, artifact := range value.Result.Artifacts {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO artifacts(board_id,artifact_id,evidence_id,task_id,media_type,display_name,byte_size,sha256)
+VALUES(?,?,?,?,?,?,?,?)
+ON CONFLICT(board_id,artifact_id) DO UPDATE SET
+evidence_id=excluded.evidence_id,task_id=excluded.task_id,media_type=excluded.media_type,
+display_name=excluded.display_name,byte_size=excluded.byte_size,sha256=excluded.sha256`,
+				board.ID, artifact.ID, value.ID, value.TaskID, artifact.Type, artifact.DisplayName,
+				artifact.Bytes, artifact.SHA256); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1060,4 +1111,23 @@ func durableRetryDeadline(board agoboardprotocol.Board, leaseID string) time.Tim
 		}
 	}
 	return time.Time{}
+}
+
+// ReferencedArtifacts lists every artifact identifier the durable graph still
+// points at. The artifact store uses it to reconcile orphans after a crash.
+func (s *Store) ReferencedArtifacts(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT artifact_id FROM artifacts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	referenced := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		referenced[id] = true
+	}
+	return referenced, rows.Err()
 }

@@ -369,3 +369,111 @@ func TestReopeningAMigratedDatabaseIsIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// The schema-4 upgrade must reach a database that is already at schema 3,
+// exercising the second migration step on its own rather than only as part of a
+// full 2-to-4 run.
+func TestSchemaThreeDatabaseUpgradesToCurrent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v3.db")
+	writeLegacyDatabase(t, path)
+
+	// First open migrates 2 -> 4. Rewind the marker to 3 and drop the schema-4
+	// additions so the next open exercises exactly the 3 -> 4 step.
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE artifacts`,
+		`ALTER TABLE evidence DROP COLUMN required_tests_passed`,
+		`ALTER TABLE evidence DROP COLUMN verdict`,
+		`PRAGMA user_version=3`,
+	} {
+		if _, err := raw.Exec(statement); err != nil {
+			t.Fatalf("rewind %q: %v", statement, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("upgrade from schema 3: %v", err)
+	}
+	defer store.Close()
+	version, err := store.SchemaVersion(ctx)
+	if err != nil || version != CurrentSchemaVersion {
+		t.Fatalf("version = %d, %v; want %d", version, err, CurrentSchemaVersion)
+	}
+	board, err := store.Board(ctx, "legacy-board")
+	if err != nil {
+		t.Fatalf("board after 3 -> 4: %v", err)
+	}
+	if board.SchemaVersion != agoboardprotocol.SchemaVersion {
+		t.Fatalf("board schema version = %d, want %d", board.SchemaVersion, agoboardprotocol.SchemaVersion)
+	}
+	// The historical acceptance keeps its verdict but claims no deterministic
+	// backing it never had.
+	for _, evidence := range board.Evidence {
+		if evidence.State == agoboardprotocol.EvidenceAccepted && evidence.Verdict != "accept" {
+			t.Fatalf("migrated evidence %q verdict = %q", evidence.ID, evidence.Verdict)
+		}
+		if len(evidence.Result.Tests) != 0 {
+			t.Fatalf("migration invented test records: %#v", evidence.Result.Tests)
+		}
+	}
+	events, err := store.Replay(ctx, "legacy-board", 0, 0)
+	if err != nil || len(events) != 6 {
+		t.Fatalf("events after 3 -> 4 = %d, %v; want 6", len(events), err)
+	}
+}
+
+// Artifact references are projected so the artifact store can be reconciled.
+func TestArtifactReferencesAreProjectedForReconciliation(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t, filepath.Join(t.TempDir(), "artifacts.db"))
+	defer store.Close()
+	board := buildClaimBoard(t, store, "art", "repo", map[string]agoboardprotocol.AccessMode{
+		"only": agoboardprotocol.AccessRead,
+	})
+	claim := startAttempt(t, store, board, "claim:1", testClock)
+	running, err := store.Board(ctx, board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyBoard(ctx, board.ID, agoboardprotocol.Command{
+		SchemaVersion: agoboardprotocol.SchemaVersion, ID: "submit",
+		ExpectedVersion: running.Version, Actor: workerActor(),
+		Type: agoboardprotocol.CommandEvidenceSubmit, TaskID: claim.TaskID, AttemptID: claim.AttemptID,
+		FencingToken: claim.FencingToken,
+		Evidence: &agoboardprotocol.EvidenceSpec{
+			ID: "evidence", TaskID: claim.TaskID, AttemptID: claim.AttemptID,
+			Artifact: "artifact://managed", Summary: "证据",
+			Result: agoboardprotocol.EvidenceResult{
+				Summary: "证据",
+				Artifacts: []agoboardprotocol.ArtifactRef{
+					{ID: "aaaa1111", Type: "text/plain", DisplayName: "log.txt", Bytes: 12, SHA256: "deadbeef"},
+					{ID: "bbbb2222", Type: "application/json", DisplayName: "report.json", Bytes: 34, SHA256: "cafebabe"},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("submit structured evidence: %v", err)
+	}
+	referenced, err := store.ReferencedArtifacts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !referenced["aaaa1111"] || !referenced["bbbb2222"] || len(referenced) != 2 {
+		t.Fatalf("referenced artifacts = %#v", referenced)
+	}
+}

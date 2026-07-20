@@ -19,11 +19,13 @@ import (
 	"syscall"
 	"time"
 
+	"claudexflow/internal/agoartifact"
 	"claudexflow/internal/agoboardapi"
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agofake"
 	"claudexflow/internal/agoplanner"
+	"claudexflow/internal/agoredact"
 	"claudexflow/internal/agoscheduler"
 
 	"flag"
@@ -76,7 +78,20 @@ func run() error {
 		LeaseDuration: 5 * time.Minute,
 		Now:           time.Now,
 	})
-	server, err := agoboardapi.New(agoboardapi.Options{Runtime: runtime, Store: store, Providers: demoProviders()})
+	artifacts, err := agoartifact.Open(agoartifact.Options{Root: filepath.Join(filepath.Dir(*databasePath), "artifacts")})
+	if err != nil {
+		return err
+	}
+	// Clear crash debris before serving: a temp file or an object no evidence
+	// references is discardable, and nothing referenced is ever removed.
+	if referenced, err := store.ReferencedArtifacts(context.Background()); err == nil {
+		if _, err := artifacts.Reconcile(context.Background(), referenced); err != nil {
+			return fmt.Errorf("reconcile artifact store: %w", err)
+		}
+	}
+	server, err := agoboardapi.New(agoboardapi.Options{
+		Runtime: runtime, Store: store, Providers: demoProviders(), Artifacts: artifacts,
+	})
 	if err != nil {
 		return err
 	}
@@ -85,10 +100,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	provider = provider.WithArtifacts(artifacts)
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
 		Store: store, Runtime: runtime, Executor: provider, Verifier: provider,
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-demo-worker", VerifierID: "ago-verifier",
 		LeaseDuration: 5 * time.Minute, Interval: time.Second, Now: time.Now,
+		Redactor: agoredact.NewFromEnvironment(os.Getenv),
 	})
 	if err != nil {
 		return err

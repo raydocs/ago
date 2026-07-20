@@ -18,12 +18,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"claudexflow/internal/agoartifact"
 	"claudexflow/internal/agoboardprotocol"
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
@@ -55,6 +59,9 @@ type Options struct {
 	Store   *agoboardstore.Store
 	// Providers is the non-secret capability roster reported to clients.
 	Providers []Provider
+	// Artifacts serves managed executor output. When nil, the download route
+	// reports that artifact storage is unavailable rather than guessing a path.
+	Artifacts *agoartifact.Store
 	// PollInterval bounds how long an idle event stream waits before it
 	// re-reads SQLite. The in-memory notifier only makes delivery prompt; it is
 	// never the authority for what a subscriber receives.
@@ -65,6 +72,7 @@ type Server struct {
 	runtime      *agoboardruntime.Runtime
 	store        *agoboardstore.Store
 	providers    []Provider
+	artifacts    *agoartifact.Store
 	pollInterval time.Duration
 
 	mu      sync.Mutex
@@ -82,6 +90,7 @@ func New(options Options) (*Server, error) {
 		runtime:      options.Runtime,
 		store:        options.Store,
 		providers:    append([]Provider(nil), options.Providers...),
+		artifacts:    options.Artifacts,
 		pollInterval: options.PollInterval,
 		waiters:      make(map[string]chan struct{}),
 	}, nil
@@ -96,6 +105,7 @@ func (server *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/boards/{boardID}/resume", server.setPaused(false))
 	mux.HandleFunc("GET /api/v1/boards/{boardID}/events", server.events)
 	mux.HandleFunc("GET /api/v1/providers", server.listProviders)
+	mux.HandleFunc("GET /api/v1/boards/{boardID}/artifacts/{artifactID}", server.downloadArtifact)
 	return mux
 }
 
@@ -622,4 +632,83 @@ func (server *Server) setPaused(pause bool) http.HandlerFunc {
 		server.notify(boardID)
 		writeJSON(writer, http.StatusOK, snapshot)
 	}
+}
+
+// downloadArtifact streams managed executor output.
+//
+// The artifact must be referenced by this board's durable evidence: an
+// identifier alone is not authority to read bytes. The descriptor recorded in
+// evidence is what the artifact store re-verifies against, so a file whose
+// bytes changed after the fact is refused rather than served.
+func (server *Server) downloadArtifact(writer http.ResponseWriter, request *http.Request) {
+	if server.artifacts == nil {
+		writeError(writer, statusError{http.StatusNotFound, "artifacts_unavailable", "当前未启用工件存储。", nil})
+		return
+	}
+	boardID, artifactID := request.PathValue("boardID"), request.PathValue("artifactID")
+	board, err := server.store.Board(request.Context(), boardID)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	reference, found := artifactReference(board, artifactID)
+	if !found {
+		// A board that does not reference the artifact is told the same thing
+		// as one where it does not exist, and no local path is echoed back.
+		writeError(writer, statusError{http.StatusNotFound, "artifact_not_found", "该看板没有引用此工件。", nil})
+		return
+	}
+	descriptor := agoartifact.Descriptor{
+		ID: reference.ID, Type: reference.Type, DisplayName: reference.DisplayName,
+		Bytes: reference.Bytes, SHA256: reference.SHA256,
+	}
+	reader, err := server.artifacts.Open(request.Context(), descriptor)
+	if err != nil {
+		if errors.Is(err, agoartifact.ErrNotFound) || errors.Is(err, agoartifact.ErrBadID) {
+			writeError(writer, statusError{http.StatusNotFound, "artifact_not_found", "工件不存在。", nil})
+			return
+		}
+		// A containment or digest failure is a integrity problem, not a client
+		// error, and the local path must not appear in the response.
+		writeError(writer, statusError{http.StatusConflict, "artifact_corrupt", "工件内容与记录的校验不一致，已拒绝下载。", nil})
+		return
+	}
+	defer reader.Close()
+	writer.Header().Set("Content-Type", descriptor.Type)
+	writer.Header().Set("Content-Length", strconv.FormatInt(descriptor.Bytes, 10))
+	writer.Header().Set("X-Content-Type-Options", "nosniff")
+	// The display name is already sanitized by the artifact store; it is
+	// encoded here so a non-ASCII name cannot alter the header's structure.
+	writer.Header().Set("Content-Disposition", contentDisposition(descriptor.DisplayName))
+	writer.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(writer, reader)
+}
+
+func artifactReference(board agoboardprotocol.Board, artifactID string) (agoboardprotocol.ArtifactRef, bool) {
+	for _, evidence := range board.Evidence {
+		for _, reference := range evidence.Result.Artifacts {
+			if reference.ID == artifactID {
+				return reference, true
+			}
+		}
+	}
+	return agoboardprotocol.ArtifactRef{}, false
+}
+
+// contentDisposition builds a header that is safe for any display name: an
+// ASCII fallback plus an RFC 5987 encoding for the real value.
+func contentDisposition(name string) string {
+	ascii := make([]rune, 0, len(name))
+	for _, r := range name {
+		if r < 0x20 || r > 0x7e || r == '"' || r == '\\' {
+			ascii = append(ascii, '_')
+			continue
+		}
+		ascii = append(ascii, r)
+	}
+	fallback := string(ascii)
+	if fallback == "" {
+		fallback = "artifact"
+	}
+	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, fallback, url.PathEscape(name))
 }
