@@ -6,6 +6,16 @@ Ago turns one user objective into a live execution board. The board is not a pas
 
 > 输入一个目标，Ago 自动生成看板、拆解任务、分配 Agent，并持续监控和验收，直到项目完成。
 
+## Try it
+
+```bash
+go build -o ago-server ./cmd/ago-server
+./ago-server demo --executor fake     # offline, no credential
+./ago-server demo --executor relay    # a real model does the work
+```
+
+Then open the printed URL. Full walkthrough: [快速开始](docs/ago-quickstart.zh.md).
+
 ## The simplest mental model
 
 **Ago combines automatic agent routing, repository-aware context engineering,

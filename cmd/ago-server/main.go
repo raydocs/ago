@@ -56,6 +56,21 @@ func main() {
 }
 
 func run() error {
+	args := os.Args[1:]
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "serve":
+			return runServe(args[1:])
+		case "demo":
+			return runDemo(args[1:])
+		default:
+			return fmt.Errorf("unknown command %q: use \"serve\" or \"demo\"", args[0])
+		}
+	}
+	return runServe(args)
+}
+
+func runServe(args []string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -63,9 +78,12 @@ func run() error {
 	flags := flag.NewFlagSet("ago-server", flag.ContinueOnError)
 	databasePath := flags.String("db", filepath.Join(home, ".ago", "demo", "ago.db"), "Ago board SQLite database")
 	listen := flags.String("listen", "127.0.0.1:4317", "loopback listen address")
-	mode := flags.String("mode", modeFake, `execution mode: "fake" (offline, no credential) or "relay" (a real model behind an OpenAI-compatible endpoint)`)
+	mode := flags.String("executor", modeFake, `which executor runs the work: "fake" (offline, no credential) or "relay" (a real model behind an OpenAI-compatible endpoint)`)
+	// --mode is what this flag was called first. Accepting both keeps existing
+	// scripts working rather than making a rename their problem.
+	flags.StringVar(mode, "mode", modeFake, `deprecated alias for --executor`)
 	scenario := flags.String("scenario", string(agofake.OutcomeSuccess), "scripted outcome, fake mode only: success, temporary_failure_then_success, permanent_failure, timeout, verifier_retry_with_feedback, blocked_needs_input, blocked_policy")
-	if err := flags.Parse(os.Args[1:]); err != nil {
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *mode != modeFake && *mode != modeRelay {
@@ -82,18 +100,49 @@ func run() error {
 		return fmt.Errorf("listen address %q must be a numeric loopback address", *listen)
 	}
 
+	return serve(serveConfig{
+		DatabasePath: *databasePath, Listen: *listen, Mode: *mode, Scenario: *scenario,
+	})
+}
+
+// serveConfig is one server's whole configuration. Setup runs once the stack
+// exists and before the listener accepts, which is where the demo plants its
+// goal — a board created through the same runtime any client would use.
+type serveConfig struct {
+	DatabasePath string
+	Listen       string
+	Mode         string
+	Scenario     string
+	Setup        func(context.Context, *stack) error
+	// Announce prints whatever the caller wants a user to read once the
+	// address is known.
+	Announce func(address string)
+}
+
+// stack is everything one server owns.
+type stack struct {
+	store      *agoboardstore.Store
+	artifacts  *agoartifact.Store
+	worktrees  *agoworktree.Manager
+	integrator *agointegrate.Integrator
+	runtime    *agoboardruntime.Runtime
+	mode       string
+}
+
+func serve(cfg serveConfig) error {
+	databasePath, listen, mode, scenario := cfg.DatabasePath, cfg.Listen, cfg.Mode, cfg.Scenario
 	// Preflight the database directory before opening it so a permission
 	// problem is reported as configuration rather than as a runtime failure.
-	if err := os.MkdirAll(filepath.Dir(*databasePath), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(databasePath), 0o700); err != nil {
 		return fmt.Errorf("prepare database directory: %w", err)
 	}
-	store, err := agoboardstore.Open(*databasePath)
+	store, err := agoboardstore.Open(databasePath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
 
-	stateDir := filepath.Dir(*databasePath)
+	stateDir := filepath.Dir(databasePath)
 	artifacts, err := agoartifact.Open(agoartifact.Options{Root: filepath.Join(stateDir, "artifacts")})
 	if err != nil {
 		return err
@@ -113,7 +162,7 @@ func run() error {
 			return fmt.Errorf("reconcile artifact store: %w", err)
 		}
 	}
-	planner, executor, judge, err := buildRoles(*mode, *scenario, artifacts, worktrees, integrator)
+	planner, executor, judge, err := buildRoles(mode, scenario, artifacts, worktrees, integrator)
 	if err != nil {
 		return err
 	}
@@ -153,16 +202,16 @@ func run() error {
 		return err
 	}
 	server, err := agoboardapi.New(agoboardapi.Options{
-		Runtime: runtime, Store: store, Providers: describeRoles(*mode), Artifacts: artifacts,
+		Runtime: runtime, Store: store, Providers: describeRoles(mode), Artifacts: artifacts,
 		Decisions: supervisorRunner, Integration: integrator,
 	})
 	if err != nil {
 		return err
 	}
 
-	listener, err := net.Listen("tcp", *listen)
+	listener, err := net.Listen("tcp", listen)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", *listen, err)
+		return fmt.Errorf("listen on %s: %w", listen, err)
 	}
 	// The interface and the API share this origin, so the page needs no CORS
 	// and never has to reach a plaintext localhost address from an HTTPS page.
@@ -181,9 +230,23 @@ func run() error {
 		// lifetime is bounded by the client's request context instead.
 	}
 
+	// The goal is planted before the listener accepts, so a user who follows
+	// the printed URL never sees an empty board that fills in underneath them.
+	if cfg.Setup != nil {
+		if err := cfg.Setup(context.Background(), &stack{
+			store: store, artifacts: artifacts, worktrees: worktrees,
+			integrator: integrator, runtime: runtime, mode: mode,
+		}); err != nil {
+			return err
+		}
+	}
+
 	// Startup diagnostics are deliberately free of credentials and paths that
 	// could contain them.
-	printReady(listener.Addr().String(), *databasePath, *mode, *scenario)
+	printReady(listener.Addr().String(), databasePath, mode, scenario)
+	if cfg.Announce != nil {
+		cfg.Announce(listener.Addr().String())
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -349,6 +412,12 @@ func printReady(address, databasePath, mode, scenario string) {
 	fmt.Printf("Ago is ready\nUI:       http://%s\nDatabase: %s\nMode:     %s\n", address, databasePath, mode)
 	if mode == modeFake {
 		fmt.Printf("Scenario: %s\n", scenario)
+		// Said plainly, because it would otherwise be easy to mistake this for
+		// a model doing the work. Fake mode exercises the machinery — the
+		// graph, the leases, the independent verifier, the integration ref —
+		// against a fixed plan and scripted outcomes. Use --executor relay for
+		// a run where a model actually decides anything.
+		fmt.Println("Note:     fake mode runs a fixed plan with scripted outcomes; no model decides anything.")
 		return
 	}
 	fmt.Printf("Planner:  %s\nExecutor: %s\nVerifier: %s\nAuth:     %s\n",
