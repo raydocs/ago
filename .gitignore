@@ -26,3 +26,8 @@ dist/claudex-flow-*.sha256
 outputs/runtime-contract-*.json
 outputs/claudex-flow-*.sha256
 *.png
+e2e/board/node_modules/
+e2e/board/test-results/
+e2e/board/playwright-report/
+e2e/board/blob-report/
+e2e/board/.playwright/

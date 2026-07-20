@@ -1,3 +1,5 @@
+import { reduceStream, boundedTimeline, APPLY, RESYNC } from "/stream-model.mjs";
+
 // Ago board interface.
 //
 // The interface owns no task state. Every column, card, and badge is rendered
@@ -16,7 +18,17 @@ const state = {
   source: null,
   lastSequence: 0,
   timeline: [],
+  resyncs: 0,
 };
+
+// Exposed for end-to-end assertions about stream health. It is read-only
+// diagnostics: nothing here can change what the board shows.
+window.agoDiagnostics = () => ({
+  cursor: state.lastSequence,
+  resyncs: state.resyncs,
+  timeline: state.timeline.length,
+  boardId: state.boardId,
+});
 
 const el = (id) => document.getElementById(id);
 const testid = (name) => document.querySelector(`[data-testid="${name}"]`);
@@ -247,7 +259,7 @@ function renderDrawer(detail) {
     host.append(labelledList("能力标签", detail.capability_tags, "capabilities"));
     host.append(labelledList("路径范围", detail.path_scopes, "scopes"));
     host.append(keyValue("访问模式", detail.access_mode, "access-mode"));
-    host.append(keyValue("尝试次数", `${detail.attempt_count}/${detail.max_attempts}`, "attempt-count"));
+    host.append(keyValue("尝试次数", `${detail.attempt_count}/${detail.max_attempts}`, "attempt-summary"));
     host.append(labelledList("依赖", detail.depends_on, "depends-on"));
     host.append(labelledList("被依赖", detail.required_by, "required-by"));
   }));
@@ -295,7 +307,7 @@ function renderDrawer(detail) {
     for (const attempt of detail.attempts) {
       const entry = document.createElement("div");
       entry.className = "entry";
-      entry.dataset.testid = `attempt-${attempt.id}`;
+      entry.dataset.testid = `attempt-entry-${attempt.id}`;
       entry.append(keyValue("第几次", attempt.number));
       entry.append(keyValue("状态", attempt.state));
       entry.append(keyValue("执行者", attempt.worker_id));
@@ -443,22 +455,25 @@ function subscribe() {
     } catch (_) {
       return;
     }
-    // A gap means this page missed something. Rather than guessing, re-read
-    // the authoritative snapshot.
-    if (payload.sequence > state.lastSequence + 1) {
+    // The cursor rules live in a pure module so they can be tested directly.
+    const next = reduceStream({ cursor: state.lastSequence }, payload);
+    state.lastSequence = next.cursor;
+    if (next.action === RESYNC) {
+      // This client missed something. Re-read the authoritative snapshot
+      // instead of guessing at the gap.
+      state.resyncs += 1;
       refreshSnapshot();
       return;
     }
-    state.lastSequence = Math.max(state.lastSequence, payload.sequence);
-    state.timeline.push({
+    if (next.action !== APPLY) {
+      return;
+    }
+    state.timeline = boundedTimeline(state.timeline, {
       sequence: payload.sequence,
       type: payload.type,
       reason: payload.reason,
       taskId: payload.task ? payload.task.id : null,
     });
-    if (state.timeline.length > 500) {
-      state.timeline.splice(0, state.timeline.length - 500);
-    }
     refreshSnapshot();
   });
 }
@@ -476,6 +491,18 @@ async function refreshSnapshot() {
     refreshPending = false;
   }
 }
+
+// Releases the event stream. The page calls this when it is being unloaded so
+// the connection ends cleanly instead of being severed mid-response, which
+// also lets any recording proxy or debugger finalise the request.
+function stopStream() {
+  if (state.source) {
+    state.source.close();
+    state.source = null;
+  }
+  setStreamState("未连接", "pill-idle");
+}
+window.agoStopStream = stopStream;
 
 function setStreamState(label, className) {
   const node = el("stream-state");
@@ -514,6 +541,7 @@ function start() {
   el("pause").addEventListener("click", () => control("pause", "pause"));
   el("resume").addEventListener("click", () => control("resume", "resume"));
   setInterval(tickCountdowns, 500);
+  window.addEventListener("pagehide", stopStream);
   loadProviders();
 
   // A reload or a server restart resumes the board from its identifier in the

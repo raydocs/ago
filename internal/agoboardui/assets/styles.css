@@ -13,6 +13,11 @@
 
 * { box-sizing: border-box; }
 
+/* A class that sets `display` outranks the user-agent's [hidden] rule, so an
+   element the page hid would still render. `.pill` and `.board` both did this.
+   Restoring [hidden] centrally is safer than remembering it per component. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);

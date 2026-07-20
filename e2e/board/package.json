@@ -1,0 +1,15 @@
+{
+  "name": "ago-board-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser end-to-end suite for the Ago board interface served by ago-server.",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:unit": "node --test unit/*.test.mjs",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.0"
+  }
+}
