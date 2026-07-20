@@ -24,6 +24,10 @@ type Goal struct {
 	Objective    agoplanner.Objective     `json:"objective"`
 	ProjectGates []agoplanner.ProjectGate `json:"project_gates"`
 	Constraints  agoplanner.Constraints   `json:"constraints"`
+	// ExecutionMode records which replaceable executor family the goal was
+	// admitted for. It is part of the durable definition so a restarted process
+	// projects the same goal without re-asking the user.
+	ExecutionMode string `json:"execution_mode,omitempty"`
 }
 
 type Dispatch struct {
@@ -188,9 +192,51 @@ func (runtime *Runtime) Create(ctx context.Context, goal Goal) (BoardView, error
 	return projectBoard(result.Board), nil
 }
 
+// Tick claims and runs at most one ready task using deterministic per-attempt
+// command identities.
 func (runtime *Runtime) Tick(ctx context.Context, boardID string) (BoardView, error) {
+	return runtime.tick(ctx, boardID, "")
+}
+
+// TickOnce is Tick under a caller-supplied idempotency key.
+//
+// The key is checked against its durable command receipt before any task is
+// selected, so replaying a key never claims a second task even after the first
+// claim has already completed and a different task has become ready. Reusing a
+// key against another board is reported as a conflict rather than silently
+// advancing the wrong graph.
+//
+// A key becomes durable only once it actually claims a task, so replaying a key
+// whose first use found nothing ready may claim a task later. The guarantee is
+// that one key claims at most one task, not that a key is pinned to an instant.
+func (runtime *Runtime) TickOnce(ctx context.Context, boardID, idempotencyKey string) (BoardView, error) {
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return BoardView{}, fmt.Errorf("idempotency key is required")
+	}
+	return runtime.tick(ctx, boardID, idempotencyKey)
+}
+
+func (runtime *Runtime) tick(ctx context.Context, boardID, idempotencyKey string) (BoardView, error) {
 	if err := runtime.validate(); err != nil {
 		return BoardView{}, err
+	}
+	acquireCommandID := ""
+	if idempotencyKey != "" {
+		// The command identity deliberately excludes the board so that reusing
+		// one key across boards collides here instead of claiming twice.
+		acquireCommandID = stableID("command", "advance", idempotencyKey)
+		recorded, found, err := runtime.store.CommandResult(ctx, runtime.options.CoordinatorID, acquireCommandID)
+		if err != nil {
+			return BoardView{}, fmt.Errorf("read advance receipt: %w", err)
+		}
+		if found {
+			if recorded.Board.ID != boardID {
+				return BoardView{}, fmt.Errorf("advance key %q already claimed work on board %q: %w", idempotencyKey, recorded.Board.ID, agoboardstore.ErrCommandConflict)
+			}
+			// This key already claimed a task. Report current durable state
+			// without selecting or dispatching anything further.
+			return runtime.View(ctx, boardID)
+		}
 	}
 	project, ok := runtime.project(boardID)
 	if !ok {
@@ -217,9 +263,12 @@ func (runtime *Runtime) Tick(ctx context.Context, boardID string) (BoardView, er
 	}
 	attemptID := stableID("attempt", boardID, task.ID, strconv.Itoa(attemptNumber))
 	leaseID := stableID("lease", boardID, task.ID, strconv.Itoa(attemptNumber))
+	if acquireCommandID == "" {
+		acquireCommandID = stableID("command", boardID, "acquire", task.ID, strconv.Itoa(attemptNumber))
+	}
 	acquired, fresh, err := runtime.store.AcquireLeaseBoardOnce(ctx, boardID, agoboardprotocol.Command{
 		SchemaVersion: agoboardprotocol.SchemaVersion,
-		ID:            stableID("command", boardID, "acquire", task.ID, strconv.Itoa(attemptNumber)), ExpectedVersion: board.Version,
+		ID:            acquireCommandID, ExpectedVersion: board.Version,
 		Actor: runtime.coordinator(), Type: agoboardprotocol.CommandLeaseAcquire,
 		Lease: &agoboardprotocol.LeaseSpec{ID: leaseID, TaskID: task.ID, AttemptID: attemptID, WorkerID: runtime.options.WorkerID},
 	}, runtime.options.Now().Add(runtime.options.LeaseDuration), nil)
@@ -292,6 +341,23 @@ func (runtime *Runtime) Tick(ctx context.Context, boardID string) (BoardView, er
 		return BoardView{}, fmt.Errorf("record evidence review: %w", err)
 	}
 	return projectBoard(decided.Board), nil
+}
+
+// Definition returns the immutable goal and plan admitted with a board,
+// recovering them from the durable store when this process did not create it.
+// Callers receive defensive copies and cannot mutate scheduling state through
+// the returned values.
+func (runtime *Runtime) Definition(ctx context.Context, boardID string) (Goal, agoplanner.Plan, error) {
+	definition, ok := runtime.project(boardID)
+	if !ok {
+		if err := runtime.store.Definition(ctx, boardID, &definition); err != nil {
+			return Goal{}, agoplanner.Plan{}, fmt.Errorf("recover board definition: %w", err)
+		}
+		runtime.mu.Lock()
+		runtime.projects[boardID] = definition
+		runtime.mu.Unlock()
+	}
+	return cloneGoal(definition.Goal), clonePlan(definition.Plan), nil
 }
 
 func (runtime *Runtime) View(ctx context.Context, boardID string) (BoardView, error) {

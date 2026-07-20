@@ -21,6 +21,13 @@ import (
 
 const CurrentSchemaVersion = 2
 
+// Sentinel errors let transport layers map durable store outcomes onto their
+// own status codes without matching on message text.
+var (
+	ErrBoardNotFound   = errors.New("does not exist")
+	ErrCommandConflict = errors.New("was already used for different content")
+)
+
 //go:embed migrations/001_initial.sql
 var initialSchema string
 
@@ -440,7 +447,7 @@ func boardQuery(ctx context.Context, q interface {
 }, id string) (agoboardprotocol.Board, error) {
 	var encoded []byte
 	if err := q.QueryRowContext(ctx, `SELECT board_json FROM boards WHERE board_id=?`, id).Scan(&encoded); errors.Is(err, sql.ErrNoRows) {
-		return agoboardprotocol.Board{}, fmt.Errorf("board %q does not exist", id)
+		return agoboardprotocol.Board{}, fmt.Errorf("board %q %w", id, ErrBoardNotFound)
 	} else if err != nil {
 		return agoboardprotocol.Board{}, err
 	}
@@ -481,6 +488,41 @@ func (s *Store) Replay(ctx context.Context, boardID string, afterVersion uint64,
 		events = append(events, e)
 	}
 	return events, rows.Err()
+}
+
+// CommandResult returns the durable result recorded for an actor's command and
+// reports whether one exists. Callers use it to decide, before performing any
+// side effect, whether a command identity has already been honoured.
+func (s *Store) CommandResult(ctx context.Context, actorID, commandID string) (Result, bool, error) {
+	if strings.TrimSpace(actorID) == "" || strings.TrimSpace(commandID) == "" {
+		return Result{}, false, fmt.Errorf("actor id and command id are required")
+	}
+	var encoded []byte
+	err := s.db.QueryRowContext(ctx, `SELECT result_json FROM commands WHERE actor_id=? AND command_id=?`, actorID, commandID).Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Result{}, false, nil
+	}
+	if err != nil {
+		return Result{}, false, err
+	}
+	var result Result
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		return Result{}, false, err
+	}
+	return result, true, nil
+}
+
+// LatestSequence returns the highest durable event version for a board, or 0
+// when it has no events. It is the authoritative resume cursor for subscribers.
+func (s *Store) LatestSequence(ctx context.Context, boardID string) (uint64, error) {
+	var highest sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(version) FROM events WHERE board_id=?`, boardID).Scan(&highest); err != nil {
+		return 0, err
+	}
+	if !highest.Valid || highest.Int64 < 0 {
+		return 0, nil
+	}
+	return uint64(highest.Int64), nil
 }
 
 func (s *Store) Ready(ctx context.Context, boardID string) ([]agoboardprotocol.Task, error) {
@@ -788,7 +830,7 @@ func storedResult(ctx context.Context, tx *sql.Tx, actor, id string, hash []byte
 		return Result{}, false, err
 	}
 	if !bytes.Equal(stored, hash) {
-		return Result{}, false, fmt.Errorf("command %q was already used for different content", id)
+		return Result{}, false, fmt.Errorf("command %q %w", id, ErrCommandConflict)
 	}
 	var result Result
 	if err := json.Unmarshal(encoded, &result); err != nil {
