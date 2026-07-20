@@ -429,3 +429,30 @@ func syncDir(path string) {
 	defer dir.Close()
 	_ = dir.Sync()
 }
+
+// Bytes reads a whole artifact after re-verifying it against its descriptor.
+// It is bounded by the descriptor's recorded size, so a tampered file cannot
+// make a caller read more than it agreed to.
+func (store *Store) Bytes(ctx context.Context, descriptor Descriptor) ([]byte, error) {
+	reader, err := store.Open(ctx, descriptor)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	limit := descriptor.Bytes
+	if limit <= 0 || limit > store.maxBytes {
+		limit = store.maxBytes
+	}
+	content, err := io.ReadAll(io.LimitReader(reader, limit))
+	if err != nil {
+		return nil, err
+	}
+	if descriptor.Bytes > 0 && int64(len(content)) != descriptor.Bytes {
+		return nil, fmt.Errorf("%q read %d of %d bytes: %w", descriptor.ID, len(content), descriptor.Bytes, ErrCorrupt)
+	}
+	digest := sha256.Sum256(content)
+	if descriptor.SHA256 != "" && hex.EncodeToString(digest[:]) != descriptor.SHA256 {
+		return nil, fmt.Errorf("%q: %w", descriptor.ID, ErrCorrupt)
+	}
+	return content, nil
+}

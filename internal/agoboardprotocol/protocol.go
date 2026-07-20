@@ -48,8 +48,13 @@ const (
 	TaskLeased    TaskState = "leased"
 	TaskRunning   TaskState = "running"
 	TaskVerifying TaskState = "verifying"
-	TaskPassed    TaskState = "passed"
-	TaskFailed    TaskState = "failed"
+	// TaskIntegrating means the evidence was accepted and the change is being
+	// promoted onto the board's integration ref. A write task is not finished
+	// until that promotion succeeds: an accepted patch nobody applied is not a
+	// completed change.
+	TaskIntegrating TaskState = "integrating"
+	TaskPassed      TaskState = "passed"
+	TaskFailed      TaskState = "failed"
 	// TaskRetryWait is a bounded, durable backoff stop: the previous attempt
 	// failed retryably and the task becomes eligible again only at
 	// NextEligibleAt. It projects onto the Blocked column with a countdown.
@@ -166,6 +171,16 @@ type Board struct {
 	// Repository identifies the single local repository this board's work
 	// touches. The scheduler serializes writers per repository.
 	Repository string `json:"repository,omitempty"`
+	// BaseRevision is the commit the board was admitted against. It is the
+	// starting point of the integration chain and never changes.
+	BaseRevision string `json:"base_revision,omitempty"`
+	// IntegrationRef is the Ago-owned ref accepted work is promoted onto. It is
+	// never the user's branch: Ago writes only to refs it created.
+	IntegrationRef string `json:"integration_ref,omitempty"`
+	// IntegratedRevision is the tip of the integration chain. A write task's
+	// worktree starts here, so downstream work inherits accepted upstream
+	// changes. It advances only through the integration authority.
+	IntegratedRevision string `json:"integrated_revision,omitempty"`
 	// NextGeneration is the board's monotonic fencing counter. It only ever
 	// increases, so a token minted for a superseded attempt can never be
 	// reissued.
@@ -204,6 +219,9 @@ type Task struct {
 	// Origin records which plan patch introduced a task, so a reader can tell
 	// planned work from work added in response to a failure.
 	Origin string `json:"origin,omitempty"`
+	// IntegratedRevision is the revision this task's accepted change produced.
+	// A read-only task never sets it; a write task without it did not finish.
+	IntegratedRevision string `json:"integrated_revision,omitempty"`
 }
 
 type Dependency struct {
@@ -282,10 +300,29 @@ type ArtifactRef struct {
 	SHA256      string `json:"sha256"`
 }
 
+// PatchRecord is the durable form of a change. The worktree it was produced in
+// is deleted immediately after; this is what survives, and it is what the
+// integration authority replays onto the integration ref.
+type PatchRecord struct {
+	// ArtifactID names the immutable patch bytes in the managed artifact store.
+	ArtifactID string `json:"artifact_id"`
+	// BaseRevision is what the change was produced against. Integration checks
+	// it against the current integrated revision to detect divergence.
+	BaseRevision string `json:"base_revision"`
+	SHA256       string `json:"sha256"`
+	Bytes        int64  `json:"bytes"`
+	// ChangedPaths is what the patch touches, measured from git.
+	ChangedPaths []string `json:"changed_paths,omitempty"`
+}
+
 // EvidenceResult is what an attempt actually produced. It carries no
 // credential: the fencing token that authorized the attempt is referenced only
 // by generation, never by value.
 type EvidenceResult struct {
+	// Patch is present when the attempt changed the repository. Its absence on
+	// a write task is what makes "accepted but nothing to integrate" visible
+	// rather than silent.
+	Patch        *PatchRecord    `json:"patch,omitempty"`
 	Summary      string          `json:"summary"`
 	Generation   uint64          `json:"generation"`
 	ChangedFiles []ChangedFile   `json:"changed_files,omitempty"`
@@ -351,9 +388,16 @@ const (
 	CommandLeaseExpire CommandType = "lease.expire"
 	// CommandLeaseRenew extends an active lease's deadline. Only the current
 	// generation may renew, so a superseded worker cannot keep a lease alive.
-	CommandLeaseRenew  CommandType = "lease.renew"
-	CommandBoardPause  CommandType = "board.pause"
-	CommandBoardResume CommandType = "board.resume"
+	CommandLeaseRenew CommandType = "lease.renew"
+	// CommandIntegrationComplete promotes an accepted change onto the board's
+	// integration ref. It is the only way a write task reaches passed, and it
+	// is issued by the integration authority — never by a worker.
+	CommandIntegrationComplete CommandType = "integration.complete"
+	// CommandIntegrationFail records that an accepted change could not be
+	// promoted, usually because the base revision moved underneath it.
+	CommandIntegrationFail CommandType = "integration.fail"
+	CommandBoardPause      CommandType = "board.pause"
+	CommandBoardResume     CommandType = "board.resume"
 	// CommandTaskRetry is a human decision to try a stopped task again. The
 	// automatic attempt bound protects against machine retry loops; a person
 	// choosing to retry is a different act, and it is audited as one.
@@ -378,7 +422,9 @@ type Command struct {
 	AttemptID       string          `json:"attempt_id,omitempty"`
 	Evidence        *EvidenceSpec   `json:"evidence,omitempty"`
 	Patch           *PatchSpec      `json:"patch,omitempty"`
-	Reason          string          `json:"reason,omitempty"`
+	// Revision is the integrated revision an integration command produced.
+	Revision string `json:"revision,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 	// FencingToken authenticates a worker or verifier against the exact attempt
 	// it is acting on. Commands from a superseded attempt cannot match.
 	FencingToken string `json:"fencing_token,omitempty"`
@@ -431,6 +477,10 @@ type BoardSpec struct {
 	ID         string `json:"id"`
 	Title      string `json:"title"`
 	Repository string `json:"repository,omitempty"`
+	// BaseRevision and IntegrationRef establish the integration chain when the
+	// board is admitted. A board without them can still run read-only work.
+	BaseRevision   string `json:"base_revision,omitempty"`
+	IntegrationRef string `json:"integration_ref,omitempty"`
 }
 
 type TaskSpec struct {
@@ -488,6 +538,8 @@ const (
 	EventBoardResumed        EventType = "board.resumed"
 	EventTaskRetryRequested  EventType = "task.retry-requested"
 	EventPlanPatched         EventType = "plan.patched"
+	EventIntegrationComplete EventType = "integration.completed"
+	EventIntegrationFailed   EventType = "integration.failed"
 )
 
 type Event struct {
@@ -601,7 +653,8 @@ func (contract TerminalContract) validate() error {
 
 func validTaskState(state TaskState) bool {
 	switch state {
-	case TaskPlanned, TaskBlocked, TaskReady, TaskLeased, TaskRunning, TaskVerifying, TaskPassed, TaskFailed, TaskRetryWait:
+	case TaskPlanned, TaskBlocked, TaskReady, TaskLeased, TaskRunning, TaskVerifying,
+		TaskIntegrating, TaskPassed, TaskFailed, TaskRetryWait:
 		return true
 	default:
 		return false

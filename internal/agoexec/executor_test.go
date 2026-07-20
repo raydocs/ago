@@ -166,8 +166,25 @@ func TestExecutesInIsolationAndReportsMeasuredChanges(t *testing.T) {
 	if len(result.Result.Tests) != 1 || !result.Result.Tests[0].Passed || !result.Result.Tests[0].Required {
 		t.Fatalf("tests = %#v", result.Result.Tests)
 	}
-	if len(result.Result.Artifacts) != 1 || result.Result.Artifacts[0].SHA256 == "" {
-		t.Fatalf("artifacts = %#v", result.Result.Artifacts)
+	// A change must be captured as durable bytes before the worktree is
+	// deleted, otherwise an accepted result would vanish.
+	if result.Result.Patch == nil {
+		t.Fatal("a change produced no durable patch record")
+	}
+	if result.Result.Patch.ArtifactID == "" || result.Result.Patch.SHA256 == "" || result.Result.Patch.BaseRevision == "" {
+		t.Fatalf("patch record is incomplete: %#v", result.Result.Patch)
+	}
+	if len(result.Result.Patch.ChangedPaths) != 1 || result.Result.Patch.ChangedPaths[0] != "README.md" {
+		t.Fatalf("patch changed paths = %#v", result.Result.Patch.ChangedPaths)
+	}
+	var patchRef bool
+	for _, artifact := range result.Result.Artifacts {
+		if artifact.ID == result.Result.Patch.ArtifactID && artifact.SHA256 != "" {
+			patchRef = true
+		}
+	}
+	if !patchRef {
+		t.Fatalf("the patch is not referenced as an artifact: %#v", result.Result.Artifacts)
 	}
 
 	// The canonical repository must be byte-identical: the work happened in an
@@ -417,8 +434,12 @@ func TestCredentialInModelOutputIsRedactedFromEvidence(t *testing.T) {
 	// Seed the redactor with the sentinel the way production seeds it from the
 	// environment.
 	t.Setenv("AGO_PROVIDER_API_KEY", secretSentinel)
+	artifacts, err := agoartifact.Open(agoartifact.Options{Root: filepath.Join(t.TempDir(), "artifacts")})
+	if err != nil {
+		t.Fatal(err)
+	}
 	rebuilt, err := agoexec.New(agoexec.Options{
-		Model: f.model, Worktrees: f.worktrees, Commands: f.commands,
+		Model: f.model, Worktrees: f.worktrees, Artifacts: artifacts, Commands: f.commands,
 		Timeout: 30 * time.Second,
 	})
 	if err != nil {

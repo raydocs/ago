@@ -376,3 +376,78 @@ func replay(t *testing.T, store *agoboardstore.Store, boardID string) []agoboard
 	}
 	return events
 }
+
+// A restarted supervisor must reach the same decisions as the one it replaced.
+//
+// The repair budget used to live in memory, so a restart re-issued repair
+// commands whose durable receipts already existed; the resulting conflict was
+// swallowed, the budget was burned on commands that did nothing, and the
+// attention queue stayed empty while the goal quietly stalled.
+func TestRepairBudgetSurvivesRestartAndStillEscalates(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	path := filepath.Join(base, "board.db")
+	script := agofake.Script{
+		Default: agofake.OutcomeSuccess,
+		ByTask:  map[string]agofake.Outcome{"identify-commands": agofake.OutcomePermanentFailure},
+	}
+	authorize := agosupervisor.Authorization{LocalFileWrites: true, MaxRepairsPerTask: 2}
+
+	first := openHarness(t, path, base, script, authorize, "board-restart-repair")
+	first.createGoal(t, first.store)
+	// Run far enough to spend at least one repair.
+	for range 8 {
+		if _, err := first.supervisor.Step(ctx); err != nil {
+			t.Fatalf("Step: %v", err)
+		}
+	}
+	beforeBoard, err := first.store.Board(ctx, first.boardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, beforeTask, _ := taskIn(beforeBoard, "identify-commands")
+	if beforeTask.UserRetries == 0 {
+		t.Fatal("no repair was spent, so the restart case would not be exercised")
+	}
+	if err := first.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A brand new supervisor with an empty memory, same durable state.
+	second := openHarness(t, path, base, script, authorize, "board-restart-repair")
+	status, err := second.supervisor.Run(ctx, 200)
+	if err != nil {
+		t.Fatalf("Run after restart: %v", err)
+	}
+	if status.Complete {
+		t.Fatal("a permanently failing goal reported completion")
+	}
+	// The goal must end up waiting on a person, with a real decision, rather
+	// than stalling with an empty queue.
+	if len(status.Decisions) == 0 {
+		t.Fatal("the restarted supervisor stalled without raising any decision")
+	}
+	if !status.Blocked {
+		t.Fatalf("status = %+v, want it blocked on a user decision", status)
+	}
+
+	afterBoard, err := second.store.Board(ctx, second.boardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, afterTask, _ := taskIn(afterBoard, "identify-commands")
+	// The budget is durable, so a restart cannot grant a fresh allowance.
+	if afterTask.UserRetries > authorize.MaxRepairsPerTask {
+		t.Fatalf("restart granted extra repairs: %d used against a limit of %d",
+			afterTask.UserRetries, authorize.MaxRepairsPerTask)
+	}
+}
+
+func taskIn(board agoboardprotocol.Board, id string) (int, agoboardprotocol.Task, bool) {
+	for index, task := range board.Tasks {
+		if task.ID == id {
+			return index, task, true
+		}
+	}
+	return -1, agoboardprotocol.Task{}, false
+}

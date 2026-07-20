@@ -27,6 +27,12 @@ type Goal struct {
 	// admitted for. It is part of the durable definition so a restarted process
 	// projects the same goal without re-asking the user.
 	ExecutionMode string `json:"execution_mode,omitempty"`
+	// BaseRevision and IntegrationRef establish where accepted work is
+	// promoted. A goal without them can still run read-only tasks; a write task
+	// cannot complete, which is what makes the missing setup visible instead of
+	// silently discarding changes.
+	BaseRevision   string `json:"base_revision,omitempty"`
+	IntegrationRef string `json:"integration_ref,omitempty"`
 }
 
 type Dispatch struct {
@@ -38,6 +44,9 @@ type Dispatch struct {
 	// from the durable graph, so an executor's behaviour across a retry is a
 	// function of recorded state rather than of process memory.
 	AttemptNumber int `json:"attempt_number"`
+	// BaseRevision is the board's integrated revision. Starting here is what
+	// makes a downstream task inherit accepted upstream work.
+	BaseRevision string `json:"base_revision,omitempty"`
 }
 
 type ExecutionResult struct {
@@ -151,8 +160,11 @@ func (runtime *Runtime) Create(ctx context.Context, goal Goal) (BoardView, error
 	commands := []agoboardprotocol.Command{{
 		SchemaVersion: agoboardprotocol.SchemaVersion,
 		ID:            stableID("command", goal.BoardID, "create"), Actor: actor,
-		Type:  agoboardprotocol.CommandBoardCreate,
-		Board: &agoboardprotocol.BoardSpec{ID: goal.BoardID, Title: goal.Objective.Summary, Repository: goal.Repository.ID},
+		Type: agoboardprotocol.CommandBoardCreate,
+		Board: &agoboardprotocol.BoardSpec{
+			ID: goal.BoardID, Title: goal.Objective.Summary, Repository: goal.Repository.ID,
+			BaseRevision: goal.BaseRevision, IntegrationRef: goal.IntegrationRef,
+		},
 	}}
 	version := uint64(1)
 	for _, proposal := range plan.Tasks {

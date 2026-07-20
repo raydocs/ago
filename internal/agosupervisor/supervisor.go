@@ -97,7 +97,6 @@ type Options struct {
 
 type Supervisor struct {
 	options   Options
-	repairs   map[string]int
 	patches   int
 	decisions []Decision
 }
@@ -118,7 +117,7 @@ func New(options Options) (*Supervisor, error) {
 	if options.Authorize.MaxPatches <= 0 {
 		options.Authorize.MaxPatches = defaultMaxPatches
 	}
-	return &Supervisor{options: options, repairs: map[string]int{}, decisions: []Decision{}}, nil
+	return &Supervisor{options: options, decisions: []Decision{}}, nil
 }
 
 // Status is what the goal looks like right now.
@@ -138,8 +137,10 @@ type Status struct {
 // act. A pass that changes nothing and raises no decision means the goal is
 // either finished or genuinely waiting on the scheduler.
 func (supervisor *Supervisor) Step(ctx context.Context) (Status, error) {
-	// The scheduler owns claiming. The supervisor only asks it to run.
-	if _, err := supervisor.options.Scheduler.RunOnce(ctx); err != nil {
+	// The scheduler owns claiming. The supervisor only asks it to run, and only
+	// for its own board: a fleet-wide sweep per supervisor would make one pass
+	// quadratic in the number of goals.
+	if _, err := supervisor.options.Scheduler.RunOnceForBoard(ctx, supervisor.options.BoardID); err != nil {
 		return Status{}, fmt.Errorf("scheduler cycle: %w", err)
 	}
 	board, err := supervisor.options.Store.Board(ctx, supervisor.options.BoardID)
@@ -205,10 +206,16 @@ func (supervisor *Supervisor) reviewStoppedWork(ctx context.Context, board agobo
 		// Repairable: give the task a fresh budget with an acceptance criterion
 		// that names what went wrong, so the next attempt is aimed at the
 		// failure rather than repeating the same work blindly.
-		if supervisor.repairs[task.ID] >= supervisor.options.Authorize.MaxRepairsPerTask {
+		//
+		// The count comes from the durable graph, not from memory. A restarted
+		// supervisor must reach the same decision as the one it replaced;
+		// counting in memory would re-issue repairs whose command receipts
+		// already exist and silently burn the budget on commands that do
+		// nothing.
+		if task.UserRetries >= supervisor.options.Authorize.MaxRepairsPerTask {
 			supervisor.raise(Decision{
 				Kind: DecisionExhausted, TaskID: task.ID, Title: task.Title,
-				Reason:       fmt.Sprintf("自动修复已用尽（%d 次）：%s", supervisor.repairs[task.ID], failureNarrative(task)),
+				Reason:       fmt.Sprintf("自动修复已用尽（%d 次）：%s", task.UserRetries, failureNarrative(task)),
 				Suggestion:   "检查任务契约是否可行，或缩小范围后手动重试。",
 				RaisedAt:     supervisor.options.Now().UTC(),
 				AttemptsUsed: task.AttemptCount,
@@ -216,7 +223,15 @@ func (supervisor *Supervisor) reviewStoppedWork(ctx context.Context, board agobo
 			continue
 		}
 		if err := supervisor.repair(ctx, task); err != nil {
-			return err
+			// One task that cannot be repaired must not stop the others from
+			// being reviewed. It becomes a decision instead of a silent stall.
+			supervisor.raise(Decision{
+				Kind: DecisionExhausted, TaskID: task.ID, Title: task.Title,
+				Reason:       fmt.Sprintf("自动修复失败：%v", err),
+				Suggestion:   "检查任务契约是否可行，或缩小范围后手动重试。",
+				RaisedAt:     supervisor.options.Now().UTC(),
+				AttemptsUsed: task.AttemptCount,
+			})
 		}
 	}
 	return nil
@@ -236,8 +251,9 @@ func (supervisor *Supervisor) repair(ctx context.Context, task agoboardprotocol.
 		})
 		return nil
 	}
-	count := supervisor.repairs[task.ID] + 1
-	supervisor.repairs[task.ID] = count
+	// UserRetries is the durable record of how many times this task was
+	// restarted, so the identity below is stable across a restart.
+	count := task.UserRetries + 1
 	supervisor.patches++
 
 	criterion := fmt.Sprintf("修复上一次失败：%s", failureNarrative(task))
@@ -265,8 +281,14 @@ func (supervisor *Supervisor) repair(ctx context.Context, task agoboardprotocol.
 			}},
 		},
 	}); err != nil {
-		// A patch that cannot be applied is not something to retry blindly.
-		return fmt.Errorf("apply repair patch for %q: %w", task.ID, err)
+		// The same repair was already recorded, which is what a restart looks
+		// like. Treat it as done rather than as a failure: retrying would
+		// re-issue an identical command, and returning an error would abandon
+		// every other stopped task in this pass.
+		if !errors.Is(err, agoboardstore.ErrCommandConflict) {
+			return fmt.Errorf("apply repair patch for %q: %w", task.ID, err)
+		}
+		return nil
 	}
 
 	updated, err := supervisor.options.Store.Board(ctx, supervisor.options.BoardID)
@@ -282,7 +304,9 @@ func (supervisor *Supervisor) repair(ctx context.Context, task agoboardprotocol.
 		TaskID:          task.ID,
 		Reason:          fmt.Sprintf("自动修复第 %d 次：%s", count, failureNarrative(task)),
 	}); err != nil {
-		return fmt.Errorf("retry task %q after repair: %w", task.ID, err)
+		if !errors.Is(err, agoboardstore.ErrCommandConflict) {
+			return fmt.Errorf("retry task %q after repair: %w", task.ID, err)
+		}
 	}
 	return nil
 }

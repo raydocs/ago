@@ -53,7 +53,11 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		next = Board{
 			SchemaVersion: SchemaVersion, ID: command.Board.ID, Title: command.Board.Title,
 			Tasks: []Task{}, Dependencies: []Dependency{}, Attempts: []Attempt{}, Leases: []Lease{}, Evidence: []Evidence{},
-			Repository: command.Board.Repository,
+			Repository:     command.Board.Repository,
+			BaseRevision:   command.Board.BaseRevision,
+			IntegrationRef: command.Board.IntegrationRef,
+			// The chain starts at the base: nothing has been integrated yet.
+			IntegratedRevision: command.Board.BaseRevision,
 			// Generations start at 1 so zero can mean "no fencing authority",
 			// which is what migrated schema-1 attempts carry.
 			NextGeneration: 1,
@@ -294,11 +298,21 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 				return current, nil, fmt.Errorf("evidence %q cannot be accepted: required tests failed: %v", evidence.ID, failed)
 			}
 			next.Evidence[evidenceIndex].Verdict, next.Evidence[evidenceIndex].VerdictReason = "accept", command.Reason
-			next.Tasks[taskIndex].State, next.Tasks[taskIndex].AcceptedEvidenceID = TaskPassed, evidence.ID
 			next.Attempts[attemptIndex].State, next.Evidence[evidenceIndex].State = AttemptPassed, EvidenceAccepted
 			next.Leases[leaseIndex].State = LeaseCompleted
-			emit(Event{Type: EventEvidenceAccepted, Task: taskPointer(next.Tasks[taskIndex]), Attempt: attemptPointer(next.Attempts[attemptIndex]), Evidence: evidencePointer(next.Evidence[evidenceIndex]), Lease: leasePointer(next.Leases[leaseIndex]), PreviousState: TaskVerifying, CurrentState: TaskPassed, Reason: command.Reason})
-			unblockReadyTasks(&next, emit)
+			next.Tasks[taskIndex].AcceptedEvidenceID = evidence.ID
+			// An accepted patch that nobody applied is not a finished change.
+			// A write task therefore waits for the integration authority; only
+			// work that changed nothing can pass on acceptance alone.
+			settled := TaskPassed
+			if evidence.Result.Patch != nil {
+				settled = TaskIntegrating
+			}
+			next.Tasks[taskIndex].State = settled
+			emit(Event{Type: EventEvidenceAccepted, Task: taskPointer(next.Tasks[taskIndex]), Attempt: attemptPointer(next.Attempts[attemptIndex]), Evidence: evidencePointer(next.Evidence[evidenceIndex]), Lease: leasePointer(next.Leases[leaseIndex]), PreviousState: TaskVerifying, CurrentState: settled, Reason: command.Reason})
+			if settled == TaskPassed {
+				unblockReadyTasks(&next, emit)
+			}
 		} else {
 			// A rejection is a failure like any other: it either earns a
 			// bounded retry or stops the task, and that decision is durable.
@@ -460,6 +474,45 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		}
 		emit(Event{Type: EventPlanPatched, Reason: command.Patch.Reason})
 		// A patch can satisfy the last dependency a blocked task was waiting on.
+		unblockReadyTasks(&next, emit)
+	case CommandIntegrationComplete, CommandIntegrationFail:
+		if err := requireInitialized(next); err != nil {
+			return current, nil, err
+		}
+		// Integration is the coordinator's act. A worker cannot promote its own
+		// change, which is what keeps "accepted" and "applied" separate.
+		if err := requireRole(RoleCoordinator); err != nil {
+			return current, nil, err
+		}
+		taskIndex, task, found := findTask(next, command.TaskID)
+		if !found {
+			return current, nil, fmt.Errorf("task %q not found", command.TaskID)
+		}
+		if task.State != TaskIntegrating {
+			return current, nil, illegalTransition(task.State, "integrate")
+		}
+		if command.Type == CommandIntegrationFail {
+			class := command.FailureClass
+			if class == FailureNone {
+				class = FailureRepository
+			}
+			next.Tasks[taskIndex].State = TaskFailed
+			next.Tasks[taskIndex].FailureClass = class
+			next.Tasks[taskIndex].BlockedReason = command.Reason
+			next.Tasks[taskIndex].ActiveAttemptID, next.Tasks[taskIndex].ActiveLeaseID = "", ""
+			emit(Event{Type: EventIntegrationFailed, Task: taskPointer(next.Tasks[taskIndex]), PreviousState: TaskIntegrating, CurrentState: TaskFailed, Reason: command.Reason})
+			break
+		}
+		if command.Revision == "" {
+			return current, nil, fmt.Errorf("integration.complete requires the resulting revision")
+		}
+		next.Tasks[taskIndex].State = TaskPassed
+		next.Tasks[taskIndex].IntegratedRevision = command.Revision
+		next.Tasks[taskIndex].ActiveAttemptID, next.Tasks[taskIndex].ActiveLeaseID = "", ""
+		// The board's chain advances, so the next write task starts from work
+		// that already includes this change.
+		next.IntegratedRevision = command.Revision
+		emit(Event{Type: EventIntegrationComplete, Task: taskPointer(next.Tasks[taskIndex]), PreviousState: TaskIntegrating, CurrentState: TaskPassed, Reason: command.Reason})
 		unblockReadyTasks(&next, emit)
 	case CommandBoardPause, CommandBoardResume:
 		if err := requireInitialized(next); err != nil {

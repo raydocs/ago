@@ -18,6 +18,7 @@
 package agoexec
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -50,6 +51,8 @@ type Artifacts interface {
 // Worktrees isolates each write attempt.
 type Worktrees interface {
 	Create(ctx context.Context, repositoryRoot, attemptID string) (agoworktree.Lease, error)
+	CreateAt(ctx context.Context, repositoryRoot, attemptID, revision string) (agoworktree.Lease, error)
+	Patch(ctx context.Context, lease agoworktree.Lease) ([]byte, error)
 	Changes(ctx context.Context, lease agoworktree.Lease) ([]agoworktree.Change, error)
 	Remove(ctx context.Context, lease agoworktree.Lease) error
 }
@@ -140,7 +143,9 @@ func (executor *Executor) Execute(ctx context.Context, dispatch agoboardruntime.
 	defer cancel()
 
 	repository := dispatch.Goal.Repository.ID
-	lease, err := executor.options.Worktrees.Create(ctx, repository, dispatch.AttemptID)
+	// Start from the board's integrated revision so this task inherits work its
+	// dependencies already had accepted and promoted.
+	lease, err := executor.options.Worktrees.CreateAt(ctx, repository, dispatch.AttemptID, dispatch.BaseRevision)
 	if err != nil {
 		return agoboardruntime.ExecutionResult{}, Error{
 			Class:   agoboardprotocol.FailureRepository,
@@ -192,6 +197,46 @@ func (executor *Executor) Execute(ctx context.Context, dispatch agoboardruntime.
 		ChangedFiles: toChangedFiles(changes),
 	}
 	executor.runCommands(ctx, lease, dispatch, plan.Commands, &result)
+
+	// The worktree is deleted the moment this returns, so the change has to be
+	// captured as durable bytes first. Without this an accepted result would
+	// simply vanish.
+	if len(changes) > 0 {
+		patch, patchErr := executor.options.Worktrees.Patch(ctx, lease)
+		if patchErr != nil {
+			return agoboardruntime.ExecutionResult{}, Error{
+				Class:   agoboardprotocol.FailureRepository,
+				Message: executor.redact(fmt.Sprintf("无法保存变更补丁：%v", patchErr)),
+			}
+		}
+		if executor.options.Artifacts == nil {
+			return agoboardruntime.ExecutionResult{}, Error{
+				Class:   agoboardprotocol.FailureRepository,
+				Message: "没有配置工件存储，变更无法持久化。",
+			}
+		}
+		descriptor, putErr := executor.options.Artifacts.Put(ctx, agoartifact.PutInput{
+			Type: "text/x-patch", DisplayName: dispatch.Task.ID + ".patch",
+		}, bytes.NewReader(patch))
+		if putErr != nil {
+			return agoboardruntime.ExecutionResult{}, Error{
+				Class:   agoboardprotocol.FailureRepository,
+				Message: executor.redact(fmt.Sprintf("无法存储变更补丁：%v", putErr)),
+			}
+		}
+		paths := make([]string, 0, len(changes))
+		for _, change := range changes {
+			paths = append(paths, change.Path)
+		}
+		result.Patch = &agoboardprotocol.PatchRecord{
+			ArtifactID: descriptor.ID, BaseRevision: lease.BaseRevision,
+			SHA256: descriptor.SHA256, Bytes: descriptor.Bytes, ChangedPaths: paths,
+		}
+		result.Artifacts = append(result.Artifacts, agoboardprotocol.ArtifactRef{
+			ID: descriptor.ID, Type: descriptor.Type, DisplayName: descriptor.DisplayName,
+			Bytes: descriptor.Bytes, SHA256: descriptor.SHA256,
+		})
+	}
 
 	if result.Summary == "" {
 		return agoboardruntime.ExecutionResult{}, Error{

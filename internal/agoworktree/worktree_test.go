@@ -100,7 +100,7 @@ func TestCreateChecksOutBaseRevisionWithoutTouchingCanonicalTree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if lease.Path == "" || lease.Repository == "" || lease.BaseRevision == "" || lease.Branch == "" || lease.ID == "" {
+	if lease.Path == "" || lease.Repository == "" || lease.BaseRevision == "" || lease.ID == "" {
 		t.Fatalf("incomplete lease: %+v", lease)
 	}
 

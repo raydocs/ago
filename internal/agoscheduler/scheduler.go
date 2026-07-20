@@ -15,9 +15,11 @@ import (
 	"strconv"
 	"time"
 
+	"claudexflow/internal/agoartifact"
 	"claudexflow/internal/agoboardprotocol"
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
+	"claudexflow/internal/agointegrate"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoredact"
 )
@@ -54,10 +56,30 @@ type Options struct {
 	// OnCycle observes each completed cycle. It is intended for tests and
 	// diagnostics and must not block.
 	OnCycle func(Cycle)
+	// Integrator promotes accepted changes onto the board's Ago-owned ref. When
+	// nil, a task whose evidence carries a patch cannot complete: an accepted
+	// change nobody applied must not be reported as finished work.
+	Integrator Integrator
 	// Redactor strips credential-shaped content from executor output before it
 	// becomes durable evidence. A nil value is replaced with one seeded from
 	// the process environment, so redaction is never accidentally off.
 	Redactor *agoredact.Redactor
+	// Artifacts reads back the durable patch an accepted attempt produced.
+	Artifacts ArtifactReader
+}
+
+// Integrator is the narrow slice of the integration authority the scheduler
+// needs. It is an interface so the scheduler never gains the ability to write
+// a repository itself.
+// ArtifactReader reads stored bytes back. The scheduler needs the patch, not
+// the ability to write artifacts.
+type ArtifactReader interface {
+	Bytes(ctx context.Context, descriptor agoartifact.Descriptor) ([]byte, error)
+}
+
+type Integrator interface {
+	EnsureRef(ctx context.Context, repository, ref, baseRevision string) (string, error)
+	Integrate(ctx context.Context, request agointegrate.Request) (agointegrate.Result, error)
 }
 
 // Cycle records what one scheduler pass did.
@@ -104,10 +126,22 @@ func New(options Options) (*Scheduler, error) {
 // a board whose work keeps becoming eligible.
 const maxClaimsPerCycle = 16
 
-// RunOnce performs exactly one deterministic scheduler cycle: preflight,
-// reconcile expired leases, then claim and dispatch eligible work within the
-// configured slots. It is the unit tests drive; Run is a loop around it.
+// RunOnce performs one deterministic scheduler cycle across every board.
 func (scheduler *Scheduler) RunOnce(ctx context.Context) (Cycle, error) {
+	return scheduler.runCycle(ctx, "")
+}
+
+// RunOnceForBoard is RunOnce scoped to a single board.
+//
+// A caller that already iterates boards must use this: calling RunOnce per
+// board would make one pass quadratic, because each call would sweep the whole
+// fleet again. Reconciliation still runs fleet-wide, since an expired lease
+// anywhere holds a concurrency slot everywhere.
+func (scheduler *Scheduler) RunOnceForBoard(ctx context.Context, boardID string) (Cycle, error) {
+	return scheduler.runCycle(ctx, boardID)
+}
+
+func (scheduler *Scheduler) runCycle(ctx context.Context, onlyBoard string) (Cycle, error) {
 	cycle := Cycle{Outcomes: []agoboardstore.ClaimOutcome{}}
 	now := scheduler.options.Now().UTC()
 
@@ -119,9 +153,13 @@ func (scheduler *Scheduler) RunOnce(ctx context.Context) (Cycle, error) {
 	}
 	cycle.Reconciled = len(expired)
 
-	boards, err := scheduler.options.Store.BoardIDs(ctx)
-	if err != nil {
-		return cycle, fmt.Errorf("list boards: %w", err)
+	boards := []string{onlyBoard}
+	if onlyBoard == "" {
+		listed, err := scheduler.options.Store.BoardIDs(ctx)
+		if err != nil {
+			return cycle, fmt.Errorf("list boards: %w", err)
+		}
+		boards = listed
 	}
 	for _, boardID := range boards {
 		if err := ctx.Err(); err != nil {
@@ -224,6 +262,7 @@ func (scheduler *Scheduler) dispatch(ctx context.Context, boardID string, claim 
 		Goal: goal, Task: proposal,
 		AttemptID: claim.AttemptID, WorkerID: scheduler.options.WorkerID,
 		AttemptNumber: attemptNumber,
+		BaseRevision:  claim.Board.IntegratedRevision,
 	}
 
 	started, err := scheduler.apply(ctx, boardID, claim, agoboardprotocol.CommandAttemptStart, func(command *agoboardprotocol.Command) {})
@@ -282,13 +321,75 @@ func (scheduler *Scheduler) dispatch(ctx context.Context, boardID string, claim 
 	if review.Accepted {
 		commandType = agoboardprotocol.CommandEvidenceAccept
 	}
-	_, err = scheduler.applyVerifier(ctx, boardID, claim, submitted.Board.Version, commandType, func(command *agoboardprotocol.Command) {
+	decided, err := scheduler.applyVerifier(ctx, boardID, claim, submitted.Board.Version, commandType, func(command *agoboardprotocol.Command) {
 		command.Evidence = &agoboardprotocol.EvidenceSpec{ID: evidenceID}
 		command.Reason = scheduler.options.Redactor.String(review.Reason)
 		if !review.Accepted {
 			command.FailureClass = rejectionClass(review)
 			command.NextEligibleAt = scheduler.nextEligible(attemptNumber)
 		}
+	})
+	if err != nil || !review.Accepted {
+		return err
+	}
+	// Acceptance is not completion for a change: the patch still has to be
+	// promoted onto the board's own ref, by an authority the worker is not.
+	return scheduler.integrate(ctx, boardID, claim, structured, decided.Board)
+}
+
+// integrate promotes an accepted change and completes the task, or records why
+// it could not be promoted so a repair can be planned.
+func (scheduler *Scheduler) integrate(ctx context.Context, boardID string, claim agoboardstore.ClaimResult, evidence agoboardprotocol.EvidenceResult, board agoboardprotocol.Board) error {
+	if evidence.Patch == nil {
+		// Nothing changed, so acceptance already completed the task.
+		return nil
+	}
+	fail := func(class agoboardprotocol.FailureClass, reason string) error {
+		current, err := scheduler.options.Store.Board(ctx, boardID)
+		if err != nil {
+			return err
+		}
+		_, err = scheduler.options.Store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
+			SchemaVersion: agoboardprotocol.SchemaVersion,
+			ID:            "integration-fail:" + claim.AttemptID, ExpectedVersion: current.Version,
+			Actor: scheduler.coordinator(), Type: agoboardprotocol.CommandIntegrationFail,
+			TaskID: claim.TaskID, FailureClass: class,
+			Reason: scheduler.options.Redactor.String(reason),
+		})
+		return err
+	}
+	if scheduler.options.Integrator == nil || scheduler.options.Artifacts == nil {
+		return fail(agoboardprotocol.FailureRepository, "未配置集成权威，已接受的变更无法应用。")
+	}
+	patch, err := scheduler.options.Artifacts.Bytes(ctx, agoartifact.Descriptor{
+		ID: evidence.Patch.ArtifactID, Bytes: evidence.Patch.Bytes, SHA256: evidence.Patch.SHA256,
+	})
+	if err != nil {
+		return fail(agoboardprotocol.FailureRepository, fmt.Sprintf("无法读取变更补丁：%v", err))
+	}
+	result, err := scheduler.options.Integrator.Integrate(ctx, agointegrate.Request{
+		Repository: board.Repository, IntegrationRef: board.IntegrationRef,
+		CurrentRevision: board.IntegratedRevision, BaseRevision: evidence.Patch.BaseRevision,
+		Patch: patch, TaskID: claim.TaskID, Summary: evidence.Summary,
+	})
+	if err != nil {
+		// A conflict is repairable work, not a reason to force anything.
+		class := agoboardprotocol.FailureRepository
+		if errors.Is(err, agointegrate.ErrConflict) {
+			class = agoboardprotocol.FailureVerifierFeedback
+		}
+		return fail(class, fmt.Sprintf("集成失败：%v", err))
+	}
+	current, err := scheduler.options.Store.Board(ctx, boardID)
+	if err != nil {
+		return err
+	}
+	_, err = scheduler.options.Store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
+		SchemaVersion: agoboardprotocol.SchemaVersion,
+		ID:            "integration:" + claim.AttemptID, ExpectedVersion: current.Version,
+		Actor: scheduler.coordinator(), Type: agoboardprotocol.CommandIntegrationComplete,
+		TaskID: claim.TaskID, Revision: result.Revision,
+		Reason: fmt.Sprintf("已集成到 %s", result.Revision),
 	})
 	return err
 }

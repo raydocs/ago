@@ -97,7 +97,9 @@ type Lease struct {
 	Path         string // absolute path to the isolated worktree
 	Repository   string // canonical repository root it was created from
 	BaseRevision string // commit SHA the worktree started at
-	Branch       string // the throwaway branch name Ago created
+	// Branch is always empty: worktrees are detached so nothing is written to
+	// the repository's ref namespace.
+	Branch string // the throwaway branch name Ago created
 }
 
 // Change describes one repository-relative path modified in a worktree.
@@ -136,11 +138,14 @@ func (m *Manager) Create(ctx context.Context, repositoryRoot, attemptID string) 
 	if _, statErr := os.Stat(path); statErr == nil {
 		return Lease{}, fmt.Errorf("worktree path %q already exists", path)
 	}
-	branch := "ago/" + sanitizeBranchComponent(attemptID) + "-" + id[:12]
 
 	lock := m.lockFor(repo)
 	lock.Lock()
-	_, addErr := runGit(ctx, repo, "worktree", "add", "-b", branch, path, base)
+	// Detached, deliberately: `worktree add -b` writes a real branch into the
+	// user's repository that `worktree remove` does not delete, so every
+	// attempt would permanently pollute their ref namespace. Detaching gives
+	// the same isolation and leaves nothing behind.
+	_, addErr := runGit(ctx, repo, "worktree", "add", "--detach", path, base)
 	lock.Unlock()
 	if addErr != nil {
 		return Lease{}, fmt.Errorf("create worktree: %w", addErr)
@@ -161,7 +166,6 @@ func (m *Manager) Create(ctx context.Context, repositoryRoot, attemptID string) 
 		Path:         path,
 		Repository:   repo,
 		BaseRevision: base,
-		Branch:       branch,
 	}, nil
 }
 
@@ -323,6 +327,50 @@ func pathHasScopePrefix(path, scope string) bool {
 // a caller passing a Lease with a doctored Path must get an error, not a
 // deletion. The canonical repository is only ever asked `git worktree
 // remove`, never touched with a mutating command against its own tree.
+// CreateAt is Create against an explicit starting revision, so a downstream
+// task can begin from work its dependencies already had integrated rather than
+// from the repository's own HEAD.
+func (m *Manager) CreateAt(ctx context.Context, repositoryRoot, attemptID, revision string) (Lease, error) {
+	if strings.TrimSpace(revision) == "" {
+		return m.Create(ctx, repositoryRoot, attemptID)
+	}
+	lease, err := m.Create(ctx, repositoryRoot, attemptID)
+	if err != nil {
+		return Lease{}, err
+	}
+	// Move the isolated copy onto the requested revision. This only ever
+	// touches Ago's own worktree; the canonical tree is untouched.
+	if _, err := runGit(ctx, lease.Path, "checkout", "--detach", revision); err != nil {
+		_ = m.Remove(ctx, lease)
+		return Lease{}, fmt.Errorf("start worktree at %q: %w", revision, err)
+	}
+	resolved, err := runGit(ctx, lease.Path, "rev-parse", "HEAD")
+	if err != nil {
+		_ = m.Remove(ctx, lease)
+		return Lease{}, err
+	}
+	lease.BaseRevision = strings.TrimSpace(string(resolved))
+	return lease, nil
+}
+
+// Patch renders everything the worktree changed as a durable binary-safe patch.
+//
+// It is produced before the worktree is removed and is the only thing that
+// survives it. Binary safety matters because an executor may legitimately
+// change a non-text file, and a patch that silently dropped it would make the
+// evidence a lie.
+func (m *Manager) Patch(ctx context.Context, lease Lease) ([]byte, error) {
+	// Stage everything so new and deleted files appear in the diff too.
+	if _, err := runGit(ctx, lease.Path, "add", "-A"); err != nil {
+		return nil, fmt.Errorf("stage worktree changes: %w", err)
+	}
+	patch, err := runGit(ctx, lease.Path, "diff", "--cached", "--binary", "--no-color", lease.BaseRevision)
+	if err != nil {
+		return nil, fmt.Errorf("render patch: %w", err)
+	}
+	return patch, nil
+}
+
 func (m *Manager) Remove(ctx context.Context, lease Lease) error {
 	if strings.TrimSpace(lease.Path) == "" {
 		return fmt.Errorf("lease has no path")
