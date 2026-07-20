@@ -398,12 +398,28 @@ async function getStats(env: Env): Promise<Response> {
   return json({ stats });
 }
 
+async function resolveCanonicalRoot(sessionID: string, env: Env): Promise<{ rootSessionID: string } | null> {
+  const selected = await env.DB.prepare(
+    "SELECT session_id, root_session_id FROM threads WHERE session_id = ?",
+  ).bind(sessionID).first<{ session_id: string; root_session_id: string | null }>();
+  if (!selected) return null;
+  const rootSessionID = stringValue(selected.root_session_id).trim() || selected.session_id;
+  return { rootSessionID };
+}
+
 async function archiveThread(sessionID: string, env: Env): Promise<Response> {
+  const resolved = await resolveCanonicalRoot(sessionID, env);
+  if (!resolved) return json({ error: "not_found" }, 404);
+
   const result = await env.DB.prepare(`
     UPDATE threads SET state = 'archived', updated_at = ?
     WHERE session_id = ? OR root_session_id = ?
-  `).bind(new Date().toISOString(), sessionID, sessionID).run();
-  return json({ ok: true, changed: result.meta.changes });
+  `).bind(new Date().toISOString(), resolved.rootSessionID, resolved.rootSessionID).run();
+  return json({
+    ok: true,
+    root_session_id: resolved.rootSessionID,
+    changed: Number(result.meta.changes ?? 0),
+  });
 }
 
 async function exportThread(sessionID: string, url: URL, env: Env, format: "json" | "markdown"): Promise<Response> {

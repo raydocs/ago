@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "repository": {
+    "id": "raydocs/ago",
+    "revision": "d79c720"
+  },
+  "objective": {
+    "id": "A-21",
+    "summary": "Implement a bounded objective-to-DAG planner contract."
+  },
+  "tasks": [
+    {
+      "id": "inspect",
+      "title": "Inspect protocol",
+      "description": "Confirm repository protocol conventions.",
+      "path_scopes": [
+        "internal/agoplanner"
+      ],
+      "acceptance_criteria": [
+        "Contract conventions are identified."
+      ],
+      "verifier_ids": [
+        "go-test"
+      ],
+      "capability_tags": [
+        "go"
+      ]
+    },
+    {
+      "id": "contract",
+      "title": "Implement contract",
+      "description": "Define and validate bounded planner proposals.",
+      "path_scopes": [
+        "internal/agoplanner/planner.go"
+      ],
+      "acceptance_criteria": [
+        "Invalid plans fail closed."
+      ],
+      "verifier_ids": [
+        "go-test",
+        "go-vet"
+      ],
+      "capability_tags": [
+        "go"
+      ]
+    },
+    {
+      "id": "test",
+      "title": "Test contract",
+      "description": "Cover valid and invalid DAG proposals.",
+      "path_scopes": [
+        "internal/agoplanner/planner_test.go"
+      ],
+      "acceptance_criteria": [
+        "Golden and invalid fixtures pass."
+      ],
+      "verifier_ids": [
+        "go-test"
+      ],
+      "capability_tags": [
+        "go",
+        "tests"
+      ]
+    },
+    {
+      "id": "vet",
+      "title": "Vet contract",
+      "description": "Statically check the planner package.",
+      "path_scopes": [
+        "internal/agoplanner"
+      ],
+      "acceptance_criteria": [
+        "Go vet reports no findings."
+      ],
+      "verifier_ids": [
+        "go-vet"
+      ],
+      "capability_tags": [
+        "go"
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "task_id": "contract",
+      "depends_on": "inspect"
+    },
+    {
+      "task_id": "test",
+      "depends_on": "contract"
+    },
+    {
+      "task_id": "vet",
+      "depends_on": "contract"
+    }
+  ],
+  "project_gates": [
+    {
+      "id": "project-tests",
+      "title": "Project tests pass",
+      "acceptance_criteria": [
+        "The planner package test suite passes."
+      ],
+      "verifier_ids": [
+        "go-test"
+      ]
+    }
+  ]
+}

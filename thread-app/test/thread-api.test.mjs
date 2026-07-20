@@ -206,3 +206,56 @@ test("Human JSON and Markdown endpoints reuse one descendant-aware graph", async
   const { stats } = await statsResponse.json();
   assert.equal(stats.event_count, 3);
 });
+
+test("archive updates only the canonical root scope and delete is unavailable", async () => {
+  const unrelated = await ingest({
+    session_id: "unrelated-root",
+    root_session_id: "unrelated-root",
+    hook_event_name: "SessionStart",
+    collector: {
+      event_id: "hook-unrelated-start",
+      observed_at: "2026-07-13T20:01:00.000Z",
+      model: "gpt-5.6-sol",
+      role: "supervisor",
+    },
+    graph_events: [],
+    usage_records: [],
+  });
+  assert.equal(unrelated.status, 200);
+
+  const archive = await mf.dispatchFetch("http://local.test/api/threads/child-session/archive", {
+    method: "POST",
+  });
+  assert.equal(archive.status, 200);
+  const body = await archive.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.root_session_id, "root-session");
+  assert.equal(body.changed, 2);
+
+  const root = await db.prepare("SELECT state FROM threads WHERE session_id = ?")
+    .bind("root-session")
+    .first();
+  const child = await db.prepare("SELECT state FROM threads WHERE session_id = ?")
+    .bind("child-session")
+    .first();
+  const other = await db.prepare("SELECT state FROM threads WHERE session_id = ?")
+    .bind("unrelated-root")
+    .first();
+  assert.equal(root.state, "archived");
+  assert.equal(child.state, "archived");
+  assert.equal(other.state, "active");
+
+  const unknown = await mf.dispatchFetch("http://local.test/api/threads/missing-session/archive", {
+    method: "POST",
+  });
+  assert.equal(unknown.status, 404);
+
+  const unavailable = await mf.dispatchFetch("http://local.test/api/threads/unrelated-root", {
+    method: "DELETE",
+  });
+  assert.equal(unavailable.status, 404);
+  const stillThere = await db.prepare("SELECT state FROM threads WHERE session_id = ?")
+    .bind("unrelated-root")
+    .first();
+  assert.equal(stillThere.state, "active");
+});
