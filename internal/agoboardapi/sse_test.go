@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -164,37 +163,19 @@ func createRealBoard(t *testing.T, baseURL, commandID, repoRoot string) goalCrea
 	return created
 }
 
-func driveRealBoardToCompletion(t *testing.T, baseURL, boardID string) boardSnapshot {
-	t.Helper()
-	var snapshot boardSnapshot
-	for i := 0; i < apiMaxAdvanceIterations; i++ {
-		response := realRequest(t, http.MethodPost, baseURL+"/api/v1/boards/"+boardID+"/advance", map[string]any{"command_id": fmt.Sprintf("sse-adv-%d", i)})
-		if response.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(response.Body)
-			response.Body.Close()
-			t.Fatalf("advance[%d] status = %d, body = %s", i, response.StatusCode, body)
-		}
-		decodeResponse(t, response, &snapshot)
-		if snapshot.Completed {
-			return snapshot
-		}
-	}
-	t.Fatalf("board %q did not complete within %d advances: %#v", boardID, apiMaxAdvanceIterations, snapshot.Progress)
-	return snapshot
-}
-
 // -- required test cases ------------------------------------------------------
 
 func TestEventsStreamInOrderAcrossCreateAndAdvance(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "board.db")
-	handler, store := newBoardTestServer(t, dbPath, nil)
+	handler, store, scheduler := newBoardTestServerWithScheduler(t, dbPath, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
 
 	created := createRealBoard(t, httpServer.URL, "sse-order", t.TempDir())
 	boardID := created.Board.BoardID
-	final := driveRealBoardToCompletion(t, httpServer.URL, boardID)
+	driveWithScheduler(t, store, scheduler, boardID)
+	final := snapshotOf(t, handler, boardID)
 	if !final.Completed || final.Progress.Failed != 0 {
 		t.Fatalf("board did not complete cleanly: %#v", final.Progress)
 	}
@@ -233,14 +214,15 @@ func TestEventsStreamInOrderAcrossCreateAndAdvance(t *testing.T) {
 
 func TestReconnectingWithLastEventIDReturnsOnlyLaterEvents(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "board.db")
-	handler, store := newBoardTestServer(t, dbPath, nil)
+	handler, store, scheduler := newBoardTestServerWithScheduler(t, dbPath, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
 
 	created := createRealBoard(t, httpServer.URL, "sse-resume", t.TempDir())
 	boardID := created.Board.BoardID
-	final := driveRealBoardToCompletion(t, httpServer.URL, boardID)
+	driveWithScheduler(t, store, scheduler, boardID)
+	final := snapshotOf(t, handler, boardID)
 	total := int(final.LatestEventSequence)
 	if total < 2 {
 		t.Fatalf("need at least 2 durable events to test resumption, got %d", total)
@@ -270,14 +252,15 @@ func TestReconnectingWithLastEventIDReturnsOnlyLaterEvents(t *testing.T) {
 
 func TestAfterQueryMatchesHeaderAndHeaderWinsOnConflict(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "board.db")
-	handler, store := newBoardTestServer(t, dbPath, nil)
+	handler, store, scheduler := newBoardTestServerWithScheduler(t, dbPath, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
 
 	created := createRealBoard(t, httpServer.URL, "sse-after-param", t.TempDir())
 	boardID := created.Board.BoardID
-	final := driveRealBoardToCompletion(t, httpServer.URL, boardID)
+	driveWithScheduler(t, store, scheduler, boardID)
+	final := snapshotOf(t, handler, boardID)
 	total := int(final.LatestEventSequence)
 	if total < 4 {
 		t.Fatalf("need at least 4 durable events, got %d", total)
@@ -305,14 +288,15 @@ func TestAfterQueryMatchesHeaderAndHeaderWinsOnConflict(t *testing.T) {
 
 func TestReplayingCursorFromZeroDoesNotMutateBoard(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "board.db")
-	handler, store := newBoardTestServer(t, dbPath, nil)
+	handler, store, scheduler := newBoardTestServerWithScheduler(t, dbPath, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
 
 	created := createRealBoard(t, httpServer.URL, "sse-replay-idempotent", t.TempDir())
 	boardID := created.Board.BoardID
-	final := driveRealBoardToCompletion(t, httpServer.URL, boardID)
+	driveWithScheduler(t, store, scheduler, boardID)
+	final := snapshotOf(t, handler, boardID)
 	total := int(final.LatestEventSequence)
 	before := taskIDSet(final)
 
@@ -335,12 +319,13 @@ func TestReplayingCursorFromZeroDoesNotMutateBoard(t *testing.T) {
 
 func TestServerRestartPreservesSSEResumability(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "board.db")
-	handlerA, storeA := newBoardTestServer(t, dbPath, nil)
+	handlerA, storeA, schedulerA := newBoardTestServerWithScheduler(t, dbPath, nil)
 	httpServerA := httptest.NewServer(handlerA)
 
 	created := createRealBoard(t, httpServerA.URL, "sse-restart", t.TempDir())
 	boardID := created.Board.BoardID
-	final := driveRealBoardToCompletion(t, httpServerA.URL, boardID)
+	driveWithScheduler(t, storeA, schedulerA, boardID)
+	final := snapshotOf(t, handlerA, boardID)
 	total := int(final.LatestEventSequence)
 	if total < 2 {
 		t.Fatalf("need at least 2 durable events, got %d", total)
@@ -350,7 +335,7 @@ func TestServerRestartPreservesSSEResumability(t *testing.T) {
 		t.Fatalf("close store A: %v", err)
 	}
 
-	handlerB, storeB := newBoardTestServer(t, dbPath, nil)
+	handlerB, storeB, _ := newBoardTestServerWithScheduler(t, dbPath, nil)
 	t.Cleanup(func() { _ = storeB.Close() })
 	httpServerB := httptest.NewServer(handlerB)
 	t.Cleanup(httpServerB.Close)
@@ -369,7 +354,7 @@ func TestServerRestartPreservesSSEResumability(t *testing.T) {
 
 func TestMalformedCursorReturns400(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "board.db")
-	handler, store := newBoardTestServer(t, dbPath, nil)
+	handler, store, _ := newBoardTestServerWithScheduler(t, dbPath, nil)
 	t.Cleanup(func() { _ = store.Close() })
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)

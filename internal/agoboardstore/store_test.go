@@ -149,7 +149,7 @@ func TestRenewAndExpireAreDurableIdempotentAndScheduleBoundedRetry(t *testing.T)
 		t.Fatal(err)
 	}
 	renewedExpiry := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Nanosecond)
-	renew := LeaseCommand{ID: "renew", ExpectedVersion: acquired.Board.Version, Actor: coordinator(), BoardID: board.ID, LeaseID: "lease", ExpiresAt: renewedExpiry}
+	renew := LeaseCommand{ID: "renew", ExpectedVersion: acquired.Board.Version, Actor: coordinator(), BoardID: board.ID, LeaseID: "lease", ExpiresAt: renewedExpiry, FencingToken: "token-attempt"}
 	renewed, err := store.RenewLease(ctx, renew)
 	if err != nil {
 		t.Fatal(err)

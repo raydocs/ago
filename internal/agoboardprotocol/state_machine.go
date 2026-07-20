@@ -366,9 +366,11 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		if !found || lease.State != LeaseActive {
 			return current, nil, fmt.Errorf("active lease %q not found", command.Lease.ID)
 		}
-		// Renewal is fenced too: a superseded generation must not be able to
-		// keep a lease alive past its supersession.
-		if command.Lease.FencingToken != "" && command.Lease.FencingToken != lease.FencingToken {
+		// Renewal is fenced: only the current generation may keep a lease alive.
+		// A lease migrated from schema 1 has no token and so cannot be renewed
+		// at all, which is the conservative outcome for work whose executor
+		// predates fencing.
+		if lease.FencingToken == "" || command.Lease.FencingToken != lease.FencingToken {
 			return current, nil, fmt.Errorf("fencing token does not authorize lease %q", command.Lease.ID)
 		}
 		if !command.Lease.ExpiresAt.After(lease.ExpiresAt) && !lease.ExpiresAt.IsZero() {

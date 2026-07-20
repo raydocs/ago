@@ -75,6 +75,8 @@ type LeaseCommand struct {
 	// They are ignored by a renewal.
 	FailureClass   agoboardprotocol.FailureClass `json:"failure_class,omitempty"`
 	NextEligibleAt time.Time                     `json:"next_eligible_at,omitempty"`
+	// FencingToken authorizes a renewal. Only the lease's current token works.
+	FencingToken string `json:"fencing_token,omitempty"`
 }
 
 func Open(path string) (*Store, error) {
@@ -101,6 +103,10 @@ func sqliteDSN(path string) string {
 	pragmas.Add("_pragma", "foreign_keys(ON)")
 	pragmas.Add("_pragma", "busy_timeout(5000)")
 	pragmas.Add("_pragma", "synchronous(FULL)")
+	// Every transaction takes the write lock on BEGIN. Claim transactions count
+	// concurrency slots and then act on the count, so a deferred lock would let
+	// two schedulers both observe a free slot and both fill it.
+	pragmas.Add("_txlock", "immediate")
 	return path + separator + pragmas.Encode()
 }
 
@@ -740,10 +746,22 @@ func (s *Store) mutateLease(ctx context.Context, command LeaseCommand, expire bo
 	if command.ID == "" || command.BoardID == "" || command.LeaseID == "" || command.Actor.ID == "" || command.Actor.Role != agoboardprotocol.RoleCoordinator {
 		return Result{}, false, fmt.Errorf("valid coordinator lease command is required")
 	}
+	// The hash covers only durable identity. NextEligibleAt and ExpectedVersion
+	// are per-process readings: including them made two schedulers reconciling
+	// the same lease produce different hashes for the same decision, so the
+	// loser hit a command conflict before reaching the CAS that is meant to
+	// turn it into a silent no-op, aborting the rest of the sweep.
 	hash, _ := requestHash(struct {
-		Command LeaseCommand `json:"command"`
-		Expire  bool         `json:"expire"`
-	}{command, expire})
+		ID        string                        `json:"id"`
+		BoardID   string                        `json:"board_id"`
+		LeaseID   string                        `json:"lease_id"`
+		Actor     agoboardprotocol.Actor        `json:"actor"`
+		Expire    bool                          `json:"expire"`
+		Token     string                        `json:"fencing_token,omitempty"`
+		ExpiresAt time.Time                     `json:"expires_at,omitempty"`
+		Reason    string                        `json:"reason,omitempty"`
+		Class     agoboardprotocol.FailureClass `json:"failure_class,omitempty"`
+	}{command.ID, command.BoardID, command.LeaseID, command.Actor, expire, command.FencingToken, command.ExpiresAt, command.Reason, command.FailureClass})
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Result{}, false, err
@@ -752,7 +770,10 @@ func (s *Store) mutateLease(ctx context.Context, command LeaseCommand, expire bo
 	if result, found, err := storedResult(ctx, tx, command.Actor.ID, command.ID, hash); err != nil {
 		return Result{}, false, err
 	} else if found {
-		return result, true, nil
+		// The recorded outcome is returned, but this caller did not produce it.
+		// Reporting a replay as fresh would let a second reconcile sweep count
+		// expiries it did not perform.
+		return result, false, nil
 	}
 	board, err := boardTx(ctx, tx, command.BoardID)
 	if err != nil {
@@ -782,8 +803,12 @@ func (s *Store) mutateLease(ctx context.Context, command LeaseCommand, expire bo
 	// schema 3 this function edited the board by hand, which meant lease expiry
 	// silently skipped fencing supersession and retry accounting.
 	protocolType := agoboardprotocol.CommandLeaseRenew
+	nextEligibleAt := command.NextEligibleAt
 	if expire {
 		protocolType = agoboardprotocol.CommandLeaseExpire
+		// Derived from committed state only, so every scheduler reconciling
+		// this lease computes the identical deadline.
+		nextEligibleAt = durableRetryDeadline(board, command.LeaseID)
 	}
 	next, events, err := agoboardprotocol.Apply(board, agoboardprotocol.Command{
 		SchemaVersion:   agoboardprotocol.SchemaVersion,
@@ -791,10 +816,10 @@ func (s *Store) mutateLease(ctx context.Context, command LeaseCommand, expire bo
 		ExpectedVersion: board.Version,
 		Actor:           command.Actor,
 		Type:            protocolType,
-		Lease:           &agoboardprotocol.LeaseSpec{ID: command.LeaseID, ExpiresAt: command.ExpiresAt},
+		Lease:           &agoboardprotocol.LeaseSpec{ID: command.LeaseID, ExpiresAt: command.ExpiresAt, FencingToken: command.FencingToken},
 		Reason:          command.Reason,
 		FailureClass:    command.FailureClass,
-		NextEligibleAt:  command.NextEligibleAt,
+		NextEligibleAt:  nextEligibleAt,
 	})
 	if err != nil {
 		return Result{}, false, err
@@ -819,8 +844,10 @@ func (s *Store) mutateLease(ctx context.Context, command LeaseCommand, expire bo
 }
 
 // ExpireDueLeases durably expires all leases whose deadlines are at or before
-// now. Each expiry has a deterministic command identity, making crash retries
-// harmless. The returned results are ordered by lease ID.
+// now. Each expiry has a deterministic command identity computed from durable
+// state alone, so concurrent sweeps agree and crash retries are harmless. The
+// returned results contain only the expiries this call performed; a sweep that
+// loses a race reports nothing rather than failing.
 func (s *Store) ExpireDueLeases(ctx context.Context, now time.Time, actor agoboardprotocol.Actor) ([]Result, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT board_id,lease_id,expires_at FROM leases WHERE state='active' AND expires_at>0 AND expires_at<=? ORDER BY board_id,lease_id`, now.UTC().UnixNano())
 	if err != nil {
@@ -848,26 +875,11 @@ func (s *Store) ExpireDueLeases(ctx context.Context, now time.Time, actor agoboa
 		if err != nil {
 			return nil, err
 		}
-		// The retry decision is computed from durable state, so two schedulers
-		// reconciling the same lease reach the same next-eligible time and the
-		// idempotency receipt absorbs the loser.
-		attemptNumber := 0
-		for _, lease := range board.Leases {
-			if lease.ID != d.lease {
-				continue
-			}
-			for _, task := range board.Tasks {
-				if task.ID == lease.TaskID {
-					attemptNumber = task.AttemptCount
-				}
-			}
-		}
 		identity := expiryCommandID(d.board, d.lease, d.expiry)
 		result, expired, err := s.mutateLease(ctx, LeaseCommand{
 			ID: identity, ExpectedVersion: board.Version, Actor: actor, BoardID: d.board, LeaseID: d.lease,
-			Reason:         "lease deadline elapsed",
-			FailureClass:   agoboardprotocol.FailureTransient,
-			NextEligibleAt: now.UTC().Add(agoboardprotocol.RetryDelay(attemptNumber)),
+			Reason:       "lease deadline elapsed",
+			FailureClass: agoboardprotocol.FailureTransient,
 		}, true, &d.expiry)
 		if err != nil {
 			return nil, err
@@ -1026,4 +1038,26 @@ func insertResult(ctx context.Context, tx *sql.Tx, actor, id string, hash []byte
 	encoded, _ := json.Marshal(result)
 	_, err := tx.ExecContext(ctx, `INSERT INTO commands VALUES(?,?,?,?,?)`, actor, id, hash, boardID, encoded)
 	return err
+}
+
+// durableRetryDeadline computes when a reclaimed task may be retried, using
+// only committed state. Two schedulers reconciling the same lease therefore
+// reach the same answer, which is what lets the idempotency receipt absorb the
+// loser instead of rejecting it.
+func durableRetryDeadline(board agoboardprotocol.Board, leaseID string) time.Time {
+	for _, lease := range board.Leases {
+		if lease.ID != leaseID {
+			continue
+		}
+		for _, task := range board.Tasks {
+			if task.ID == lease.TaskID {
+				base := lease.ExpiresAt
+				if base.IsZero() {
+					base = lease.AcquiredAt
+				}
+				return base.UTC().Add(agoboardprotocol.RetryDelay(task.AttemptCount))
+			}
+		}
+	}
+	return time.Time{}
 }

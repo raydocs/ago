@@ -4,12 +4,10 @@ package agoboardruntime
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +44,9 @@ type ExecutionResult struct {
 type Review struct {
 	Accepted bool   `json:"accepted"`
 	Reason   string `json:"reason"`
+	// FailureClass lets a verifier distinguish actionable feedback from a
+	// terminal stop. An empty value on a rejection means retryable feedback.
+	FailureClass agoboardprotocol.FailureClass `json:"failure_class,omitempty"`
 }
 
 type Executor interface {
@@ -103,21 +104,22 @@ type project struct {
 }
 
 type Runtime struct {
-	store    *agoboardstore.Store
-	planner  agoplanner.Planner
-	executor Executor
-	verifier Verifier
-	options  Options
+	store   *agoboardstore.Store
+	planner agoplanner.Planner
+	options Options
 
 	mu       sync.RWMutex
 	projects map[string]project
 }
 
-func New(store *agoboardstore.Store, planner agoplanner.Planner, executor Executor, verifier Verifier, options Options) *Runtime {
+// New builds the goal-admission runtime. It takes no executor or verifier:
+// running work belongs to internal/agoscheduler, and holding them here would
+// invite a second dispatch path.
+func New(store *agoboardstore.Store, planner agoplanner.Planner, options Options) *Runtime {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
-	return &Runtime{store: store, planner: planner, executor: executor, verifier: verifier, options: options, projects: make(map[string]project)}
+	return &Runtime{store: store, planner: planner, options: options, projects: make(map[string]project)}
 }
 
 func (runtime *Runtime) Create(ctx context.Context, goal Goal) (BoardView, error) {
@@ -193,170 +195,9 @@ func (runtime *Runtime) Create(ctx context.Context, goal Goal) (BoardView, error
 	return projectBoard(result.Board), nil
 }
 
-// Tick claims and runs at most one ready task using deterministic per-attempt
-// command identities.
-func (runtime *Runtime) Tick(ctx context.Context, boardID string) (BoardView, error) {
-	return runtime.tick(ctx, boardID, "")
-}
-
-// TickOnce is Tick under a caller-supplied idempotency key.
-//
-// The key is checked against its durable command receipt before any task is
-// selected, so replaying a key never claims a second task even after the first
-// claim has already completed and a different task has become ready. Reusing a
-// key against another board is reported as a conflict rather than silently
-// advancing the wrong graph.
-//
-// A key becomes durable only once it actually claims a task, so replaying a key
-// whose first use found nothing ready may claim a task later. The guarantee is
-// that one key claims at most one task, not that a key is pinned to an instant.
-func (runtime *Runtime) TickOnce(ctx context.Context, boardID, idempotencyKey string) (BoardView, error) {
-	if strings.TrimSpace(idempotencyKey) == "" {
-		return BoardView{}, fmt.Errorf("idempotency key is required")
-	}
-	return runtime.tick(ctx, boardID, idempotencyKey)
-}
-
-func (runtime *Runtime) tick(ctx context.Context, boardID, idempotencyKey string) (BoardView, error) {
-	if err := runtime.validate(); err != nil {
-		return BoardView{}, err
-	}
-	acquireCommandID := ""
-	if idempotencyKey != "" {
-		// The command identity deliberately excludes the board so that reusing
-		// one key across boards collides here instead of claiming twice.
-		acquireCommandID = stableID("command", "advance", idempotencyKey)
-		recorded, found, err := runtime.store.CommandResult(ctx, runtime.options.CoordinatorID, acquireCommandID)
-		if err != nil {
-			return BoardView{}, fmt.Errorf("read advance receipt: %w", err)
-		}
-		if found {
-			if recorded.Board.ID != boardID {
-				return BoardView{}, fmt.Errorf("advance key %q already claimed work on board %q: %w", idempotencyKey, recorded.Board.ID, agoboardstore.ErrCommandConflict)
-			}
-			// This key already claimed a task. Report current durable state
-			// without selecting or dispatching anything further.
-			return runtime.View(ctx, boardID)
-		}
-	}
-	project, ok := runtime.project(boardID)
-	if !ok {
-		if err := runtime.store.Definition(ctx, boardID, &project); err != nil {
-			return BoardView{}, fmt.Errorf("recover board definition: %w", err)
-		}
-		runtime.mu.Lock()
-		runtime.projects[boardID] = project
-		runtime.mu.Unlock()
-	}
-	board, err := runtime.store.Board(ctx, boardID)
-	if err != nil {
-		return BoardView{}, err
-	}
-	task, proposal, found := firstReady(board, project.Plan)
-	if !found {
-		return projectBoard(board), nil
-	}
-	attemptNumber := 1
-	for _, attempt := range board.Attempts {
-		if attempt.TaskID == task.ID {
-			attemptNumber++
-		}
-	}
-	attemptID := stableID("attempt", boardID, task.ID, strconv.Itoa(attemptNumber))
-	leaseID := stableID("lease", boardID, task.ID, strconv.Itoa(attemptNumber))
-	now := runtime.options.Now().UTC()
-	// A fencing token must be unguessable, or a superseded executor could forge
-	// authority over the attempt that replaced it. Randomness is safe for
-	// replay because the durable receipt is consulted before a token is minted:
-	// a repeated claim returns the recorded result instead of re-deriving one.
-	fencingToken, err := newFencingToken()
-	if err != nil {
-		return BoardView{}, err
-	}
-	if acquireCommandID == "" {
-		acquireCommandID = stableID("command", boardID, "acquire", task.ID, strconv.Itoa(attemptNumber))
-	}
-	acquired, fresh, err2 := runtime.store.AcquireLeaseBoardOnce(ctx, boardID, agoboardprotocol.Command{
-		SchemaVersion: agoboardprotocol.SchemaVersion,
-		ID:            acquireCommandID, ExpectedVersion: board.Version,
-		Actor: runtime.coordinator(), Type: agoboardprotocol.CommandLeaseAcquire,
-		Lease: &agoboardprotocol.LeaseSpec{
-			ID: leaseID, TaskID: task.ID, AttemptID: attemptID, WorkerID: runtime.options.WorkerID,
-			FencingToken: fencingToken, AcquiredAt: now, ExpiresAt: now.Add(runtime.options.LeaseDuration),
-		},
-	}, now.Add(runtime.options.LeaseDuration), nil)
-	if err := err2; err != nil {
-		latest, readErr := runtime.store.Board(ctx, boardID)
-		if readErr == nil && !taskIsReady(latest, task.ID) {
-			return projectBoard(latest), nil
-		}
-		return BoardView{}, fmt.Errorf("claim task %q: %w", task.ID, err)
-	}
-	if !fresh {
-		latest, readErr := runtime.store.Board(ctx, boardID)
-		if readErr != nil {
-			return BoardView{}, readErr
-		}
-		return projectBoard(latest), nil
-	}
-	started, err := runtime.store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
-		SchemaVersion: agoboardprotocol.SchemaVersion,
-		ID:            stableID("command", boardID, "start", attemptID), ExpectedVersion: acquired.Board.Version, FencingToken: fencingToken,
-		Actor: runtime.worker(), Type: agoboardprotocol.CommandAttemptStart, TaskID: task.ID, AttemptID: attemptID,
-	})
-	if err != nil {
-		return BoardView{}, fmt.Errorf("start attempt %q: %w", attemptID, err)
-	}
-	dispatch := Dispatch{Goal: cloneGoal(project.Goal), Task: cloneTask(proposal), AttemptID: attemptID, WorkerID: runtime.options.WorkerID}
-	evidence, executionErr := runtime.executor.Execute(ctx, dispatch)
-	if executionErr != nil || strings.TrimSpace(evidence.Artifact) == "" || strings.TrimSpace(evidence.Summary) == "" {
-		reason := "executor returned incomplete evidence"
-		if executionErr != nil {
-			reason = executionErr.Error()
-		}
-		failed, failErr := runtime.store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
-			SchemaVersion: agoboardprotocol.SchemaVersion,
-			ID:            stableID("command", boardID, "fail", attemptID), ExpectedVersion: started.Board.Version, FencingToken: fencingToken,
-			FailureClass: agoboardprotocol.FailureTransient, NextEligibleAt: now.Add(agoboardprotocol.RetryDelay(attemptNumber)),
-			Actor: runtime.worker(), Type: agoboardprotocol.CommandAttemptFail,
-			TaskID: task.ID, AttemptID: attemptID, Reason: reason,
-		})
-		if failErr != nil {
-			return BoardView{}, fmt.Errorf("record executor failure: %w", failErr)
-		}
-		return projectBoard(failed.Board), nil
-	}
-	evidenceID := stableID("evidence", boardID, attemptID)
-	submitted, err := runtime.store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
-		SchemaVersion: agoboardprotocol.SchemaVersion,
-		ID:            stableID("command", boardID, "submit-evidence", attemptID), ExpectedVersion: started.Board.Version, FencingToken: fencingToken,
-		Actor: runtime.worker(), Type: agoboardprotocol.CommandEvidenceSubmit,
-		TaskID: task.ID, AttemptID: attemptID,
-		Evidence: &agoboardprotocol.EvidenceSpec{ID: evidenceID, TaskID: task.ID, AttemptID: attemptID, Artifact: evidence.Artifact, Summary: evidence.Summary},
-	})
-	if err != nil {
-		return BoardView{}, fmt.Errorf("submit evidence: %w", err)
-	}
-	review, err := runtime.verifier.Verify(ctx, dispatch, evidence)
-	if err != nil {
-		return projectBoard(submitted.Board), fmt.Errorf("verify evidence: %w", err)
-	}
-	commandType := agoboardprotocol.CommandEvidenceReject
-	if review.Accepted {
-		commandType = agoboardprotocol.CommandEvidenceAccept
-	}
-	decided, err := runtime.store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
-		SchemaVersion: agoboardprotocol.SchemaVersion,
-		ID:            stableID("command", boardID, "review", attemptID), ExpectedVersion: submitted.Board.Version, FencingToken: fencingToken,
-		FailureClass: agoboardprotocol.FailureVerifierFeedback, NextEligibleAt: now.Add(agoboardprotocol.RetryDelay(attemptNumber)),
-		Actor: runtime.verifierActor(), Type: commandType,
-		TaskID: task.ID, AttemptID: attemptID, Evidence: &agoboardprotocol.EvidenceSpec{ID: evidenceID}, Reason: review.Reason,
-	})
-	if err != nil {
-		return BoardView{}, fmt.Errorf("record evidence review: %w", err)
-	}
-	return projectBoard(decided.Board), nil
-}
+// Scheduling lives in internal/agoscheduler. The runtime deliberately exposes
+// no claim or dispatch entry point: a second scheduling authority here is how
+// duplicate dispatch and unbounded retry get reintroduced.
 
 // Definition returns the immutable goal and plan admitted with a board,
 // recovering them from the durable store when this process did not create it.
@@ -388,8 +229,8 @@ func (runtime *Runtime) Completion(ctx context.Context, boardID string) (agoboar
 }
 
 func (runtime *Runtime) validate() error {
-	if runtime == nil || runtime.store == nil || runtime.planner == nil || runtime.executor == nil || runtime.verifier == nil {
-		return fmt.Errorf("board store, planner, executor, and verifier are required")
+	if runtime == nil || runtime.store == nil || runtime.planner == nil {
+		return fmt.Errorf("board store and planner are required")
 	}
 	if strings.TrimSpace(runtime.options.CoordinatorID) == "" || strings.TrimSpace(runtime.options.WorkerID) == "" || strings.TrimSpace(runtime.options.VerifierID) == "" {
 		return fmt.Errorf("coordinator, worker, and verifier identities are required")
@@ -453,29 +294,6 @@ func columnForState(state agoboardprotocol.TaskState) Column {
 	}
 }
 
-func firstReady(board agoboardprotocol.Board, plan agoplanner.Plan) (agoboardprotocol.Task, agoplanner.TaskProposal, bool) {
-	proposals := make(map[string]agoplanner.TaskProposal, len(plan.Tasks))
-	for _, proposal := range plan.Tasks {
-		proposals[proposal.ID] = proposal
-	}
-	for _, task := range board.Tasks {
-		if task.State == agoboardprotocol.TaskReady {
-			proposal, found := proposals[task.ID]
-			return task, proposal, found
-		}
-	}
-	return agoboardprotocol.Task{}, agoplanner.TaskProposal{}, false
-}
-
-func taskIsReady(board agoboardprotocol.Board, taskID string) bool {
-	for _, task := range board.Tasks {
-		if task.ID == taskID {
-			return task.State == agoboardprotocol.TaskReady
-		}
-	}
-	return false
-}
-
 func stableID(namespace string, parts ...string) string {
 	encoded, _ := json.Marshal(parts)
 	digest := sha256.Sum256(encoded)
@@ -513,13 +331,4 @@ func accessModeFor(proposal agoplanner.TaskProposal) agoboardprotocol.AccessMode
 		}
 	}
 	return agoboardprotocol.AccessRead
-}
-
-// newFencingToken returns an unpredictable single-use credential.
-func newFencingToken() (string, error) {
-	buffer := make([]byte, 32)
-	if _, err := rand.Read(buffer); err != nil {
-		return "", fmt.Errorf("generate fencing token: %w", err)
-	}
-	return hex.EncodeToString(buffer), nil
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +17,7 @@ import (
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agoplanner"
+	"claudexflow/internal/agoscheduler"
 )
 
 const (
@@ -37,12 +37,19 @@ const (
 // lifecycle (Close it, possibly early for restart tests) so it is not
 // registered with t.Cleanup here.
 func newBoardTestServer(t *testing.T, dbPath string, providers []agoboardapi.Provider) (http.Handler, *agoboardstore.Store) {
+	handler, store, _ := newBoardTestServerWithScheduler(t, dbPath, providers)
+	return handler, store
+}
+
+// newBoardTestServerWithScheduler also returns the scheduler that advances the
+// board. There is no manual advance endpoint: progress comes from scheduling.
+func newBoardTestServerWithScheduler(t *testing.T, dbPath string, providers []agoboardapi.Provider) (http.Handler, *agoboardstore.Store, *agoscheduler.Scheduler) {
 	t.Helper()
 	store, err := agoboardstore.Open(dbPath)
 	if err != nil {
 		t.Fatalf("agoboardstore.Open(%q): %v", dbPath, err)
 	}
-	runtime := agoboardruntime.New(store, agoplanner.DemoPlanner{}, &fakeAPIExecutor{}, &fakeAPIVerifier{}, agoboardruntime.Options{
+	runtime := agoboardruntime.New(store, agoplanner.DemoPlanner{}, agoboardruntime.Options{
 		CoordinatorID: apiCoordinatorID,
 		WorkerID:      apiWorkerID,
 		VerifierID:    apiVerifierID,
@@ -61,7 +68,37 @@ func newBoardTestServer(t *testing.T, dbPath string, providers []agoboardapi.Pro
 	if err != nil {
 		t.Fatalf("agoboardapi.New: %v", err)
 	}
-	return server.Handler(), store
+	scheduler, err := agoscheduler.New(agoscheduler.Options{
+		Store: store, Runtime: runtime, Executor: &fakeAPIExecutor{}, Verifier: &fakeAPIVerifier{},
+		CoordinatorID: apiCoordinatorID, WorkerID: apiWorkerID, VerifierID: apiVerifierID,
+		LeaseDuration: time.Minute,
+		Now:           func() time.Time { return time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC) },
+	})
+	if err != nil {
+		t.Fatalf("agoscheduler.New: %v", err)
+	}
+	return server.Handler(), store, scheduler
+}
+
+// driveWithScheduler advances a board the way production does, by running
+// scheduler cycles until the graph stops changing.
+func driveWithScheduler(t *testing.T, store *agoboardstore.Store, scheduler *agoscheduler.Scheduler, boardID string) {
+	t.Helper()
+	ctx := context.Background()
+	previous := uint64(0)
+	for range apiMaxAdvanceIterations {
+		if _, err := scheduler.RunOnce(ctx); err != nil {
+			t.Fatalf("scheduler cycle: %v", err)
+		}
+		board, err := store.Board(ctx, boardID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if board.Version == previous {
+			return
+		}
+		previous = board.Version
+	}
 }
 
 // fakeAPIExecutor deterministically "executes" every dispatched task so the
@@ -232,23 +269,15 @@ func decodeInto(t *testing.T, recorder *httptest.ResponseRecorder, target any) {
 	}
 }
 
-// driveRecorderBoardToCompletion issues advance calls (each with a distinct
-// command_id) until the board reports completed, bounded so a stuck runtime
-// fails the test instead of hanging.
-func driveRecorderBoardToCompletion(t *testing.T, handler http.Handler, boardID string) boardSnapshot {
+// snapshotOf reads the current board projection over HTTP.
+func snapshotOf(t *testing.T, handler http.Handler, boardID string) boardSnapshot {
 	t.Helper()
-	var snapshot boardSnapshot
-	for i := 0; i < apiMaxAdvanceIterations; i++ {
-		response := doRequest(t, handler, http.MethodPost, "/api/v1/boards/"+boardID+"/advance", map[string]any{"command_id": fmt.Sprintf("adv-%d", i)})
-		if response.Code != http.StatusOK {
-			t.Fatalf("advance[%d] status = %d, body = %s", i, response.Code, response.Body.String())
-		}
-		decodeInto(t, response, &snapshot)
-		if snapshot.Completed {
-			return snapshot
-		}
+	response := doRequest(t, handler, http.MethodGet, "/api/v1/boards/"+boardID, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("snapshot status = %d, body = %s", response.Code, response.Body.String())
 	}
-	t.Fatalf("board %q did not complete within %d advances: %#v", boardID, apiMaxAdvanceIterations, snapshot.Progress)
+	var snapshot boardSnapshot
+	decodeInto(t, response, &snapshot)
 	return snapshot
 }
 
@@ -435,7 +464,7 @@ func TestSnapshotHasCanonicalColumnsAndDependencyEdgesReflectedInTasks(t *testin
 
 func TestTaskDetailReturnsContractScopesAndAttemptsAfterAdvance(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "board.db")
-	handler, store := newBoardTestServer(t, dbPath, nil)
+	handler, store, scheduler := newBoardTestServerWithScheduler(t, dbPath, nil)
 	t.Cleanup(func() { _ = store.Close() })
 
 	created := doRequest(t, handler, http.MethodPost, "/api/v1/goals", goalBody("cmd-task-detail", chineseDemoObjective, t.TempDir()))
@@ -446,7 +475,8 @@ func TestTaskDetailReturnsContractScopesAndAttemptsAfterAdvance(t *testing.T) {
 	decodeInto(t, created, &createdResponse)
 	boardID := createdResponse.Board.BoardID
 
-	final := driveRecorderBoardToCompletion(t, handler, boardID)
+	driveWithScheduler(t, store, scheduler, boardID)
+	final := snapshotOf(t, handler, boardID)
 	if !final.Completed || final.Progress.Failed != 0 {
 		t.Fatalf("board did not complete cleanly: %#v", final.Progress)
 	}
@@ -573,8 +603,8 @@ func TestNoProviderSecretLeaksAcrossEndpoints(t *testing.T) {
 	taskResponse := doRequest(t, handler, http.MethodGet, "/api/v1/boards/"+boardID+"/tasks/"+probeTaskID, nil)
 	assertNoSentinelLeak(t, taskResponse)
 
-	advanceResponse := doRequest(t, handler, http.MethodPost, "/api/v1/boards/"+boardID+"/advance", map[string]any{"command_id": "adv-secret"})
-	assertNoSentinelLeak(t, advanceResponse)
+	pauseResponse := doRequest(t, handler, http.MethodPost, "/api/v1/boards/"+boardID+"/pause", map[string]any{"command_id": "pause-secret", "reason": "用户暂停"})
+	assertNoSentinelLeak(t, pauseResponse)
 
 	providersResponseRecorder := doRequest(t, handler, http.MethodGet, "/api/v1/providers", nil)
 	assertNoSentinelLeak(t, providersResponseRecorder)

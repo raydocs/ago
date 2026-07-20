@@ -2,7 +2,6 @@ package agoboardruntime
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -13,167 +12,153 @@ import (
 	"claudexflow/internal/agoplanner"
 )
 
-func TestChineseGoalRunsThroughBoardClaimEvidenceAndIndependentReview(t *testing.T) {
-	runtime, store, executor, verifier := newFixtureRuntime(t)
+// The runtime owns goal admission and durable definition recovery. Claiming,
+// dispatch, retry, and verification moved to internal/agoscheduler, which is
+// where those behaviours are now tested; keeping a second scheduling entry
+// point here is what this package deliberately no longer has.
+
+func TestChineseGoalIsAdmittedAsADurableGraph(t *testing.T) {
+	runtime, store := newFixtureRuntime(t)
 	goal, plan := fixtureGoalAndPlan()
 	runtime.planner = agoplanner.FixturePlanner{Proposal: plan}
 
-	created, err := runtime.Create(context.Background(), goal)
+	view, err := runtime.Create(context.Background(), goal)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	assertOnlyTaskInColumn(t, created, ColumnReady)
-
-	completed, err := runtime.Tick(context.Background(), goal.BoardID)
-	if err != nil {
-		t.Fatalf("Tick: %v", err)
-	}
-	assertOnlyTaskInColumn(t, completed, ColumnDone)
-	if executor.dispatch.Goal.Objective.Summary != goal.Objective.Summary || verifier.dispatch.Goal.Objective.Summary != goal.Objective.Summary {
-		t.Fatalf("Chinese objective changed: executor=%q verifier=%q", executor.dispatch.Goal.Objective.Summary, verifier.dispatch.Goal.Objective.Summary)
-	}
-	if !reflect.DeepEqual(executor.dispatch.Task, plan.Tasks[0]) {
-		t.Fatalf("executor task = %#v, want full proposal %#v", executor.dispatch.Task, plan.Tasks[0])
-	}
-	completion, err := runtime.Completion(context.Background(), goal.BoardID)
-	if err != nil || completion.Status != agoboardstore.CompletionPassed {
-		t.Fatalf("Completion = %#v, %v", completion, err)
-	}
-	events, err := store.Replay(context.Background(), goal.BoardID, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantTypes := []agoboardprotocol.EventType{
-		agoboardprotocol.EventBoardCreated,
-		agoboardprotocol.EventTaskAdded,
-		agoboardprotocol.EventTaskStateChanged,
-		agoboardprotocol.EventLeaseAcquired,
-		agoboardprotocol.EventAttemptStateChanged,
-		agoboardprotocol.EventEvidenceSubmitted,
-		agoboardprotocol.EventEvidenceAccepted,
-	}
-	gotTypes := make([]agoboardprotocol.EventType, len(events))
-	for index := range events {
-		gotTypes[index] = events[index].Type
-	}
-	if !reflect.DeepEqual(gotTypes, wantTypes) {
-		t.Fatalf("event order = %#v, want %#v", gotTypes, wantTypes)
-	}
-}
-
-// A first rejection earns a bounded retry rather than stopping the task: the
-// verifier's feedback is retryable and the attempt budget is not yet spent.
-func TestVerifierRejectionSchedulesBoundedRetryBeforeStopping(t *testing.T) {
-	runtime, store, _, verifier := newFixtureRuntime(t)
-	goal, plan := fixtureGoalAndPlan()
-	runtime.planner = agoplanner.FixturePlanner{Proposal: plan}
-	verifier.review = Review{Accepted: false, Reason: "验收标准未满足"}
-	if _, err := runtime.Create(context.Background(), goal); err != nil {
-		t.Fatal(err)
-	}
-	view, err := runtime.Tick(context.Background(), goal.BoardID)
-	if err != nil {
-		t.Fatalf("Tick: %v", err)
-	}
-	// Retry-wait projects onto Blocked so the user sees a stop with a countdown.
-	assertOnlyTaskInColumn(t, view, ColumnBlocked)
+	assertOnlyTaskInColumn(t, view, ColumnReady)
 
 	board, err := store.Board(context.Background(), goal.BoardID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	task := board.Tasks[0]
-	if task.State != agoboardprotocol.TaskRetryWait {
-		t.Fatalf("task state = %q, want %q", task.State, agoboardprotocol.TaskRetryWait)
+	if board.Title != goal.Objective.Summary {
+		t.Fatalf("board title = %q, want the Chinese objective unchanged", board.Title)
 	}
-	if task.AttemptCount != 1 || task.FailureClass != agoboardprotocol.FailureVerifierFeedback {
-		t.Fatalf("retry accounting = attempts %d class %q", task.AttemptCount, task.FailureClass)
+	if board.Repository != goal.Repository.ID {
+		t.Fatalf("board repository = %q, want %q", board.Repository, goal.Repository.ID)
 	}
-	if task.NextEligibleAt.IsZero() {
-		t.Fatal("a retry-wait task must carry a durable next eligible time")
+	if board.NextGeneration != 1 {
+		t.Fatalf("a new board must start its fencing counter at 1, got %d", board.NextGeneration)
 	}
-	// The work is not finished and not failed: it is waiting.
-	completion, err := runtime.Completion(context.Background(), goal.BoardID)
-	if err != nil || completion.Status != agoboardstore.CompletionInProgress || completion.Remaining != 1 {
-		t.Fatalf("Completion = %#v, %v", completion, err)
+	if board.Paused {
+		t.Fatal("a new board must not start paused")
+	}
+	for _, task := range board.Tasks {
+		if task.AccessMode == "" {
+			t.Fatalf("task %q was admitted without an access mode", task.ID)
+		}
+		if task.AttemptCount != 0 {
+			t.Fatalf("task %q was admitted with %d attempts", task.ID, task.AttemptCount)
+		}
 	}
 }
 
-func TestExecutorFailureProjectsBlockedWithoutCallingVerifier(t *testing.T) {
-	runtime, _, executor, verifier := newFixtureRuntime(t)
+func TestGraphAdmissionIsIdempotentForTheSameGoal(t *testing.T) {
+	runtime, store := newFixtureRuntime(t)
 	goal, plan := fixtureGoalAndPlan()
 	runtime.planner = agoplanner.FixturePlanner{Proposal: plan}
-	executor.err = errors.New("fake executor failed")
+	ctx := context.Background()
+
+	if _, err := runtime.Create(ctx, goal); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Board(ctx, goal.BoardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Create(ctx, goal); err != nil {
+		t.Fatalf("re-admitting the same goal: %v", err)
+	}
+	second, err := store.Board(ctx, goal.BoardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("re-admitting an identical goal changed the durable graph")
+	}
+	boards, err := store.BoardIDs(ctx)
+	if err != nil || len(boards) != 1 {
+		t.Fatalf("boards = %#v, %v; want exactly one", boards, err)
+	}
+}
+
+// A restarted process must recover the goal and plan from SQLite, since the
+// scheduler needs them to build a dispatch.
+func TestRestartRecoversDurableGoalAndPlannerDefinition(t *testing.T) {
+	runtime, store := newFixtureRuntime(t)
+	goal, plan := fixtureGoalAndPlan()
+	runtime.planner = agoplanner.FixturePlanner{Proposal: plan}
 	if _, err := runtime.Create(context.Background(), goal); err != nil {
 		t.Fatal(err)
 	}
-	view, err := runtime.Tick(context.Background(), goal.BoardID)
+
+	restarted := New(store, agoplanner.FixturePlanner{Proposal: plan}, runtime.options)
+	recoveredGoal, recoveredPlan, err := restarted.Definition(context.Background(), goal.BoardID)
 	if err != nil {
-		t.Fatalf("Tick persists the failure instead of returning it: %v", err)
+		t.Fatalf("Definition after restart: %v", err)
 	}
-	assertOnlyTaskInColumn(t, view, ColumnBlocked)
-	if verifier.calls != 0 {
-		t.Fatalf("verifier calls = %d, want 0", verifier.calls)
+	if recoveredGoal.Objective.Summary != goal.Objective.Summary {
+		t.Fatalf("recovered objective = %q, want %q", recoveredGoal.Objective.Summary, goal.Objective.Summary)
+	}
+	if recoveredGoal.ExecutionMode != goal.ExecutionMode {
+		t.Fatalf("recovered execution mode = %q, want %q", recoveredGoal.ExecutionMode, goal.ExecutionMode)
+	}
+	if !reflect.DeepEqual(recoveredPlan.Tasks, plan.Tasks) {
+		t.Fatalf("recovered plan tasks = %#v, want %#v", recoveredPlan.Tasks, plan.Tasks)
 	}
 }
 
-func TestRuntimeRestartRecoversDurableGoalAndPlannerMetadata(t *testing.T) {
-	runtime, store, executor, verifier := newFixtureRuntime(t)
+// The returned definition must be a copy: a caller cannot reach into the
+// runtime's cache and change what the next dispatch sees.
+func TestDefinitionReturnsDefensiveCopies(t *testing.T) {
+	runtime, _ := newFixtureRuntime(t)
 	goal, plan := fixtureGoalAndPlan()
 	runtime.planner = agoplanner.FixturePlanner{Proposal: plan}
 	if _, err := runtime.Create(context.Background(), goal); err != nil {
 		t.Fatal(err)
 	}
-
-	restarted := New(store, agoplanner.FixturePlanner{Proposal: plan}, executor, verifier, runtime.options)
-	view, err := restarted.Tick(context.Background(), goal.BoardID)
+	first, firstPlan, err := runtime.Definition(context.Background(), goal.BoardID)
 	if err != nil {
-		t.Fatalf("Tick after runtime restart: %v", err)
+		t.Fatal(err)
 	}
-	assertOnlyTaskInColumn(t, view, ColumnDone)
-	if executor.dispatch.Goal.Objective.Summary != goal.Objective.Summary || !reflect.DeepEqual(executor.dispatch.Task, plan.Tasks[0]) {
-		t.Fatalf("recovered dispatch = %#v", executor.dispatch)
+	first.Objective.Summary = "被篡改的目标"
+	firstPlan.Tasks[0].Title = "被篡改的任务"
+
+	second, secondPlan, err := runtime.Definition(context.Background(), goal.BoardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Objective.Summary != goal.Objective.Summary {
+		t.Fatalf("mutating a returned goal changed the runtime's copy: %q", second.Objective.Summary)
+	}
+	if secondPlan.Tasks[0].Title != plan.Tasks[0].Title {
+		t.Fatalf("mutating a returned plan changed the runtime's copy: %q", secondPlan.Tasks[0].Title)
 	}
 }
 
-type fakeExecutor struct {
-	dispatch Dispatch
-	result   ExecutionResult
-	err      error
+func TestCreateRejectsAnEmptyObjective(t *testing.T) {
+	runtime, _ := newFixtureRuntime(t)
+	goal, plan := fixtureGoalAndPlan()
+	runtime.planner = agoplanner.FixturePlanner{Proposal: plan}
+	goal.Objective.Summary = "   "
+	if _, err := runtime.Create(context.Background(), goal); err == nil {
+		t.Fatal("a goal with a blank objective was admitted")
+	}
 }
 
-func (executor *fakeExecutor) Execute(_ context.Context, dispatch Dispatch) (ExecutionResult, error) {
-	executor.dispatch = dispatch
-	return executor.result, executor.err
-}
-
-type fakeVerifier struct {
-	dispatch Dispatch
-	evidence ExecutionResult
-	review   Review
-	calls    int
-}
-
-func (verifier *fakeVerifier) Verify(_ context.Context, dispatch Dispatch, evidence ExecutionResult) (Review, error) {
-	verifier.calls++
-	verifier.dispatch, verifier.evidence = dispatch, evidence
-	return verifier.review, nil
-}
-
-func newFixtureRuntime(t *testing.T) (*Runtime, *agoboardstore.Store, *fakeExecutor, *fakeVerifier) {
+func newFixtureRuntime(t *testing.T) (*Runtime, *agoboardstore.Store) {
 	t.Helper()
 	store, err := agoboardstore.Open(filepath.Join(t.TempDir(), "board.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	executor := &fakeExecutor{result: ExecutionResult{Artifact: "artifact://fake/result", Summary: "测试通过"}}
-	verifier := &fakeVerifier{review: Review{Accepted: true, Reason: "独立验收通过"}}
-	runtime := New(store, nil, executor, verifier, Options{
+	runtime := New(store, nil, Options{
 		CoordinatorID: "scheduler", WorkerID: "fake-local-worker", VerifierID: "independent-verifier",
 		LeaseDuration: time.Minute, Now: func() time.Time { return time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC) },
 	})
-	return runtime, store, executor, verifier
+	return runtime, store
 }
 
 func fixtureGoalAndPlan() (Goal, agoplanner.Plan) {
@@ -186,6 +171,7 @@ func fixtureGoalAndPlan() (Goal, agoplanner.Plan) {
 		Constraints: agoplanner.Constraints{
 			PathScopes: []string{"internal/agoboardruntime"}, CapabilityTags: []string{"go", "tests"}, VerifierIDs: []string{"go-test"},
 		},
+		ExecutionMode: "fake",
 	}
 	plan := agoplanner.Plan{
 		SchemaVersion: agoplanner.SchemaVersion, Repository: goal.Repository, Objective: goal.Objective, ProjectGates: goal.ProjectGates,
@@ -211,4 +197,17 @@ func assertOnlyTaskInColumn(t *testing.T, view BoardView, column Column) {
 			t.Fatalf("unexpected tasks in column %s: %#v", item.Name, item.Tasks)
 		}
 	}
+}
+
+// The runtime must not expose a second way to move task state.
+func TestRuntimeExposesNoSchedulingEntryPoint(t *testing.T) {
+	runtime, _ := newFixtureRuntime(t)
+	value := reflect.TypeOf(runtime)
+	for index := range value.NumMethod() {
+		switch name := value.Method(index).Name; name {
+		case "Tick", "TickOnce", "Claim", "Dispatch", "Advance":
+			t.Fatalf("the runtime exposes %q, reintroducing a second scheduling authority", name)
+		}
+	}
+	_ = agoboardprotocol.SchemaVersion
 }

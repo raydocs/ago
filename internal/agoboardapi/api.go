@@ -92,7 +92,8 @@ func (server *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/goals", server.createGoal)
 	mux.HandleFunc("GET /api/v1/boards/{boardID}", server.boardSnapshot)
 	mux.HandleFunc("GET /api/v1/boards/{boardID}/tasks/{taskID}", server.taskDetail)
-	mux.HandleFunc("POST /api/v1/boards/{boardID}/advance", server.advance)
+	mux.HandleFunc("POST /api/v1/boards/{boardID}/pause", server.setPaused(true))
+	mux.HandleFunc("POST /api/v1/boards/{boardID}/resume", server.setPaused(false))
 	mux.HandleFunc("GET /api/v1/boards/{boardID}/events", server.events)
 	mux.HandleFunc("GET /api/v1/providers", server.listProviders)
 	return mux
@@ -118,8 +119,9 @@ type goalResponse struct {
 	Board     Snapshot `json:"board"`
 }
 
-type advanceRequest struct {
+type controlRequest struct {
 	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
 }
 
 type SnapshotGoal struct {
@@ -259,41 +261,6 @@ func (server *Server) boardSnapshot(writer http.ResponseWriter, request *http.Re
 		writeError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, snapshot)
-}
-
-func (server *Server) advance(writer http.ResponseWriter, request *http.Request) {
-	var input advanceRequest
-	if err := decodeRequest(writer, request, &input); err != nil {
-		writeError(writer, err)
-		return
-	}
-	if strings.TrimSpace(input.CommandID) == "" {
-		writeError(writer, statusError{http.StatusBadRequest, "invalid_request", "推进请求需要 command_id。", nil})
-		return
-	}
-	boardID := request.PathValue("boardID")
-	if _, err := server.store.Board(request.Context(), boardID); err != nil {
-		writeError(writer, err)
-		return
-	}
-	// The client command ID is the durable claim identity: replaying it returns
-	// current state without claiming a second task, and reusing it for another
-	// board is a conflict.
-	if _, err := server.runtime.TickOnce(request.Context(), boardID, input.CommandID); err != nil {
-		if errors.Is(err, agoboardstore.ErrCommandConflict) {
-			writeError(writer, statusError{http.StatusConflict, "command_conflict", "该命令 ID 已用于推进另一个看板，请换一个命令 ID。", err})
-			return
-		}
-		writeError(writer, statusError{http.StatusBadRequest, "advance_failed", "推进看板失败。", err})
-		return
-	}
-	snapshot, err := server.snapshot(request.Context(), boardID)
-	if err != nil {
-		writeError(writer, err)
-		return
-	}
-	server.notify(boardID)
 	writeJSON(writer, http.StatusOK, snapshot)
 }
 
@@ -439,10 +406,7 @@ func (server *Server) snapshot(ctx context.Context, boardID string) (Snapshot, e
 			Status: completion.Status, Passed: completion.Passed,
 			Failed: completion.Failed, Remaining: completion.Remaining, Total: total,
 		},
-		// Pause control is owned by the D3 scheduler increment; until it exists
-		// no board can be paused, and reporting a fixed false is honest rather
-		// than pretending a control is wired.
-		Paused:    false,
+		Paused:    board.Paused,
 		Completed: total > 0 && completion.Remaining == 0,
 	}, nil
 }
@@ -571,4 +535,62 @@ func decodeRequest(writer http.ResponseWriter, request *http.Request, target any
 		return statusError{http.StatusBadRequest, "invalid_request", "请求体不是合法的 JSON。", err}
 	}
 	return nil
+}
+
+// setPaused issues a durable board.pause or board.resume protocol command.
+//
+// Pausing stops new claims; attempts already running keep their leases and are
+// allowed to finish, because cancelling live work is a separate, explicit act.
+// The state is part of the board aggregate, so it survives a restart.
+func (server *Server) setPaused(pause bool) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		var input controlRequest
+		if err := decodeRequest(writer, request, &input); err != nil {
+			writeError(writer, err)
+			return
+		}
+		if strings.TrimSpace(input.CommandID) == "" {
+			writeError(writer, statusError{http.StatusBadRequest, "invalid_request", "该请求需要 command_id。", nil})
+			return
+		}
+		boardID := request.PathValue("boardID")
+		board, err := server.store.Board(request.Context(), boardID)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		commandType := agoboardprotocol.CommandBoardResume
+		reason := strings.TrimSpace(input.Reason)
+		if pause {
+			commandType = agoboardprotocol.CommandBoardPause
+			if reason == "" {
+				reason = "用户暂停"
+			}
+		}
+		_, err = server.store.ApplyBoard(request.Context(), boardID, agoboardprotocol.Command{
+			SchemaVersion:   agoboardprotocol.SchemaVersion,
+			ID:              input.CommandID,
+			ExpectedVersion: board.Version,
+			Actor:           agoboardprotocol.Actor{ID: "ago-operator", Role: agoboardprotocol.RoleCoordinator},
+			Type:            commandType,
+			Reason:          reason,
+		})
+		if err != nil {
+			if errors.Is(err, agoboardstore.ErrCommandConflict) {
+				writeError(writer, statusError{http.StatusConflict, "command_conflict", "该命令 ID 已用于不同的请求内容。", err})
+				return
+			}
+			// An illegal transition, such as pausing an already-paused board, is
+			// reported rather than silently treated as success.
+			writeError(writer, statusError{http.StatusConflict, "illegal_transition", "看板当前状态不允许该操作。", err})
+			return
+		}
+		snapshot, err := server.snapshot(request.Context(), boardID)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		server.notify(boardID)
+		writeJSON(writer, http.StatusOK, snapshot)
+	}
 }

@@ -23,6 +23,7 @@ import (
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agoplanner"
+	"claudexflow/internal/agoscheduler"
 
 	"flag"
 )
@@ -66,7 +67,7 @@ func run() error {
 	}
 	defer store.Close()
 
-	runtime := agoboardruntime.New(store, agoplanner.DemoPlanner{}, demoExecutor{}, demoVerifier{}, agoboardruntime.Options{
+	runtime := agoboardruntime.New(store, agoplanner.DemoPlanner{}, agoboardruntime.Options{
 		CoordinatorID: "ago-scheduler",
 		WorkerID:      "ago-demo-worker",
 		VerifierID:    "ago-verifier",
@@ -74,6 +75,15 @@ func run() error {
 		Now:           time.Now,
 	})
 	server, err := agoboardapi.New(agoboardapi.Options{Runtime: runtime, Store: store, Providers: demoProviders()})
+	if err != nil {
+		return err
+	}
+
+	scheduler, err := agoscheduler.New(agoscheduler.Options{
+		Store: store, Runtime: runtime, Executor: demoExecutor{}, Verifier: demoVerifier{},
+		CoordinatorID: "ago-scheduler", WorkerID: "ago-demo-worker", VerifierID: "ago-verifier",
+		LeaseDuration: 5 * time.Minute, Interval: time.Second, Now: time.Now,
+	})
 	if err != nil {
 		return err
 	}
@@ -95,6 +105,21 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The scheduler advances the board; nothing external drives it.
+	schedulerCtx, stopScheduler := context.WithCancel(context.Background())
+	schedulerDone := make(chan struct{})
+	go func() {
+		defer close(schedulerDone)
+		_ = scheduler.Run(schedulerCtx)
+	}()
+	// Shutdown waits for the scheduler to finish its cycle, so a claimed attempt
+	// is never abandoned mid-dispatch.
+	defer func() {
+		stopScheduler()
+		<-schedulerDone
+	}()
+
 	errs := make(chan error, 1)
 	go func() { errs <- httpServer.Serve(listener) }()
 	select {
