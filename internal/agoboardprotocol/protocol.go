@@ -196,6 +196,14 @@ type Task struct {
 	NextEligibleAt time.Time    `json:"next_eligible_at,omitempty"`
 	FailureClass   FailureClass `json:"failure_class,omitempty"`
 	BlockedReason  string       `json:"blocked_reason,omitempty"`
+	// SupersededBy names the task that replaced this one. A superseded task is
+	// terminal and keeps all of its history; it is never removed.
+	SupersededBy string `json:"superseded_by,omitempty"`
+	// Cancelled marks work a patch withdrew before it was accepted.
+	Cancelled bool `json:"cancelled,omitempty"`
+	// Origin records which plan patch introduced a task, so a reader can tell
+	// planned work from work added in response to a failure.
+	Origin string `json:"origin,omitempty"`
 }
 
 type Dependency struct {
@@ -350,6 +358,10 @@ const (
 	// automatic attempt bound protects against machine retry loops; a person
 	// choosing to retry is a different act, and it is audited as one.
 	CommandTaskRetry CommandType = "task.retry"
+	// CommandPlanPatch changes the graph after admission: new information, a
+	// verifier's feedback, or a plan that turned out to be wrong. Earlier graph
+	// versions are never rewritten; a superseded task keeps its history.
+	CommandPlanPatch CommandType = "plan.patch"
 )
 
 type Command struct {
@@ -365,6 +377,7 @@ type Command struct {
 	TaskID          string          `json:"task_id,omitempty"`
 	AttemptID       string          `json:"attempt_id,omitempty"`
 	Evidence        *EvidenceSpec   `json:"evidence,omitempty"`
+	Patch           *PatchSpec      `json:"patch,omitempty"`
 	Reason          string          `json:"reason,omitempty"`
 	// FencingToken authenticates a worker or verifier against the exact attempt
 	// it is acting on. Commands from a superseded attempt cannot match.
@@ -373,6 +386,45 @@ type Command struct {
 	// decision. The state machine still enforces the attempt bound itself.
 	FailureClass   FailureClass `json:"failure_class,omitempty"`
 	NextEligibleAt time.Time    `json:"next_eligible_at,omitempty"`
+}
+
+// PatchOperation is one graph change. The set is deliberately small: every
+// operation must be expressible as a legal transition the state machine can
+// validate, so a patch can never smuggle in a state a command could not reach.
+type PatchOperation string
+
+const (
+	PatchAddTask          PatchOperation = "add_task"
+	PatchAddDependency    PatchOperation = "add_dependency"
+	PatchRemoveDependency PatchOperation = "remove_dependency"
+	PatchUpdateAcceptance PatchOperation = "update_acceptance"
+	PatchSupersedeTask    PatchOperation = "supersede_task"
+	PatchCancelTask       PatchOperation = "cancel_task"
+)
+
+// PatchStep is one operation inside a patch. A patch applies atomically: if any
+// step is illegal, the whole patch is rejected and the graph is untouched.
+type PatchStep struct {
+	Operation PatchOperation `json:"operation"`
+	Task      *TaskSpec      `json:"task,omitempty"`
+	TaskID    string         `json:"task_id,omitempty"`
+	DependsOn string         `json:"depends_on,omitempty"`
+	// SupersededBy names the task that replaces TaskID. The superseded task
+	// keeps its attempts and evidence; it is only marked, never deleted.
+	SupersededBy string `json:"superseded_by,omitempty"`
+	// Acceptance replaces a task's acceptance criteria. It may only be applied
+	// to work that has not been accepted yet.
+	Acceptance *TerminalContract `json:"acceptance,omitempty"`
+	Reason     string            `json:"reason,omitempty"`
+}
+
+// PatchSpec is an audited, atomic change to an admitted graph.
+type PatchSpec struct {
+	ID    string      `json:"id"`
+	Steps []PatchStep `json:"steps"`
+	// Actor identity and reason are recorded on the event, so a reader can see
+	// who changed the plan and why without reconstructing it.
+	Reason string `json:"reason"`
 }
 
 type BoardSpec struct {
@@ -435,6 +487,7 @@ const (
 	EventBoardPaused         EventType = "board.paused"
 	EventBoardResumed        EventType = "board.resumed"
 	EventTaskRetryRequested  EventType = "task.retry-requested"
+	EventPlanPatched         EventType = "plan.patched"
 )
 
 type Event struct {

@@ -152,8 +152,11 @@ func (s *Store) Claim(ctx context.Context, request ClaimRequest) (ClaimResult, e
 		return ClaimResult{}, err
 	}
 	attemptNumber := task.AttemptCount + 1
-	attemptID := derivedClaimID("attempt", board.ID, task.ID, attemptNumber)
-	leaseID := derivedClaimID("lease", board.ID, task.ID, attemptNumber)
+	// A user retry resets the attempt budget, so the attempt number alone
+	// repeats. The retry generation keeps the derived identity unique, which
+	// matters because a duplicate attempt or lease id is rejected outright.
+	attemptID := derivedClaimID("attempt", board.ID, task.ID, task.UserRetries, attemptNumber)
+	leaseID := derivedClaimID("lease", board.ID, task.ID, task.UserRetries, attemptNumber)
 	next, events, err := agoboardprotocol.Apply(board, agoboardprotocol.Command{
 		SchemaVersion:   agoboardprotocol.SchemaVersion,
 		ID:              request.CommandID,
@@ -293,8 +296,11 @@ func newFencingToken() (string, error) {
 	return hex.EncodeToString(buffer), nil
 }
 
-func derivedClaimID(namespace, boardID, taskID string, attemptNumber int) string {
-	digest, _ := requestHash([]string{namespace, boardID, taskID, strconv.Itoa(attemptNumber)})
+func derivedClaimID(namespace, boardID, taskID string, userRetries, attemptNumber int) string {
+	digest, _ := requestHash([]string{
+		namespace, boardID, taskID,
+		strconv.Itoa(userRetries), strconv.Itoa(attemptNumber),
+	})
 	return namespace + ":" + hex.EncodeToString(digest[:16])
 }
 

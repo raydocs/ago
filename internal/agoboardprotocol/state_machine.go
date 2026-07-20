@@ -431,6 +431,36 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		}
 		next.Tasks[index].State = state
 		emit(Event{Type: EventTaskRetryRequested, Task: taskPointer(next.Tasks[index]), PreviousState: previous.State, CurrentState: state, Reason: command.Reason})
+	case CommandPlanPatch:
+		if err := requireInitialized(next); err != nil {
+			return current, nil, err
+		}
+		if err := requireRole(RoleCoordinator); err != nil {
+			return current, nil, err
+		}
+		if command.Patch == nil || command.Patch.ID == "" || len(command.Patch.Steps) == 0 {
+			return current, nil, fmt.Errorf("plan.patch requires an id and at least one step")
+		}
+		if command.Patch.Reason == "" {
+			return current, nil, fmt.Errorf("plan.patch requires a reason recording why the plan changed")
+		}
+		if len(command.Patch.Steps) > maxPatchSteps {
+			return current, nil, fmt.Errorf("plan.patch exceeds %d steps", maxPatchSteps)
+		}
+		// Every step is applied to one working copy. A failure anywhere returns
+		// the original board, so a patch is all-or-nothing and a partially
+		// applied plan can never be observed.
+		for index, step := range command.Patch.Steps {
+			if err := applyPatchStep(&next, command.Patch.ID, step); err != nil {
+				return current, nil, fmt.Errorf("plan patch %q step %d (%s): %w", command.Patch.ID, index+1, step.Operation, err)
+			}
+		}
+		if err := next.Validate(); err != nil {
+			return current, nil, fmt.Errorf("plan patch %q produced an invalid graph: %w", command.Patch.ID, err)
+		}
+		emit(Event{Type: EventPlanPatched, Reason: command.Patch.Reason})
+		// A patch can satisfy the last dependency a blocked task was waiting on.
+		unblockReadyTasks(&next, emit)
 	case CommandBoardPause, CommandBoardResume:
 		if err := requireInitialized(next); err != nil {
 			return current, nil, err
@@ -701,4 +731,169 @@ func cloneEvidenceResult(result EvidenceResult) EvidenceResult {
 	result.Artifacts = append([]ArtifactRef(nil), result.Artifacts...)
 	result.Warnings = append([]string(nil), result.Warnings...)
 	return result
+}
+
+// maxPatchSteps bounds one patch so a single command cannot rewrite the whole
+// graph in an unreviewable jump.
+const maxPatchSteps = 32
+
+// applyPatchStep mutates the working board for one operation.
+//
+// The rules exist to protect history: accepted work is immutable, running work
+// is not silently removed, and a superseded task keeps its attempts and
+// evidence rather than being deleted.
+func applyPatchStep(board *Board, patchID string, step PatchStep) error {
+	switch step.Operation {
+	case PatchAddTask:
+		if step.Task == nil || step.Task.ID == "" || step.Task.Title == "" {
+			return fmt.Errorf("add_task requires task id and title")
+		}
+		if err := step.Task.TerminalContract.validate(); err != nil {
+			return err
+		}
+		if !validAccessMode(step.Task.AccessMode) {
+			return fmt.Errorf("add_task requires a valid access mode")
+		}
+		if _, _, found := findTask(*board, step.Task.ID); found {
+			return fmt.Errorf("duplicate task id %q", step.Task.ID)
+		}
+		task := Task{
+			ID: step.Task.ID, Title: step.Task.Title, State: TaskPlanned,
+			TerminalContract: cloneContract(step.Task.TerminalContract),
+			AccessMode:       step.Task.AccessMode,
+			Origin:           patchID,
+		}
+		board.Tasks = append(board.Tasks, task)
+		// A task added by a patch is activated immediately: the graph is
+		// already running, so leaving it planned would strand it.
+		index := len(board.Tasks) - 1
+		if dependenciesPassed(*board, task.ID) {
+			board.Tasks[index].State = TaskReady
+		} else {
+			board.Tasks[index].State = TaskBlocked
+		}
+	case PatchAddDependency:
+		if step.TaskID == "" || step.DependsOn == "" || step.TaskID == step.DependsOn {
+			return fmt.Errorf("add_dependency requires two distinct task ids")
+		}
+		index, task, found := findTask(*board, step.TaskID)
+		if !found {
+			return fmt.Errorf("task %q not found", step.TaskID)
+		}
+		if _, _, found := findTask(*board, step.DependsOn); !found {
+			return fmt.Errorf("prerequisite %q not found", step.DependsOn)
+		}
+		if task.State == TaskPassed {
+			return fmt.Errorf("cannot add a dependency to accepted task %q", step.TaskID)
+		}
+		id := patchID + ":" + step.TaskID + ":" + step.DependsOn
+		for _, existing := range board.Dependencies {
+			if existing.TaskID == step.TaskID && existing.DependsOn == step.DependsOn {
+				return fmt.Errorf("dependency already exists")
+			}
+			if existing.ID == id {
+				return fmt.Errorf("duplicate dependency id %q", id)
+			}
+		}
+		board.Dependencies = append(board.Dependencies, Dependency{ID: id, TaskID: step.TaskID, DependsOn: step.DependsOn})
+		// A new prerequisite can make ready work no longer ready.
+		if board.Tasks[index].State == TaskReady && !dependenciesPassed(*board, step.TaskID) {
+			board.Tasks[index].State = TaskBlocked
+		}
+	case PatchRemoveDependency:
+		if step.TaskID == "" || step.DependsOn == "" {
+			return fmt.Errorf("remove_dependency requires two task ids")
+		}
+		for position, existing := range board.Dependencies {
+			if existing.TaskID == step.TaskID && existing.DependsOn == step.DependsOn {
+				board.Dependencies = append(board.Dependencies[:position], board.Dependencies[position+1:]...)
+				return nil
+			}
+		}
+		return fmt.Errorf("dependency %q -> %q not found", step.TaskID, step.DependsOn)
+	case PatchUpdateAcceptance:
+		if step.TaskID == "" || step.Acceptance == nil {
+			return fmt.Errorf("update_acceptance requires a task id and acceptance criteria")
+		}
+		if err := step.Acceptance.validate(); err != nil {
+			return err
+		}
+		index, task, found := findTask(*board, step.TaskID)
+		if !found {
+			return fmt.Errorf("task %q not found", step.TaskID)
+		}
+		// Changing what "done" means after work was accepted would rewrite the
+		// meaning of a decision already made.
+		if task.State == TaskPassed {
+			return fmt.Errorf("cannot change the acceptance criteria of accepted task %q", step.TaskID)
+		}
+		board.Tasks[index].TerminalContract = cloneContract(*step.Acceptance)
+	case PatchSupersedeTask:
+		if step.TaskID == "" || step.SupersededBy == "" || step.TaskID == step.SupersededBy {
+			return fmt.Errorf("supersede_task requires a task and a distinct replacement")
+		}
+		index, task, found := findTask(*board, step.TaskID)
+		if !found {
+			return fmt.Errorf("task %q not found", step.TaskID)
+		}
+		if _, _, found := findTask(*board, step.SupersededBy); !found {
+			return fmt.Errorf("replacement task %q not found", step.SupersededBy)
+		}
+		if task.State == TaskPassed {
+			return fmt.Errorf("cannot supersede accepted task %q", step.TaskID)
+		}
+		if task.State == TaskLeased || task.State == TaskRunning || task.State == TaskVerifying {
+			// Running work is never silently removed. It must be cancelled
+			// explicitly, which is a separate, visible decision.
+			return fmt.Errorf("task %q is still running; cancel it before superseding", step.TaskID)
+		}
+		board.Tasks[index].SupersededBy = step.SupersededBy
+		board.Tasks[index].State = TaskFailed
+		board.Tasks[index].FailureClass = FailureNone
+		board.Tasks[index].BlockedReason = "superseded by " + step.SupersededBy
+	case PatchCancelTask:
+		if step.TaskID == "" {
+			return fmt.Errorf("cancel_task requires a task id")
+		}
+		index, task, found := findTask(*board, step.TaskID)
+		if !found {
+			return fmt.Errorf("task %q not found", step.TaskID)
+		}
+		if task.State == TaskPassed {
+			return fmt.Errorf("cannot cancel accepted task %q", step.TaskID)
+		}
+		if task.State == TaskLeased || task.State == TaskRunning || task.State == TaskVerifying {
+			// Cancelling live work has to end its lease too, or the attempt
+			// would keep running against a task nobody is waiting for.
+			for position := range board.Leases {
+				if board.Leases[position].TaskID == task.ID && board.Leases[position].State == LeaseActive {
+					board.Leases[position].State = LeaseCompleted
+				}
+			}
+			for position := range board.Attempts {
+				if board.Attempts[position].ID == task.ActiveAttemptID {
+					board.Attempts[position].State = AttemptFailed
+					board.Attempts[position].FailureClass = FailurePolicy
+					board.Attempts[position].FailureReason = "cancelled by plan patch"
+				}
+			}
+		}
+		board.Tasks[index].State = TaskFailed
+		board.Tasks[index].Cancelled = true
+		board.Tasks[index].ActiveAttemptID, board.Tasks[index].ActiveLeaseID = "", ""
+		board.Tasks[index].FailureClass = FailurePolicy
+		board.Tasks[index].BlockedReason = firstNonBlank(step.Reason, "cancelled by plan patch")
+	default:
+		return fmt.Errorf("unsupported patch operation %q", step.Operation)
+	}
+	return nil
+}
+
+func firstNonBlank(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
