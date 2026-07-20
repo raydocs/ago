@@ -18,6 +18,11 @@ const SchemaVersion = 3
 // scheduler, however buggy, can create an extra attempt.
 const MaxAttempts = 3
 
+// MaxVerificationAttempts bounds how long an unreachable verifier is tolerated
+// before the goal asks a person to look. It is separate from MaxAttempts: a
+// verifier outage is not the worker's fault.
+const MaxVerificationAttempts = 10
+
 // MaxRetryDelay caps the backoff so a bounded retry stays observable.
 const MaxRetryDelay = 30 * time.Second
 
@@ -367,6 +372,11 @@ type Evidence struct {
 	Result        EvidenceResult `json:"result,omitempty"`
 	Verdict       string         `json:"verdict,omitempty"`
 	VerdictReason string         `json:"verdict_reason,omitempty"`
+	// VerificationAttempts counts how many times verification was tried on this
+	// evidence. It is deliberately separate from the worker's attempt budget: a
+	// verifier being unreachable says nothing about whether the work was good,
+	// so it must never consume a worker attempt or re-run the model.
+	VerificationAttempts int `json:"verification_attempts,omitempty"`
 }
 
 type CommandType string
@@ -381,7 +391,11 @@ const (
 	CommandEvidenceSubmit CommandType = "evidence.submit"
 	CommandEvidenceAccept CommandType = "evidence.accept"
 	CommandEvidenceReject CommandType = "evidence.reject"
-	CommandAttemptFail    CommandType = "attempt.fail"
+	// CommandVerificationDeferred records that verification could not be
+	// performed — the provider was unavailable, not that the work was bad. The
+	// evidence stays submitted and the task stays in review.
+	CommandVerificationDeferred CommandType = "verification.deferred"
+	CommandAttemptFail          CommandType = "attempt.fail"
 	// CommandLeaseExpire is the coordinator's reconciliation of a lease whose
 	// deadline elapsed or whose worker is unreachable. It supersedes the
 	// attempt so late traffic from it can no longer authenticate.
@@ -523,23 +537,24 @@ type EvidenceSpec struct {
 type EventType string
 
 const (
-	EventBoardCreated        EventType = "board.created"
-	EventTaskAdded           EventType = "task.added"
-	EventDependencyAdded     EventType = "dependency.added"
-	EventTaskStateChanged    EventType = "task.state-changed"
-	EventLeaseAcquired       EventType = "lease.acquired"
-	EventAttemptStateChanged EventType = "attempt.state-changed"
-	EventEvidenceSubmitted   EventType = "evidence.submitted"
-	EventEvidenceAccepted    EventType = "evidence.accepted"
-	EventEvidenceRejected    EventType = "evidence.rejected"
-	EventLeaseExpired        EventType = "lease.expired"
-	EventLeaseRenewed        EventType = "lease.renewed"
-	EventBoardPaused         EventType = "board.paused"
-	EventBoardResumed        EventType = "board.resumed"
-	EventTaskRetryRequested  EventType = "task.retry-requested"
-	EventPlanPatched         EventType = "plan.patched"
-	EventIntegrationComplete EventType = "integration.completed"
-	EventIntegrationFailed   EventType = "integration.failed"
+	EventBoardCreated         EventType = "board.created"
+	EventTaskAdded            EventType = "task.added"
+	EventDependencyAdded      EventType = "dependency.added"
+	EventTaskStateChanged     EventType = "task.state-changed"
+	EventLeaseAcquired        EventType = "lease.acquired"
+	EventAttemptStateChanged  EventType = "attempt.state-changed"
+	EventEvidenceSubmitted    EventType = "evidence.submitted"
+	EventEvidenceAccepted     EventType = "evidence.accepted"
+	EventEvidenceRejected     EventType = "evidence.rejected"
+	EventLeaseExpired         EventType = "lease.expired"
+	EventLeaseRenewed         EventType = "lease.renewed"
+	EventBoardPaused          EventType = "board.paused"
+	EventBoardResumed         EventType = "board.resumed"
+	EventTaskRetryRequested   EventType = "task.retry-requested"
+	EventPlanPatched          EventType = "plan.patched"
+	EventIntegrationComplete  EventType = "integration.completed"
+	EventIntegrationFailed    EventType = "integration.failed"
+	EventVerificationDeferred EventType = "verification.deferred"
 )
 
 type Event struct {

@@ -20,6 +20,7 @@ import (
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoredact"
 	"claudexflow/internal/agoscheduler"
+	"claudexflow/internal/agoverify"
 )
 
 // secretSentinel is planted everywhere an executor could leak it. It must not
@@ -65,10 +66,20 @@ func (e leakyExecutor) Execute(ctx context.Context, dispatch agoboardruntime.Dis
 	}, nil
 }
 
+// leakyVerifier is a hostile judge: it puts the sentinel into its own reason,
+// so the test covers the verifier's output as well as the executor's.
 type leakyVerifier struct{}
 
-func (leakyVerifier) Verify(context.Context, agoboardruntime.Dispatch, agoboardruntime.ExecutionResult) (agoboardruntime.Review, error) {
-	return agoboardruntime.Review{Accepted: true, Reason: "已核对密钥 " + secretSentinel}, nil
+func (leakyVerifier) Judge(_ context.Context, input agoverify.JudgeInput) (agoverify.JudgeVerdict, error) {
+	criteria := make([]agoverify.CriterionOutcome, 0, len(input.AcceptanceCriteria))
+	for _, criterion := range input.AcceptanceCriteria {
+		criteria = append(criteria, agoverify.CriterionOutcome{Criterion: criterion, Passed: true, Reason: "已核对"})
+	}
+	return agoverify.JudgeVerdict{
+		Decision: agoverify.DecisionAccept,
+		Summary:  "已核对密钥 " + secretSentinel,
+		Criteria: criteria,
+	}, nil
 }
 
 // A sentinel planted by a hostile executor must not reach SQLite bytes,
@@ -99,7 +110,7 @@ func TestSecretSentinelNeverReachesAnyDurableOrVisibleSurface(t *testing.T) {
 	}
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
 		Store: store, Runtime: runtime,
-		Executor: leakyExecutor{artifacts: artifacts}, Verifier: leakyVerifier{},
+		Executor: leakyExecutor{artifacts: artifacts}, Verification: mustVerification(t, leakyVerifier{}, artifacts),
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: time.Minute, Now: clock,
 		Redactor: agoredact.New(secretSentinel),
@@ -330,7 +341,7 @@ func TestTaskDetailExposesStructuredEvidence(t *testing.T) {
 	}
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
 		Store: store, Runtime: runtime,
-		Executor: provider.WithArtifacts(artifacts), Verifier: provider,
+		Executor: provider.WithArtifacts(artifacts), Verification: mustVerification(t, mustFakeVerifier(t), artifacts),
 		CoordinatorID: "c", WorkerID: "w", VerifierID: "v", LeaseDuration: time.Minute, Now: clock,
 	})
 	if err != nil {
@@ -407,4 +418,22 @@ func TestTaskDetailExposesStructuredEvidence(t *testing.T) {
 	if checked == 0 {
 		t.Fatal("no task passed, so structured evidence was never checked")
 	}
+}
+
+func mustVerification(t *testing.T, judge agoverify.Judge, artifacts *agoartifact.Store) *agoverify.Verifier {
+	t.Helper()
+	verification, err := agoverify.New(agoverify.Options{Judge: judge, Artifacts: artifacts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return verification
+}
+
+func mustFakeVerifier(t *testing.T) *agofake.Verifier {
+	t.Helper()
+	judge, err := agofake.NewVerifier(agofake.Script{Default: agofake.OutcomeSuccess})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return judge
 }

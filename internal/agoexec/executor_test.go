@@ -502,3 +502,60 @@ func gitStatus(t *testing.T, repo string) string {
 // decoding path a real relay response takes.
 func jsonMarshal(value any) ([]byte, error)       { return json.Marshal(value) }
 func jsonUnmarshal(data []byte, target any) error { return json.Unmarshal(data, target) }
+
+// escapingCommands stands in for what `node build.js` or `make` actually do:
+// run model-authored code that can write anywhere in the worktree.
+type escapingCommands struct{ dir string }
+
+func (c *escapingCommands) Run(_ context.Context, dir, name string, args ...string) (string, int, error) {
+	c.dir = dir
+	// Write a file the task was never allowed to touch.
+	_ = os.MkdirAll(filepath.Join(dir, ".github", "workflows"), 0o700)
+	_ = os.WriteFile(filepath.Join(dir, ".github", "workflows", "deploy.yml"), []byte("on: push\n"), 0o600)
+	return "built", 0, nil
+}
+
+// A verification command runs model-authored code AFTER the first scope check.
+// Whatever it writes ends up in the patch, so the gate has to be applied again
+// to the state the patch actually captures — otherwise an out-of-scope file
+// reaches the integration ref while the evidence names only in-scope ones.
+func TestCommandsCannotWriteOutsideScopeAfterTheFirstCheck(t *testing.T) {
+	f := newFixture(t, successPlan(), nil)
+	escaping := &escapingCommands{}
+	rebuilt, err := agoexec.New(agoexec.Options{
+		Model: f.model, Worktrees: f.worktrees, Artifacts: mustArtifacts(t), Commands: escaping,
+		Timeout: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rebuilt.Execute(context.Background(), dispatchFor(f.repo, "README.md"))
+	if err == nil {
+		t.Fatal("a command wrote outside the declared scope and the attempt was accepted")
+	}
+	if escaping.dir == "" {
+		t.Fatal("the command never ran, so the test proves nothing")
+	}
+	var classified interface {
+		FailureClass() agoboardprotocol.FailureClass
+	}
+	if !errors.As(err, &classified) || classified.FailureClass() != agoboardprotocol.FailurePolicy {
+		t.Fatalf("failure class = %v, want policy", err)
+	}
+	if !strings.Contains(err.Error(), "deploy.yml") {
+		t.Fatalf("the error does not name the file the command wrote: %v", err)
+	}
+	// And nothing reached the canonical repository.
+	if _, statErr := os.Stat(filepath.Join(f.repo, ".github")); statErr == nil {
+		t.Fatal("the out-of-scope file reached the canonical repository")
+	}
+}
+
+func mustArtifacts(t *testing.T) *agoartifact.Store {
+	t.Helper()
+	store, err := agoartifact.Open(agoartifact.Options{Root: filepath.Join(t.TempDir(), "artifacts")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}

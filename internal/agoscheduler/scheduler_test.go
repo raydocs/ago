@@ -14,6 +14,7 @@ import (
 	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoscheduler"
+	"claudexflow/internal/agoverify"
 )
 
 const chineseObjective = "分析当前仓库，为 README 增加一个快速开始章节，运行相关测试，并生成完成报告。"
@@ -55,11 +56,17 @@ func (e *recordingExecutor) Execute(_ context.Context, dispatch agoboardruntime.
 	}, nil
 }
 
-type acceptingVerifier struct{ calls atomic.Int64 }
+// countingJudge records how often verification actually ran, which is what
+// lets a test prove the executor and the verifier are two separate calls.
+type countingJudge struct{ calls atomic.Int64 }
 
-func (v *acceptingVerifier) Verify(_ context.Context, _ agoboardruntime.Dispatch, _ agoboardruntime.ExecutionResult) (agoboardruntime.Review, error) {
-	v.calls.Add(1)
-	return agoboardruntime.Review{Accepted: true, Reason: "证据满足验收标准"}, nil
+func (j *countingJudge) Judge(_ context.Context, input agoverify.JudgeInput) (agoverify.JudgeVerdict, error) {
+	j.calls.Add(1)
+	outcomes := make([]agoverify.CriterionOutcome, 0, len(input.AcceptanceCriteria))
+	for _, criterion := range input.AcceptanceCriteria {
+		outcomes = append(outcomes, agoverify.CriterionOutcome{Criterion: criterion, Passed: true, Reason: "证据支持"})
+	}
+	return agoverify.JudgeVerdict{Decision: agoverify.DecisionAccept, Summary: "证据满足验收标准", Criteria: outcomes}, nil
 }
 
 type harness struct {
@@ -67,7 +74,7 @@ type harness struct {
 	runtime   *agoboardruntime.Runtime
 	scheduler *agoscheduler.Scheduler
 	executor  *recordingExecutor
-	verifier  *acceptingVerifier
+	verifier  *countingJudge
 	clock     *clock
 	boardID   string
 }
@@ -80,13 +87,13 @@ func newHarness(t *testing.T, dbPath string) *harness {
 	}
 	testClock := newClock()
 	executor := &recordingExecutor{}
-	verifier := &acceptingVerifier{}
+	verifier := &countingJudge{}
 	runtime := agoboardruntime.New(store, agoplanner.DemoPlanner{}, agoboardruntime.Options{
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: time.Minute, Now: testClock.Now,
 	})
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
-		Store: store, Runtime: runtime, Executor: executor, Verifier: verifier,
+		Store: store, Runtime: runtime, Executor: executor, Verification: mustSchedulerVerification(t, verifier),
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: time.Minute, Now: testClock.Now,
 	})
@@ -255,8 +262,17 @@ func TestPauseSurvivesRestartAndResumeContinuesScheduling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Version != pausedVersion.Version {
-		t.Fatalf("a paused board advanced from version %d to %d", pausedVersion.Version, after.Version)
+	// Pause stops work being STARTED, not work being finished: an attempt
+	// already in flight runs through its own verification and integration
+	// rather than being abandoned halfway. So the invariant is that no new
+	// attempt appears, not that the graph freezes.
+	if len(after.Attempts) != len(pausedVersion.Attempts) {
+		t.Fatalf("a paused board created %d new attempts", len(after.Attempts)-len(pausedVersion.Attempts))
+	}
+	for _, task := range after.Tasks {
+		if task.State == agoboardprotocol.TaskLeased && !contains(pausedVersion.Tasks, task.ID, agoboardprotocol.TaskLeased) {
+			t.Fatalf("a paused board claimed task %q", task.ID)
+		}
 	}
 	if err := h.store.Close(); err != nil {
 		t.Fatal(err)
@@ -367,7 +383,7 @@ func TestRunExitsCleanlyOnContextCancel(t *testing.T) {
 
 	ticks := make(chan time.Time)
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
-		Store: h.store, Runtime: h.runtime, Executor: h.executor, Verifier: h.verifier,
+		Store: h.store, Runtime: h.runtime, Executor: h.executor, Verification: mustSchedulerVerification(t, h.verifier),
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: time.Minute, Now: h.clock.Now, Ticker: ticks,
 	})
@@ -507,4 +523,22 @@ func TestTransientExecutorFailureIsRetriedWithinTheBound(t *testing.T) {
 			t.Fatalf("task %q accumulated %d attempts, above the bound of %d", taskID, attempts, agoboardprotocol.MaxAttempts)
 		}
 	}
+}
+
+func mustSchedulerVerification(t *testing.T, judge agoverify.Judge) *agoverify.Verifier {
+	t.Helper()
+	verification, err := agoverify.New(agoverify.Options{Judge: judge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return verification
+}
+
+func contains(tasks []agoboardprotocol.Task, id string, state agoboardprotocol.TaskState) bool {
+	for _, task := range tasks {
+		if task.ID == id && task.State == state {
+			return true
+		}
+	}
+	return false
 }

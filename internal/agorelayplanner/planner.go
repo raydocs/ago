@@ -226,17 +226,29 @@ func (p *Planner) callAndValidate(ctx context.Context, request agoplanner.Reques
 		return agoplanner.Plan{}, err
 	}
 
-	var plan agoplanner.Plan
-	if err := p.model.CompleteJSON(ctx, wire, &plan); err != nil {
+	// Only the fields the model actually owns are parsed. Decoding into the
+	// full Plan meant a model writing "schema_version": "1.0" or a repository
+	// as a bare string broke the whole response, and it invited the idea that
+	// a model has any say over which goal is being planned. It does not: those
+	// fields come from the request below.
+	var proposal struct {
+		Tasks        []agoplanner.TaskProposal       `json:"tasks"`
+		Dependencies []agoplanner.DependencyProposal `json:"dependencies"`
+	}
+	if err := p.model.CompleteJSON(ctx, wire, &proposal); err != nil {
 		return agoplanner.Plan{}, fmt.Errorf("model call failed: %w", err)
 	}
 
 	// The request — not the model — owns what goal is being planned for.
 	// A model that echoes back a different repository, objective, or gate
 	// set must not be able to make that stick.
-	plan.SchemaVersion = agoplanner.SchemaVersion
-	plan.Repository = request.Repository
-	plan.Objective = request.Objective
+	plan := agoplanner.Plan{
+		SchemaVersion: agoplanner.SchemaVersion,
+		Repository:    request.Repository,
+		Objective:     request.Objective,
+		Tasks:         proposal.Tasks,
+		Dependencies:  proposal.Dependencies,
+	}
 	plan.ProjectGates = request.ProjectGates
 
 	if err := plan.Validate(request); err != nil {
@@ -382,8 +394,32 @@ func (p *Planner) buildUserPrompt(request agoplanner.Request) string {
 			strings.Join(gate.AcceptanceCriteria, "; "),
 			strings.Join(gate.VerifierIDs, ", "))
 	}
-	fmt.Fprintf(&b, "\n图限制: 最多 %d 个任务, 最多 %d 条依赖, 最大依赖链深度 %d。\n", p.maxTasks, p.maxDependencies, p.maxDepth)
-	b.WriteString("请返回一个 JSON 对象，字段包括 schema_version, repository, objective, tasks, dependencies, project_gates，且必须满足以上所有约束。")
+	fmt.Fprintf(&b, "\n图限制: 最多 %d 个任务, 最多 %d 条依赖, 最大依赖链深度 %d。\n\n", p.maxTasks, p.maxDependencies, p.maxDepth)
+
+	// A worked example is worth more than a field list: a model omitting a
+	// required array is the single most common way a plan fails validation,
+	// and showing one filled-in task fixes it far more reliably than
+	// describing the schema again.
+	b.WriteString("每个任务的所有字段都是必填的，数组都不能为空。示例（只是格式示范，不要照抄内容）：\n")
+	fmt.Fprintf(&b, `{
+  "tasks": [
+    {
+      "id": "inspect-readme",
+      "title": "检查 README 现状",
+      "description": "读取 README，确认快速开始章节需要补充哪些内容。",
+      "path_scopes": [%q],
+      "acceptance_criteria": ["已记录 README 缺少的章节内容"],
+      "verifier_ids": [%q],
+      "capability_tags": [%q]
+    }
+  ],
+  "dependencies": [{"task_id": "write-readme", "depends_on": "inspect-readme"}]
+}
+`, firstOr(request.Constraints.PathScopes, "README.md"),
+		firstOr(request.Constraints.VerifierIDs, "ago-verifier"),
+		firstOr(request.Constraints.CapabilityTags, "repo-read"))
+	b.WriteString("\n只返回 tasks 和 dependencies 两个字段。不要返回 schema_version、repository、objective 或 project_gates：这些由系统提供，你写了也会被忽略。")
+	b.WriteString("写文件的任务必须在 path_scopes 中列出它要修改的具体文件，不能列出全部允许范围。")
 	return b.String()
 }
 
@@ -397,4 +433,13 @@ func (p *Planner) buildCorrectionPrompt(previousUser string, validationErr error
 	b.WriteString(p.redactor.String(validationErr.Error()))
 	b.WriteString("\n请修正后重新返回一个满足以上所有约束的 JSON 对象。")
 	return p.redactor.String(b.String())
+}
+
+// firstOr returns the first value or a fallback, for building an example the
+// model can copy the shape of.
+func firstOr(values []string, fallback string) string {
+	if len(values) > 0 {
+		return values[0]
+	}
+	return fallback
 }

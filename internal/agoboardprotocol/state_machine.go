@@ -255,6 +255,13 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		}
 		evidence := Evidence{ID: command.Evidence.ID, TaskID: command.TaskID, AttemptID: command.AttemptID, WorkerID: command.Actor.ID, Artifact: command.Evidence.Artifact, Summary: command.Evidence.Summary, State: EvidenceSubmitted, Result: result}
 		next.Evidence = append(next.Evidence, evidence)
+		// The worker is finished: its lease covered execution, not review.
+		// Leaving it active would let the expiry sweep destroy work that was
+		// already submitted, and would hold a concurrency slot while an
+		// independent verifier takes its time.
+		if leaseIndex, _, found := findLease(next, taskFor(next, command.TaskID).ActiveLeaseID); found {
+			next.Leases[leaseIndex].State = LeaseCompleted
+		}
 		attemptIndex, _, _ := findAttempt(next, command.AttemptID)
 		next.Attempts[attemptIndex].EvidenceID = evidence.ID
 		task, attempt := taskAndAttempt(next, command.TaskID, command.AttemptID)
@@ -286,9 +293,11 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		if !found || evidence.State != EvidenceSubmitted {
 			return current, nil, fmt.Errorf("evidence %q is not submitted", command.Evidence.ID)
 		}
-		leaseIndex, lease, found := findLease(next, task.ActiveLeaseID)
-		if !found || lease.State != LeaseActive {
-			return current, nil, fmt.Errorf("active lease not found")
+		// The lease is already completed: the worker finished when it submitted.
+		// A verdict is about the evidence, not about who still holds a slot.
+		leaseIndex, _, found := findLease(next, task.ActiveLeaseID)
+		if !found {
+			return current, nil, fmt.Errorf("lease for attempt %q not found", command.AttemptID)
 		}
 		if command.Type == CommandEvidenceAccept {
 			// Deterministic checks outrank judgement. A verifier may not accept
@@ -426,9 +435,11 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		if !found {
 			return current, nil, fmt.Errorf("task %q not found", command.TaskID)
 		}
-		// Only a stopped task may be restarted. Retrying running or accepted
-		// work would either duplicate a live attempt or discard a decision.
-		if task.State != TaskFailed && task.State != TaskRetryWait {
+		// Only stopped work may be restarted. Running work would be duplicated
+		// and accepted work would have a decision discarded. A task stuck
+		// mid-integration is included deliberately: it is stopped, and without
+		// this a lost completion would leave it with no way out at all.
+		if task.State != TaskFailed && task.State != TaskRetryWait && task.State != TaskIntegrating {
 			return current, nil, illegalTransition(task.State, "retry")
 		}
 		previous := task
@@ -475,6 +486,30 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		emit(Event{Type: EventPlanPatched, Reason: command.Patch.Reason})
 		// A patch can satisfy the last dependency a blocked task was waiting on.
 		unblockReadyTasks(&next, emit)
+	case CommandVerificationDeferred:
+		if err := requireRole(RoleCoordinator); err != nil {
+			return current, nil, err
+		}
+		if command.Evidence == nil || command.Evidence.ID == "" {
+			return current, nil, fmt.Errorf("verification.deferred requires an evidence id")
+		}
+		evidenceIndex, evidence, found := findEvidence(next, command.Evidence.ID)
+		if !found || evidence.State != EvidenceSubmitted {
+			return current, nil, fmt.Errorf("evidence %q is not awaiting verification", command.Evidence.ID)
+		}
+		taskIndex, task, found := findTask(next, evidence.TaskID)
+		if !found || task.State != TaskVerifying {
+			return current, nil, illegalTransition(task.State, "defer verification")
+		}
+		// Nothing about the work changes: the evidence stays submitted and the
+		// task stays in review. Only the count moves, so a permanently broken
+		// verifier becomes visible instead of retrying forever in silence.
+		next.Evidence[evidenceIndex].VerificationAttempts = evidence.VerificationAttempts + 1
+		if next.Evidence[evidenceIndex].VerificationAttempts > MaxVerificationAttempts {
+			next.Tasks[taskIndex].BlockedReason = command.Reason
+			next.Tasks[taskIndex].FailureClass = FailureNeedsInput
+		}
+		emit(Event{Type: EventVerificationDeferred, Task: taskPointer(next.Tasks[taskIndex]), Evidence: evidencePointer(next.Evidence[evidenceIndex]), Reason: command.Reason})
 	case CommandIntegrationComplete, CommandIntegrationFail:
 		if err := requireInitialized(next); err != nil {
 			return current, nil, err
@@ -949,4 +984,9 @@ func firstNonBlank(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func taskFor(board Board, id string) Task {
+	_, task, _ := findTask(board, id)
+	return task
 }

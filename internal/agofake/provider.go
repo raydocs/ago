@@ -225,28 +225,6 @@ func deterministicHash(parts ...string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// Verify is the independent acceptance decision. It runs under the verifier
-// identity, never the worker's.
-func (provider *Provider) Verify(ctx context.Context, dispatch agoboardruntime.Dispatch, result agoboardruntime.ExecutionResult) (agoboardruntime.Review, error) {
-	if err := ctx.Err(); err != nil {
-		return agoboardruntime.Review{}, err
-	}
-	if provider.script.outcomeFor(dispatch.Task.ID) == OutcomeVerifierRetryWithFeedback && dispatch.AttemptNumber <= 1 {
-		return agoboardruntime.Review{
-			Accepted:     false,
-			FailureClass: agoboardprotocol.FailureVerifierFeedback,
-			Reason:       fmt.Sprintf("任务《%s》的证据未覆盖全部验收标准，请在下一次尝试中补充。", dispatch.Task.Title),
-		}, nil
-	}
-	if result.Artifact == "" || result.Summary == "" {
-		return agoboardruntime.Review{
-			Accepted:     false,
-			FailureClass: agoboardprotocol.FailureVerifierFeedback,
-			Reason:       "提交的证据不完整。",
-		}, nil
-	}
-	return agoboardruntime.Review{
-		Accepted: true,
-		Reason:   fmt.Sprintf("任务《%s》的证据满足全部验收标准。", dispatch.Task.Title),
-	}, nil
-}
+// Verify is deliberately absent. This type is the EXECUTOR. Acceptance belongs
+// to agofake.Verifier, which reads persisted evidence and has no access to what
+// the executor was thinking — see verifier.go.

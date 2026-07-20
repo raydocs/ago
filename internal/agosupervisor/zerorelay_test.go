@@ -15,6 +15,7 @@ import (
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoscheduler"
 	"claudexflow/internal/agosupervisor"
+	"claudexflow/internal/agoverify"
 )
 
 const chineseObjective = "分析当前仓库，为 README 增加一个快速开始章节，运行相关测试，并生成完成报告。"
@@ -62,6 +63,15 @@ func openHarness(t *testing.T, path, base string, script agofake.Script, authori
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Two separate objects: the executor cannot certify its own work.
+	judge, err := agofake.NewVerifier(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := agoverify.New(agoverify.Options{Judge: judge, Artifacts: artifacts})
+	if err != nil {
+		t.Fatal(err)
+	}
 	testClock := &clock{now: time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)}
 	runtime := agoboardruntime.New(store, agoplanner.DemoPlanner{}, agoboardruntime.Options{
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
@@ -69,7 +79,7 @@ func openHarness(t *testing.T, path, base string, script agofake.Script, authori
 	})
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
 		Store: store, Runtime: runtime,
-		Executor: provider.WithArtifacts(artifacts), Verifier: provider,
+		Executor: provider.WithArtifacts(artifacts), Verification: verification,
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: time.Minute, Now: testClock.Now,
 	})

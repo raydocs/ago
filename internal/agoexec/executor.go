@@ -24,8 +24,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"claudexflow/internal/agoartifact"
@@ -197,6 +199,30 @@ func (executor *Executor) Execute(ctx context.Context, dispatch agoboardruntime.
 		ChangedFiles: toChangedFiles(changes),
 	}
 	executor.runCommands(ctx, lease, dispatch, plan.Commands, &result)
+
+	// The commands just ran arbitrary model-authored code inside the worktree.
+	// Whatever they wrote is in the tree and would be in the patch, so the
+	// scope gate has to be applied again to the state the patch will actually
+	// capture. Checking only before the commands would let `node build.js` or
+	// `make` write anywhere while the evidence named one in-scope file.
+	changes, err = executor.options.Worktrees.Changes(ctx, lease)
+	if err != nil {
+		return agoboardruntime.ExecutionResult{}, Error{
+			Class:   agoboardprotocol.FailureRepository,
+			Message: executor.redact(fmt.Sprintf("无法读取命令执行后的变更：%v", err)),
+		}
+	}
+	if violations := agoworktree.ViolatesScope(changes, dispatch.Task.PathScopes); len(violations) > 0 {
+		return agoboardruntime.ExecutionResult{}, Error{
+			Class: agoboardprotocol.FailurePolicy,
+			Message: executor.redact(fmt.Sprintf(
+				"验证命令写入了允许范围 %v 之外的文件：%v。该结果已被丢弃。",
+				dispatch.Task.PathScopes, violations)),
+		}
+	}
+	// The evidence must describe the tree the patch contains, not the tree as
+	// it was before the commands ran.
+	result.ChangedFiles = toChangedFiles(changes)
 
 	// The worktree is deleted the moment this returns, so the change has to be
 	// captured as durable bytes first. Without this an accepted result would
@@ -491,4 +517,68 @@ func repositoryListing(root string, scopes []string) (string, error) {
 
 func (executor *Executor) redact(value string) string {
 	return executor.options.Redactor.String(value)
+}
+
+// SystemCommands runs a check inside a worktree as a real process.
+//
+// It is deliberately thin: the allowlist and the argument validation live in
+// the executor, so this only spawns what it is given. The process group is
+// killed on cancellation, because a test runner that spawns children would
+// otherwise outlive the attempt.
+type SystemCommands struct {
+	// MaxOutputBytes bounds captured output so a runaway command cannot fill
+	// memory. Zero uses 256 KiB.
+	MaxOutputBytes int
+}
+
+func (commands SystemCommands) Run(ctx context.Context, dir, name string, args ...string) (string, int, error) {
+	limit := commands.MaxOutputBytes
+	if limit <= 0 {
+		limit = 256 * 1024
+	}
+	command := exec.CommandContext(ctx, name, args...)
+	command.Dir = dir
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
+	// A minimal environment: a child gets what it needs to run, not the
+	// operator's credentials.
+	command.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + dir,
+		"LANG=en_US.UTF-8",
+	}
+	var buffer bytes.Buffer
+	writer := &boundedWriter{limit: limit, buffer: &buffer}
+	command.Stdout, command.Stderr = writer, writer
+	err := command.Run()
+	exitCode := 0
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		exitCode = exitErr.ExitCode()
+		err = nil
+	}
+	return buffer.String(), exitCode, err
+}
+
+// boundedWriter stops accepting output once the limit is reached, so a command
+// that never stops printing cannot exhaust memory.
+type boundedWriter struct {
+	limit   int
+	written int
+	buffer  *bytes.Buffer
+}
+
+func (writer *boundedWriter) Write(p []byte) (int, error) {
+	remaining := writer.limit - writer.written
+	if remaining <= 0 {
+		// Report the bytes as consumed so the command is not killed by a short
+		// write; the output is simply not retained.
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	written, err := writer.buffer.Write(p)
+	writer.written += written
+	return len(p), err
 }

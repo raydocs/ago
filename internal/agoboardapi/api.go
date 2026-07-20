@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -48,8 +49,11 @@ const (
 // Provider describes one configured capability provider without exposing any
 // credential value.
 type Provider struct {
-	ID             string   `json:"id"`
-	Kind           string   `json:"kind"`
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+	// Model is the mapping this role uses. It is non-secret metadata; the base
+	// URL is deliberately absent because it can itself carry a credential.
+	Model          string   `json:"model,omitempty"`
 	Capabilities   []string `json:"capabilities"`
 	AuthConfigured bool     `json:"auth_configured"`
 }
@@ -63,6 +67,10 @@ type Options struct {
 	// Nil means no supervisor is running, which is reported as an empty queue
 	// rather than an error: a board with no supervisor simply needs nothing.
 	Decisions DecisionSource
+	// Integration establishes the Ago-owned ref a board's accepted work is
+	// promoted onto. Without it a write task can never complete, so a board
+	// created with no integration setup can only run read-only work.
+	Integration IntegrationSetup
 	// Artifacts serves managed executor output. When nil, the download route
 	// reports that artifact storage is unavailable rather than guessing a path.
 	Artifacts *agoartifact.Store
@@ -77,6 +85,7 @@ type Server struct {
 	store        *agoboardstore.Store
 	providers    []Provider
 	decisions    DecisionSource
+	integration  IntegrationSetup
 	artifacts    *agoartifact.Store
 	pollInterval time.Duration
 
@@ -96,6 +105,7 @@ func New(options Options) (*Server, error) {
 		store:        options.Store,
 		providers:    append([]Provider(nil), options.Providers...),
 		decisions:    options.Decisions,
+		integration:  options.Integration,
 		artifacts:    options.Artifacts,
 		pollInterval: options.PollInterval,
 		waiters:      make(map[string]chan struct{}),
@@ -264,6 +274,19 @@ func (server *Server) createGoal(writer http.ResponseWriter, request *http.Reque
 		writeError(writer, err)
 		return
 	}
+	// Establish where this board's accepted work will be promoted, before any
+	// task can produce a change. Ago writes only its own ref; the user's branch
+	// is never involved.
+	if server.integration != nil {
+		ref := server.integration.RefName(goal.BoardID)
+		base, refErr := server.integration.EnsureRef(request.Context(), goal.Repository.ID, ref, "")
+		if refErr != nil {
+			writeError(writer, statusError{http.StatusBadRequest, "repository_unavailable",
+				"无法在该仓库中建立 Ago 集成分支，请确认它是一个 git 仓库。", refErr})
+			return
+		}
+		goal.BaseRevision, goal.IntegrationRef = base, ref
+	}
 	// The board identity is derived from the command ID, so an already-present
 	// board means this exact command was admitted before. Two concurrent
 	// identical requests may both report 201; the durable store still admits
@@ -275,6 +298,9 @@ func (server *Server) createGoal(writer http.ResponseWriter, request *http.Reque
 		status = http.StatusOK
 	}
 	if _, createErr := server.runtime.Create(request.Context(), goal); createErr != nil {
+		// The response stays generic so nothing internal leaks, but an operator
+		// needs to know why a goal was refused.
+		log.Printf("goal %q rejected: %v", input.CommandID, createErr)
 		// An exact replay is absorbed by the store's command receipt, so a
 		// conflict here can only mean the command ID was reused with different
 		// content.
@@ -812,4 +838,10 @@ func (server *Server) listDecisions(writer http.ResponseWriter, request *http.Re
 		pending = server.decisions.PendingDecisions(boardID)
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{"decisions": pending})
+}
+
+// IntegrationSetup establishes a board's Ago-owned integration ref.
+type IntegrationSetup interface {
+	RefName(boardID string) string
+	EnsureRef(ctx context.Context, repository, ref, baseRevision string) (string, error)
 }

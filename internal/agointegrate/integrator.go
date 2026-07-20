@@ -100,9 +100,13 @@ type Request struct {
 
 // Result is the durable outcome of a promotion.
 type Result struct {
-	Revision   string
-	Rebased    bool
-	ChangedRaw string
+	Revision string
+	Rebased  bool
+	// AlreadyIntegrated reports that the change was found to be present
+	// already, which is how a retry after an interrupted completion succeeds
+	// without committing the same work twice.
+	AlreadyIntegrated bool
+	ChangedRaw        string
 }
 
 // EnsureRef creates the board's integration ref at the base revision if it does
@@ -141,14 +145,15 @@ func (integrator *Integrator) Integrate(ctx context.Context, request Request) (R
 	if len(bytes.TrimSpace(request.Patch)) == 0 {
 		return Result{}, ErrEmptyPatch
 	}
-	tip := strings.TrimSpace(request.CurrentRevision)
-	if tip == "" {
-		resolved, err := integrator.git(ctx, request.Repository, "rev-parse", request.IntegrationRef)
-		if err != nil {
-			return Result{}, err
-		}
-		tip = strings.TrimSpace(string(resolved))
+	// The ref's own tip is the authority, not what the caller believed it to
+	// be. Trusting a caller's stale view is what made a lost completion command
+	// poison the ref forever: every later integration compared against a
+	// revision that had already moved.
+	resolved, err := integrator.git(ctx, request.Repository, "rev-parse", request.IntegrationRef)
+	if err != nil {
+		return Result{}, err
 	}
+	tip := strings.TrimSpace(string(resolved))
 
 	scratch, err := os.MkdirTemp(integrator.root, "integrate-")
 	if err != nil {
@@ -168,6 +173,12 @@ func (integrator *Integrator) Integrate(ctx context.Context, request Request) (R
 
 	rebased := strings.TrimSpace(request.BaseRevision) != "" && request.BaseRevision != tip
 	if err := integrator.applyPatch(ctx, scratch, request.Patch); err != nil {
+		// Before calling it a conflict, check whether the change is simply
+		// already present: `git apply` refuses a patch that has been applied,
+		// and that is indistinguishable from a conflict by exit code alone.
+		if integrator.alreadyApplied(ctx, scratch, request.Patch) {
+			return Result{Revision: tip, AlreadyIntegrated: true}, nil
+		}
 		// A patch that will not replay onto newer work is a conflict for a
 		// person or a repair task to resolve. It is never forced.
 		return Result{}, fmt.Errorf("%w: task %s onto %s: %v", ErrConflict, request.TaskID, short(tip), err)
@@ -180,6 +191,12 @@ func (integrator *Integrator) Integrate(ctx context.Context, request Request) (R
 		return Result{}, err
 	}
 	if len(bytes.TrimSpace(staged)) == 0 {
+		// The patch produced no change against this tip, which means it is
+		// already there. That is what a retry after a lost completion looks
+		// like, so it is success at the current revision rather than an error.
+		if rebased {
+			return Result{Revision: tip, Rebased: true, AlreadyIntegrated: true}, nil
+		}
 		return Result{}, ErrEmptyPatch
 	}
 
@@ -290,3 +307,17 @@ func short(revision string) string {
 	}
 	return revision
 }
+
+// alreadyApplied reports whether a patch is already present in the tree. It is
+// how an interrupted integration is distinguished from a genuine conflict.
+func (integrator *Integrator) alreadyApplied(ctx context.Context, dir string, patch []byte) bool {
+	command := exec.CommandContext(ctx, "git", "apply", "--reverse", "--check", "-")
+	command.Dir = dir
+	command.Stdin = bytes.NewReader(patch)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return command.Run() == nil
+}
+
+// RefName is the conventional integration ref for a board, as a method so a
+// caller can depend on the setup interface rather than the package.
+func (integrator *Integrator) RefName(boardID string) string { return RefName(boardID) }

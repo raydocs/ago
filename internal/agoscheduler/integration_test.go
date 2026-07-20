@@ -19,6 +19,7 @@ import (
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agorelay"
 	"claudexflow/internal/agoscheduler"
+	"claudexflow/internal/agoverify"
 	"claudexflow/internal/agoworktree"
 )
 
@@ -43,15 +44,42 @@ func (m *writingModel) CompleteJSON(_ context.Context, request agorelay.Request,
 	return roundTripJSON(plan, target)
 }
 
-// acceptingVerifierProvider accepts anything with evidence. Its independence is
-// its identity: the scheduler calls it under the verifier id, never the worker.
-type acceptingVerifierProvider struct{}
+// acceptingJudge answers every criterion from the durable evidence it is given.
+// It is a separate type from the executor: independence here is structural, not
+// a different identity string on the same object.
+type acceptingJudge struct{}
 
-func (acceptingVerifierProvider) Verify(_ context.Context, dispatch agoboardruntime.Dispatch, result agoboardruntime.ExecutionResult) (agoboardruntime.Review, error) {
-	if result.Summary == "" {
-		return agoboardruntime.Review{Accepted: false, Reason: "没有证据"}, nil
+func (acceptingJudge) Judge(_ context.Context, input agoverify.JudgeInput) (agoverify.JudgeVerdict, error) {
+	return agoverify.JudgeVerdict{
+		Decision: agoverify.DecisionAccept, Summary: "证据满足验收标准",
+		Criteria: answerAll(input, true, "证据支持"),
+	}, nil
+}
+
+type rejectingJudge struct{}
+
+func (rejectingJudge) Judge(_ context.Context, input agoverify.JudgeInput) (agoverify.JudgeVerdict, error) {
+	return agoverify.JudgeVerdict{
+		Decision: agoverify.DecisionBlockedPolicy, Summary: "不符合要求",
+		Criteria: answerAll(input, false, "不符合要求"),
+	}, nil
+}
+
+func answerAll(input agoverify.JudgeInput, passed bool, reason string) []agoverify.CriterionOutcome {
+	outcomes := make([]agoverify.CriterionOutcome, 0, len(input.AcceptanceCriteria))
+	for _, criterion := range input.AcceptanceCriteria {
+		outcomes = append(outcomes, agoverify.CriterionOutcome{Criterion: criterion, Passed: passed, Reason: reason})
 	}
-	return agoboardruntime.Review{Accepted: true, Reason: "证据满足验收标准"}, nil
+	return outcomes
+}
+
+func mustVerify(t *testing.T, judge agoverify.Judge, artifacts *agoartifact.Store) *agoverify.Verifier {
+	t.Helper()
+	verification, err := agoverify.New(agoverify.Options{Judge: judge, Artifacts: artifacts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return verification
 }
 
 func initGitRepository(t *testing.T) string {
@@ -168,7 +196,7 @@ func TestAcceptedWorkIsIntegratedAndInheritedDownstream(t *testing.T) {
 	}
 
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
-		Store: store, Runtime: runtime, Executor: executor, Verifier: acceptingVerifierProvider{},
+		Store: store, Runtime: runtime, Executor: executor, Verification: mustVerify(t, acceptingJudge{}, artifacts),
 		Integrator: integrator, Artifacts: artifacts,
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: time.Minute, Now: time.Now,
@@ -307,8 +335,8 @@ func TestRejectedWorkIsNeverIntegrated(t *testing.T) {
 
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
 		Store: store, Runtime: runtime, Executor: executor,
-		Verifier:   rejectingVerifier{},
-		Integrator: integrator, Artifacts: artifacts,
+		Verification: mustVerify(t, rejectingJudge{}, artifacts),
+		Integrator:   integrator, Artifacts: artifacts,
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: time.Minute, Now: time.Now,
 	})

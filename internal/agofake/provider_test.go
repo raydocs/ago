@@ -8,12 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"claudexflow/internal/agoartifact"
 	"claudexflow/internal/agoboardprotocol"
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agofake"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoscheduler"
+	"claudexflow/internal/agoverify"
 )
 
 const chineseObjective = "分析当前仓库，为 README 增加一个快速开始章节，运行相关测试，并生成完成报告。"
@@ -41,7 +43,20 @@ func newFixture(t *testing.T, script agofake.Script) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	artifacts, err := agoartifact.Open(agoartifact.Options{Root: filepath.Join(t.TempDir(), "artifacts")})
+	if err != nil {
+		t.Fatal(err)
+	}
 	provider, err := agofake.New(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two separate objects: the executor cannot certify its own work.
+	judge, err := agofake.NewVerifier(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := agoverify.New(agoverify.Options{Judge: judge, Artifacts: artifacts})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +66,7 @@ func newFixture(t *testing.T, script agofake.Script) *fixture {
 		LeaseDuration: time.Minute, Now: testClock.Now,
 	})
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
-		Store: store, Runtime: runtime, Executor: provider, Verifier: provider,
+		Store: store, Runtime: runtime, Executor: provider.WithArtifacts(artifacts), Verification: verification,
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: time.Minute, Now: testClock.Now,
 	})

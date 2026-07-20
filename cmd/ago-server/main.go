@@ -1,10 +1,17 @@
-// Command ago-server runs the local Ago Goal and Board API over a durable
-// SQLite Work Graph.
+// Command ago-server runs Ago: a Chinese goal becomes a durable task graph that
+// a background scheduler executes, an independent verifier judges, and an
+// integration authority promotes onto an Ago-owned git ref.
 //
-// It is the demo entry point for increments D1 and D2: a Chinese goal creates a
-// durable DAG and board, and the browser follows progress through a resumable
-// server-sent event stream. Scheduling is still driven by explicit advance
-// calls; the background scheduler arrives with D3.
+// Two modes:
+//
+//   - fake: deterministic and offline. No credential, no network. The executor
+//     and the verifier are still separate implementations, so the offline demo
+//     exercises the same independence the real one does.
+//   - relay: a real model behind an OpenAI-compatible endpoint plans, executes,
+//     and verifies — as three separate roles making three separate calls.
+//
+// Credentials come from the environment only. They are never accepted as a
+// flag, because a flag lands in shell history and in the process list.
 package main
 
 import (
@@ -24,11 +31,19 @@ import (
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agoboardui"
+	"claudexflow/internal/agoexec"
 	"claudexflow/internal/agofake"
+	"claudexflow/internal/agointegrate"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoredact"
+	"claudexflow/internal/agorelay"
+	"claudexflow/internal/agorelayplanner"
+	"claudexflow/internal/agorelayverifier"
 	"claudexflow/internal/agoscheduler"
 	"claudexflow/internal/agosupervisor"
+	"claudexflow/internal/agoverify"
+	"claudexflow/internal/agoworktree"
+	"strings"
 
 	"flag"
 )
@@ -48,13 +63,18 @@ func run() error {
 	flags := flag.NewFlagSet("ago-server", flag.ContinueOnError)
 	databasePath := flags.String("db", filepath.Join(home, ".ago", "demo", "ago.db"), "Ago board SQLite database")
 	listen := flags.String("listen", "127.0.0.1:4317", "loopback listen address")
-	executionMode := flags.String("executor", agoboardapi.ExecutionModeFake, "executor family for admitted goals")
-	scenario := flags.String("scenario", string(agofake.OutcomeSuccess), "scripted fake outcome: success, temporary_failure_then_success, permanent_failure, timeout, verifier_retry_with_feedback, blocked_needs_input, blocked_policy")
+	mode := flags.String("mode", modeFake, `execution mode: "fake" (offline, no credential) or "relay" (a real model behind an OpenAI-compatible endpoint)`)
+	scenario := flags.String("scenario", string(agofake.OutcomeSuccess), "scripted outcome, fake mode only: success, temporary_failure_then_success, permanent_failure, timeout, verifier_retry_with_feedback, blocked_needs_input, blocked_policy")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
-	if *executionMode != agoboardapi.ExecutionModeFake {
-		return fmt.Errorf("unsupported executor %q: only %q is available until the Claude Code provider lands", *executionMode, agoboardapi.ExecutionModeFake)
+	if *mode != modeFake && *mode != modeRelay {
+		return fmt.Errorf("unsupported mode %q: use %q or %q", *mode, modeFake, modeRelay)
+	}
+	// A scripted outcome is a property of the offline demo. Accepting one in
+	// relay mode would let a run look scripted while a real model did the work.
+	if *mode == modeRelay && *scenario != string(agofake.OutcomeSuccess) {
+		return fmt.Errorf("--scenario applies to %q mode only", modeFake)
 	}
 	if host, _, err := net.SplitHostPort(*listen); err != nil {
 		return fmt.Errorf("invalid listen address %q: %w", *listen, err)
@@ -73,14 +93,16 @@ func run() error {
 	}
 	defer store.Close()
 
-	runtime := agoboardruntime.New(store, agoplanner.DemoPlanner{}, agoboardruntime.Options{
-		CoordinatorID: "ago-scheduler",
-		WorkerID:      "ago-demo-worker",
-		VerifierID:    "ago-verifier",
-		LeaseDuration: 5 * time.Minute,
-		Now:           time.Now,
-	})
-	artifacts, err := agoartifact.Open(agoartifact.Options{Root: filepath.Join(filepath.Dir(*databasePath), "artifacts")})
+	stateDir := filepath.Dir(*databasePath)
+	artifacts, err := agoartifact.Open(agoartifact.Options{Root: filepath.Join(stateDir, "artifacts")})
+	if err != nil {
+		return err
+	}
+	worktrees, err := agoworktree.New(agoworktree.Options{Root: filepath.Join(stateDir, "worktrees")})
+	if err != nil {
+		return err
+	}
+	integrator, err := agointegrate.New(agointegrate.Options{Root: filepath.Join(stateDir, "integration")})
 	if err != nil {
 		return err
 	}
@@ -91,14 +113,25 @@ func run() error {
 			return fmt.Errorf("reconcile artifact store: %w", err)
 		}
 	}
-	provider, err := agofake.New(agofake.Script{Default: agofake.Outcome(*scenario)})
+	planner, executor, judge, err := buildRoles(*mode, *scenario, artifacts, worktrees, integrator)
 	if err != nil {
 		return err
 	}
-	provider = provider.WithArtifacts(artifacts)
+	runtime := agoboardruntime.New(store, planner, agoboardruntime.Options{
+		CoordinatorID: "ago-scheduler",
+		WorkerID:      "ago-worker",
+		VerifierID:    "ago-verifier",
+		LeaseDuration: 5 * time.Minute,
+		Now:           time.Now,
+	})
+	verification, err := agoverify.New(agoverify.Options{Judge: judge, Artifacts: artifacts})
+	if err != nil {
+		return err
+	}
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
-		Store: store, Runtime: runtime, Executor: provider, Verifier: provider,
-		CoordinatorID: "ago-scheduler", WorkerID: "ago-demo-worker", VerifierID: "ago-verifier",
+		Store: store, Runtime: runtime, Executor: executor, Verification: verification,
+		Integrator: integrator, Artifacts: artifacts,
+		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: 5 * time.Minute, Interval: time.Second, Now: time.Now,
 		Redactor: agoredact.NewFromEnvironment(os.Getenv),
 	})
@@ -120,8 +153,8 @@ func run() error {
 		return err
 	}
 	server, err := agoboardapi.New(agoboardapi.Options{
-		Runtime: runtime, Store: store, Providers: demoProviders(), Artifacts: artifacts,
-		Decisions: supervisorRunner,
+		Runtime: runtime, Store: store, Providers: describeRoles(*mode), Artifacts: artifacts,
+		Decisions: supervisorRunner, Integration: integrator,
 	})
 	if err != nil {
 		return err
@@ -150,7 +183,7 @@ func run() error {
 
 	// Startup diagnostics are deliberately free of credentials and paths that
 	// could contain them.
-	fmt.Printf("Ago is ready\nUI:       http://%s\nDatabase: %s\nProvider: %s\nScenario: %s\n", listener.Addr(), *databasePath, *executionMode, *scenario)
+	printReady(listener.Addr().String(), *databasePath, *mode, *scenario)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -196,4 +229,143 @@ func demoProviders() []agoboardapi.Provider {
 		{ID: "ago-demo-executor", Kind: "executor", Capabilities: []string{"repo-read", "repo-write", "tests", "report"}, AuthConfigured: false},
 		{ID: "ago-verifier", Kind: "verifier", Capabilities: []string{"verification"}, AuthConfigured: false},
 	}
+}
+
+const (
+	modeFake  = "fake"
+	modeRelay = "relay"
+)
+
+// Relay configuration comes from the environment. A credential passed as a flag
+// would be visible in shell history and in the process list, so it is not
+// accepted there at all.
+const (
+	envBaseURL       = "AGO_RELAY_BASE_URL"
+	envAPIKey        = "AGO_RELAY_API_KEY"
+	envPlannerModel  = "AGO_PLANNER_MODEL"
+	envExecutorModel = "AGO_EXECUTOR_MODEL"
+	envVerifierModel = "AGO_VERIFIER_MODEL"
+)
+
+// buildRoles constructs the three roles for a mode.
+//
+// They are separate implementations, not one object under three names. In relay
+// mode they may share a transport and even an endpoint, but each makes its own
+// call with its own model mapping — which is what makes the verifier's opinion
+// independent of the executor's.
+func buildRoles(mode, scenario string, artifacts *agoartifact.Store, worktrees *agoworktree.Manager, integrator *agointegrate.Integrator) (agoplanner.Planner, agoboardruntime.Executor, agoverify.Judge, error) {
+	switch mode {
+	case modeFake:
+		provider, err := agofake.New(agofake.Script{Default: agofake.Outcome(scenario)})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		judge, err := agofake.NewVerifier(agofake.Script{Default: agofake.Outcome(scenario)})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return agoplanner.DemoPlanner{}, provider.WithArtifacts(artifacts), judge, nil
+	case modeRelay:
+		baseURL := os.Getenv(envBaseURL)
+		if strings.TrimSpace(baseURL) == "" {
+			return nil, nil, nil, fmt.Errorf("relay mode requires %s", envBaseURL)
+		}
+		if strings.TrimSpace(os.Getenv(envAPIKey)) == "" {
+			return nil, nil, nil, fmt.Errorf("relay mode requires %s in the environment (never as a flag)", envAPIKey)
+		}
+		client := func(model, fallback string) (*agorelay.Client, error) {
+			name := os.Getenv(model)
+			if strings.TrimSpace(name) == "" {
+				name = fallback
+			}
+			return agorelay.New(agorelay.Profile{
+				ID: "relay-" + name, BaseURL: baseURL, Model: name, APIKeyEnv: envAPIKey,
+				Timeout: 3 * time.Minute, MaxOutputBytes: 1 << 20,
+			}, nil, os.Getenv)
+		}
+		plannerClient, err := client(envPlannerModel, "claude-sonnet-5")
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		executorClient, err := client(envExecutorModel, "claude-sonnet-5")
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		verifierClient, err := client(envVerifierModel, "claude-sonnet-5")
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		planner, err := agorelayplanner.New(agorelayplanner.Options{Model: plannerClient})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		executor, err := agoexec.New(agoexec.Options{
+			Model: executorClient, Worktrees: worktrees, Artifacts: artifacts,
+			Commands: agoexec.SystemCommands{}, Timeout: 5 * time.Minute,
+		})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		judge, err := agorelayverifier.New(agorelayverifier.Options{Model: verifierClient})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return planner, executor, agoverify.RelayJudge{Verifier: judge}, nil
+	}
+	return nil, nil, nil, fmt.Errorf("unsupported mode %q", mode)
+}
+
+// describeRoles reports the capability roster. It states whether a credential
+// is configured and never what it is, and it never echoes the base URL, which
+// can itself carry credentials in a query string.
+func describeRoles(mode string) []agoboardapi.Provider {
+	if mode == modeFake {
+		return []agoboardapi.Provider{
+			{ID: "ago-demo-planner", Kind: "planner", Capabilities: []string{"planning"}},
+			{ID: "ago-demo-executor", Kind: "executor", Capabilities: []string{"repo-read", "repo-write", "tests", "report"}},
+			{ID: "ago-demo-verifier", Kind: "verifier", Capabilities: []string{"verification"}},
+		}
+	}
+	configured := strings.TrimSpace(os.Getenv(envAPIKey)) != ""
+	model := func(name, fallback string) string {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			return value
+		}
+		return fallback
+	}
+	return []agoboardapi.Provider{
+		{ID: "relay-planner", Kind: "planner", Model: model(envPlannerModel, "claude-sonnet-5"),
+			Capabilities: []string{"planning"}, AuthConfigured: configured},
+		{ID: "relay-executor", Kind: "executor", Model: model(envExecutorModel, "claude-sonnet-5"),
+			Capabilities: []string{"repo-read", "repo-write", "tests"}, AuthConfigured: configured},
+		{ID: "relay-verifier", Kind: "verifier", Model: model(envVerifierModel, "claude-sonnet-5"),
+			Capabilities: []string{"verification"}, AuthConfigured: configured},
+	}
+}
+
+// printReady prints startup diagnostics. Nothing here can carry a credential:
+// the mode, the model names, and local paths only.
+func printReady(address, databasePath, mode, scenario string) {
+	fmt.Printf("Ago is ready\nUI:       http://%s\nDatabase: %s\nMode:     %s\n", address, databasePath, mode)
+	if mode == modeFake {
+		fmt.Printf("Scenario: %s\n", scenario)
+		return
+	}
+	fmt.Printf("Planner:  %s\nExecutor: %s\nVerifier: %s\nAuth:     %s\n",
+		envOr(envPlannerModel, "claude-sonnet-5"), envOr(envExecutorModel, "claude-sonnet-5"),
+		envOr(envVerifierModel, "claude-sonnet-5"), configuredLabel())
+}
+
+func envOr(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func configuredLabel() string {
+	if strings.TrimSpace(os.Getenv(envAPIKey)) != "" {
+		return "configured"
+	}
+	return "missing"
 }

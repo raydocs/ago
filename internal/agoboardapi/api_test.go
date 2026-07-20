@@ -19,6 +19,7 @@ import (
 	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoscheduler"
+	"claudexflow/internal/agoverify"
 )
 
 const (
@@ -70,7 +71,7 @@ func newBoardTestServerWithScheduler(t *testing.T, dbPath string, providers []ag
 		t.Fatalf("agoboardapi.New: %v", err)
 	}
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
-		Store: store, Runtime: runtime, Executor: &fakeAPIExecutor{}, Verifier: &fakeAPIVerifier{},
+		Store: store, Runtime: runtime, Executor: &fakeAPIExecutor{}, Verification: mustVerification(t, &fakeAPIJudge{}, nil),
 		CoordinatorID: apiCoordinatorID, WorkerID: apiWorkerID, VerifierID: apiVerifierID,
 		LeaseDuration: time.Minute,
 		Now:           func() time.Time { return time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC) },
@@ -113,11 +114,17 @@ func (*fakeAPIExecutor) Execute(_ context.Context, dispatch agoboardruntime.Disp
 	}, nil
 }
 
-// fakeAPIVerifier deterministically accepts every attempt's evidence.
-type fakeAPIVerifier struct{}
+// fakeAPIJudge answers every criterion from the evidence it is handed. It is a
+// separate type from the executor on purpose: a verifier that could see the
+// executor's state would be certifying its own work.
+type fakeAPIJudge struct{}
 
-func (*fakeAPIVerifier) Verify(_ context.Context, _ agoboardruntime.Dispatch, _ agoboardruntime.ExecutionResult) (agoboardruntime.Review, error) {
-	return agoboardruntime.Review{Accepted: true, Reason: "演示验收通过"}, nil
+func (*fakeAPIJudge) Judge(_ context.Context, input agoverify.JudgeInput) (agoverify.JudgeVerdict, error) {
+	criteria := make([]agoverify.CriterionOutcome, 0, len(input.AcceptanceCriteria))
+	for _, criterion := range input.AcceptanceCriteria {
+		criteria = append(criteria, agoverify.CriterionOutcome{Criterion: criterion, Passed: true, Reason: "证据支持"})
+	}
+	return agoverify.JudgeVerdict{Decision: agoverify.DecisionAccept, Summary: "演示验收通过", Criteria: criteria}, nil
 }
 
 // -- wire-shape types matching the frozen agoboardapi contract --------------
@@ -760,7 +767,7 @@ func newBoardTestServerWithFailingExecutor(t *testing.T, dbPath string) (http.Ha
 		t.Fatal(err)
 	}
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
-		Store: store, Runtime: runtime, Executor: failingExecutor{}, Verifier: &fakeAPIVerifier{},
+		Store: store, Runtime: runtime, Executor: failingExecutor{}, Verification: mustVerification(t, &fakeAPIJudge{}, nil),
 		CoordinatorID: apiCoordinatorID, WorkerID: apiWorkerID, VerifierID: apiVerifierID,
 		LeaseDuration: time.Minute, Now: clock,
 	})
