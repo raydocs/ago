@@ -47,6 +47,19 @@ export async function makeFixtureRepository() {
   }
   await mkdir(path.join(resolved, "docs"), { recursive: true });
   await writeFile(path.join(resolved, "README.md"), "# fixture\n", "utf8");
+  // A real git repository, because Ago promotes accepted work onto its own ref
+  // and refuses a goal whose repository it cannot establish that ref in. The
+  // identity is set locally so the suite never depends on the machine having a
+  // git user configured.
+  for (const args of [
+    ["init", "-b", "main"],
+    ["config", "user.email", "fixture@ago.localhost"],
+    ["config", "user.name", "Ago E2E Fixture"],
+    ["add", "-A"],
+    ["commit", "-m", "fixture"],
+  ]) {
+    execFileSync("git", args, { cwd: resolved, stdio: "pipe" });
+  }
   return resolved;
 }
 

@@ -9,9 +9,9 @@ Ago turns one user objective into a live execution board. The board is not a pas
 ## Try it
 
 ```bash
-go build -o ago-server ./cmd/ago-server
-./ago-server demo --executor fake     # offline, no credential
-./ago-server demo --executor relay    # a real model does the work
+go build -o ago ./cmd/ago
+./ago demo --executor fake     # offline, no credential
+./ago demo --executor relay    # a real model does the work
 ```
 
 Then open the printed URL. Full walkthrough: [快速开始](docs/ago-quickstart.zh.md).

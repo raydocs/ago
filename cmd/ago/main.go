@@ -35,6 +35,7 @@ import (
 	"claudexflow/internal/agopluginhost"
 	"claudexflow/internal/agopluginprotocol"
 	"claudexflow/internal/agoprotocol"
+	"claudexflow/internal/agoserve"
 	"claudexflow/internal/agothreadstore"
 	"claudexflow/internal/agoverifier"
 	"claudexflow/internal/agowritebroker"
@@ -49,6 +50,12 @@ func main() {
 
 func run() error {
 	mode, args := dispatch(os.Args[1:])
+	if mode == "demo" {
+		// The demo is the same orchestration stack the server runs, linked in
+		// rather than shelled out to: a user who built `ago` must not also have
+		// to find and install a second binary.
+		return agoserve.Demo(args, os.Stdout)
+	}
 	if mode == "client" {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -63,6 +70,9 @@ func dispatch(args []string) (string, []string) {
 	}
 	if args[0] == "daemon" {
 		return "daemon", args[1:]
+	}
+	if args[0] == "demo" {
+		return "demo", args[1:]
 	}
 	return "client", args
 }
