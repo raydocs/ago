@@ -177,6 +177,23 @@ type modelListResponse struct {
 	} `json:"data"`
 }
 
+// mergeInstructions repeats the system instructions inside the user message.
+//
+// Not every OpenAI-compatible endpoint delivers the system role. A local
+// agent-style proxy in particular replaces it with its own, and the caller's
+// instructions vanish silently: against one such relay the verifier's output
+// contract was ignored on every call — the model invented its own field names
+// and omitted the verdict entirely — so verification could never conclude.
+// The user role is the only one every endpoint passes through, so the
+// instructions go there too. The system message is still sent, because
+// providers that do honour it give it higher priority than user text.
+func mergeInstructions(system, user string) string {
+	if strings.TrimSpace(system) == "" {
+		return user
+	}
+	return system + "\n\n" + user
+}
+
 // Complete performs one bounded chat completion.
 func (c *Client) Complete(ctx context.Context, request Request) (Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.profile.Timeout)
@@ -188,7 +205,7 @@ func (c *Client) Complete(ctx context.Context, request Request) (Response, error
 		Model: c.profile.Model,
 		Messages: []chatMessage{
 			{Role: "system", Content: request.System},
-			{Role: "user", Content: request.User},
+			{Role: "user", Content: mergeInstructions(request.System, request.User)},
 		},
 	}
 	if request.SchemaName != "" && len(request.Schema) > 0 {

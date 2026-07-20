@@ -515,10 +515,10 @@ func (c *escapingCommands) Run(_ context.Context, dir, name string, args ...stri
 	return "built", 0, nil
 }
 
-// A verification command runs model-authored code AFTER the first scope check.
-// Whatever it writes ends up in the patch, so the gate has to be applied again
-// to the state the patch actually captures — otherwise an out-of-scope file
-// reaches the integration ref while the evidence names only in-scope ones.
+// A verification command runs model-authored code AFTER the change has been
+// checked. Whatever it writes must never reach the patch: a command measures
+// the work, it does not author it. The out-of-scope file is discarded and
+// reported rather than integrated.
 func TestCommandsCannotWriteOutsideScopeAfterTheFirstCheck(t *testing.T) {
 	f := newFixture(t, successPlan(), nil)
 	escaping := &escapingCommands{}
@@ -529,26 +529,83 @@ func TestCommandsCannotWriteOutsideScopeAfterTheFirstCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = rebuilt.Execute(context.Background(), dispatchFor(f.repo, "README.md"))
-	if err == nil {
-		t.Fatal("a command wrote outside the declared scope and the attempt was accepted")
+	result, err := rebuilt.Execute(context.Background(), dispatchFor(f.repo, "README.md"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
 	}
 	if escaping.dir == "" {
 		t.Fatal("the command never ran, so the test proves nothing")
 	}
-	var classified interface {
-		FailureClass() agoboardprotocol.FailureClass
+	// Not in the evidence, and — the part that matters — not in the patch that
+	// integration would apply.
+	for _, file := range result.Result.ChangedFiles {
+		if strings.Contains(file.Path, "deploy.yml") {
+			t.Fatalf("a file written by a command is being reported as work: %#v", result.Result.ChangedFiles)
+		}
 	}
-	if !errors.As(err, &classified) || classified.FailureClass() != agoboardprotocol.FailurePolicy {
-		t.Fatalf("failure class = %v, want policy", err)
+	if patch := result.Result.Patch; patch != nil {
+		for _, path := range patch.ChangedPaths {
+			if strings.Contains(path, "deploy.yml") {
+				t.Fatalf("a file written by a command reached the patch: %#v", patch.ChangedPaths)
+			}
+		}
 	}
-	if !strings.Contains(err.Error(), "deploy.yml") {
-		t.Fatalf("the error does not name the file the command wrote: %v", err)
+	// The user is told it happened; it is discarded, not hidden.
+	if !strings.Contains(strings.Join(result.Result.Warnings, " "), "deploy.yml") {
+		t.Fatalf("the discarded file was not reported: %#v", result.Result.Warnings)
 	}
 	// And nothing reached the canonical repository.
 	if _, statErr := os.Stat(filepath.Join(f.repo, ".github")); statErr == nil {
 		t.Fatal("the out-of-scope file reached the canonical repository")
 	}
+}
+
+// The work the model actually proposed survives a command that rewrites it:
+// the checkpoint is the model's edits, so a formatter or a build step cannot
+// quietly change what is delivered.
+func TestCommandsCannotRewriteTheDeliveredChange(t *testing.T) {
+	f := newFixture(t, successPlan(), nil)
+	rewriting := &rewritingCommands{path: "README.md", contents: "written by a command, not the model\n"}
+	artifacts := mustArtifacts(t)
+	rebuilt, err := agoexec.New(agoexec.Options{
+		Model: f.model, Worktrees: f.worktrees, Artifacts: artifacts, Commands: rewriting,
+		Timeout: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := rebuilt.Execute(context.Background(), dispatchFor(f.repo, "README.md"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !rewriting.ran {
+		t.Fatal("the command never ran, so the test proves nothing")
+	}
+	if result.Result.Patch == nil {
+		t.Fatal("no patch was produced")
+	}
+	patch, err := artifacts.Bytes(context.Background(), agoartifact.Descriptor{
+		ID: result.Result.Patch.ArtifactID, SHA256: result.Result.Patch.SHA256, Bytes: result.Result.Patch.Bytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(patch), "written by a command") {
+		t.Fatalf("a command's rewrite reached the patch:\n%s", patch)
+	}
+}
+
+// rewritingCommands overwrites a file the model legitimately changed.
+type rewritingCommands struct {
+	path     string
+	contents string
+	ran      bool
+}
+
+func (c *rewritingCommands) Run(_ context.Context, dir, name string, args ...string) (string, int, error) {
+	c.ran = true
+	_ = os.WriteFile(filepath.Join(dir, c.path), []byte(c.contents), 0o600)
+	return "ok", 0, nil
 }
 
 func mustArtifacts(t *testing.T) *agoartifact.Store {
@@ -558,4 +615,56 @@ func mustArtifacts(t *testing.T) *agoartifact.Store {
 		t.Fatal(err)
 	}
 	return store
+}
+
+// A real toolchain writes caches into HOME. When HOME was the worktree itself,
+// `go test` left tens of thousands of build-cache and telemetry files in the
+// tree, and the scope check — correctly — read every one of them as an
+// out-of-scope write and failed honest work as a policy violation. The scratch
+// home is therefore outside the worktree.
+func TestChecksRunWithAHomeOutsideTheWorktree(t *testing.T) {
+	worktree := t.TempDir()
+	commands := agoexec.SystemCommands{}
+	// sh is used rather than go so the test does not depend on a toolchain, but
+	// the behaviour under test is the same: a tool writing into $HOME.
+	output, exitCode, err := commands.Run(context.Background(), worktree, "/bin/sh", "-c",
+		`printf '%s\n' "$HOME" && touch "$HOME/cache-file"`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, output %q", exitCode, output)
+	}
+	home := strings.TrimSpace(output)
+	if home == "" {
+		t.Fatal("the command was given no HOME at all")
+	}
+	if strings.HasPrefix(home, worktree) {
+		t.Fatalf("HOME %q is inside the worktree %q, so every tool cache lands in the tree", home, worktree)
+	}
+	if _, err := os.Stat(filepath.Join(worktree, "cache-file")); !os.IsNotExist(err) {
+		t.Fatalf("a file written to $HOME appeared in the worktree (stat error = %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "cache-file")); err != nil {
+		t.Fatalf("the file written to $HOME is not in the scratch home: %v", err)
+	}
+}
+
+// The cache variables are set explicitly, so a toolchain that derives its cache
+// location from something other than HOME still writes outside the worktree.
+func TestChecksRunWithToolCachesOutsideTheWorktree(t *testing.T) {
+	worktree := t.TempDir()
+	output, _, err := agoexec.SystemCommands{}.Run(context.Background(), worktree, "/bin/sh", "-c",
+		`printf '%s\n%s\n%s\n%s\n' "$GOCACHE" "$GOMODCACHE" "$XDG_CACHE_HOME" "$TMPDIR"`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, value := range strings.Fields(output) {
+		if value == "" {
+			t.Fatalf("a cache location was left unset: %q", output)
+		}
+		if strings.HasPrefix(value, worktree) {
+			t.Fatalf("cache location %q is inside the worktree %q", value, worktree)
+		}
+	}
 }

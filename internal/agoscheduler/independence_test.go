@@ -212,3 +212,67 @@ func newSchedulerWith(h *harness, executor agoboardruntime.Executor, verificatio
 }
 
 var _ = errors.Is
+
+// An outage that never ends must not become a silent stall.
+//
+// Verification is deferred a bounded number of times, and the bound used to be
+// enforced by skipping the evidence — after which nothing would ever look at it
+// again. The task stayed in verifying, a state no transition could leave, and a
+// supervisor read it as merely pending and spun until it ran out of steps. The
+// attempt is failed instead, on the record, so it can be escalated like any
+// other work that cannot be finished automatically.
+func TestVerificationThatNeverConcludesFailsTheAttemptInsteadOfStalling(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, filepath.Join(t.TempDir(), "board.db"))
+	defer h.store.Close()
+	h.createGoal(t, "board-never-concludes")
+
+	verification, err := agoverify.New(agoverify.Options{Judge: &unavailableJudge{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := newSchedulerWith(h, h.executor, verification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Well past MaxVerificationAttempts, so the bound is certainly reached.
+	for range agoboardprotocol.MaxVerificationAttempts + 5 {
+		if _, err := scheduler.RunOnce(ctx); err != nil {
+			t.Fatalf("a permanent verifier outage failed the cycle: %v", err)
+		}
+	}
+
+	board, err := h.store.Board(ctx, h.boardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranded := 0
+	for _, task := range board.Tasks {
+		if task.State == agoboardprotocol.TaskVerifying {
+			stranded++
+		}
+	}
+	if stranded > 0 {
+		t.Fatalf("%d task(s) are stranded in verifying with nothing able to move them", stranded)
+	}
+	// The failure says the verdict was never obtained — not that the work was
+	// judged and found wanting.
+	var failed []agoboardprotocol.Task
+	for _, task := range board.Tasks {
+		if task.State == agoboardprotocol.TaskFailed {
+			failed = append(failed, task)
+		}
+	}
+	if len(failed) == 0 {
+		t.Fatal("no task recorded a failure, so the exhausted verification left no trace")
+	}
+	for _, task := range failed {
+		if task.FailureClass != agoboardprotocol.FailureExhausted {
+			t.Fatalf("task %q failed with class %q, want exhausted: %s",
+				task.ID, task.FailureClass, task.BlockedReason)
+		}
+		if !strings.Contains(task.BlockedReason, "验收") {
+			t.Fatalf("task %q does not say verification was the problem: %q", task.ID, task.BlockedReason)
+		}
+	}
+}

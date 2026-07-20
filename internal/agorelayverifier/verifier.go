@@ -94,6 +94,10 @@ type Request struct {
 	ArtifactIDs  []string
 	TestNames    []string
 	BaseRevision string
+	// PatchText is the change itself, already checked against its recorded
+	// digest by the caller. It is what lets a criterion written in prose — a
+	// documented example, a report section — actually be judged.
+	PatchText string
 }
 
 // CriterionVerdict is the model's judgement of one acceptance criterion.
@@ -348,7 +352,23 @@ func systemPrompt() string {
 		"Every criterion you mark passed:true MUST cite at least one entry in evidence_refs. " +
 		"Every evidence_refs entry MUST be exactly the evidence id, one of the listed artifact ids, or one of the listed test names given to you below — citing anything else is a fabrication and the whole verdict will be rejected. " +
 		"Set \"verdict\" to \"accept\" only if every criterion is passed:true; otherwise use \"retry_with_feedback\" with repair_feedback describing what is missing, \"blocked_needs_input\" with missing_input describing what you need from a person, or \"blocked_policy\". " +
-		"Respond with ONLY one JSON object matching the requested schema. Do not include any explanation outside the JSON object."
+		"Respond with ONLY one JSON object. Do not include any explanation outside the JSON object.\n\n" +
+		// The wire request also carries a JSON schema, but not every provider
+		// honours response_format — one that ignores it invents its own field
+		// names ("met", "explanation") and omits "verdict" entirely, which
+		// fails closed and wastes the whole verification. Stating the contract
+		// in the prompt costs nothing and makes the schema an optimisation
+		// rather than a dependency.
+		"The object MUST use exactly these keys and no others:\n" +
+		"{\n" +
+		"  \"verdict\": \"accept\" | \"retry_with_feedback\" | \"blocked_needs_input\" | \"blocked_policy\",\n" +
+		"  \"summary\": \"<one sentence>\",\n" +
+		"  \"criteria\": [{\"criterion\": \"<exact copy>\", \"passed\": true|false, \"evidence_refs\": [\"<permitted citation>\"], \"reason\": \"<why>\"}],\n" +
+		"  \"repair_feedback\": \"<what to fix, when verdict is retry_with_feedback>\",\n" +
+		"  \"missing_input\": \"<what a person must supply, when verdict is blocked_needs_input>\",\n" +
+		"  \"risks\": [\"<optional>\"]\n" +
+		"}\n" +
+		"\"verdict\" is REQUIRED. Do not rename \"passed\" to \"met\", do not rename \"reason\" to \"explanation\", and do not nest the object under another key."
 }
 
 // buildUserPrompt renders the request into the prompt the model judges
@@ -407,7 +427,25 @@ func (v *Verifier) buildUserPrompt(request Request) string {
 	fmt.Fprintf(&b, "artifact_ids: %s\n", strings.Join(boundedStrings(request.ArtifactIDs), ", "))
 	fmt.Fprintf(&b, "test_names: %s\n", strings.Join(boundedStrings(request.TestNames), ", "))
 	fmt.Fprintf(&b, "base_revision: %s\n", boundedField(request.BaseRevision))
+
+	if strings.TrimSpace(request.PatchText) != "" {
+		b.WriteString("\nThe change itself, as a unified diff. This is the durable content that " +
+			"will be applied; judge the criteria against it rather than asking for the file text:\n")
+		b.WriteString(boundedPatch(request.PatchText))
+		b.WriteString("\n")
+	}
 	return b.String()
+}
+
+// maxPromptPatchChars bounds the rendered diff. The caller already bounds it;
+// this is the prompt builder refusing to trust that.
+const maxPromptPatchChars = 32 * 1024
+
+func boundedPatch(patch string) string {
+	if len(patch) > maxPromptPatchChars {
+		return patch[:maxPromptPatchChars] + "\n...[truncated]"
+	}
+	return patch
 }
 
 // boundedSlice caps items at maxPromptItems, so a huge evidence list cannot

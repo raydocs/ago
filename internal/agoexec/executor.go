@@ -26,7 +26,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -54,6 +56,8 @@ type Artifacts interface {
 type Worktrees interface {
 	Create(ctx context.Context, repositoryRoot, attemptID string) (agoworktree.Lease, error)
 	CreateAt(ctx context.Context, repositoryRoot, attemptID, revision string) (agoworktree.Lease, error)
+	Checkpoint(ctx context.Context, lease agoworktree.Lease) error
+	Restore(ctx context.Context, lease agoworktree.Lease) ([]string, error)
 	Patch(ctx context.Context, lease agoworktree.Lease) ([]byte, error)
 	Changes(ctx context.Context, lease agoworktree.Lease) ([]agoworktree.Change, error)
 	Remove(ctx context.Context, lease agoworktree.Lease) error
@@ -198,13 +202,39 @@ func (executor *Executor) Execute(ctx context.Context, dispatch agoboardruntime.
 		Warnings:     executor.options.Redactor.Strings(plan.Risks),
 		ChangedFiles: toChangedFiles(changes),
 	}
+	// A verification command is not an author. The change under review is the
+	// one the model proposed and that was just checked against the task's
+	// scope; anything a command writes afterwards — a compiled binary, a
+	// rewritten file, a downloaded module — is a side effect of measuring, not
+	// part of the work. It is recorded and thrown away.
+	//
+	// This is also the security boundary: without it `make` or `node build.js`
+	// could write anywhere it liked and have the result carried into the patch
+	// while the evidence named one in-scope file.
+	if err := executor.options.Worktrees.Checkpoint(ctx, lease); err != nil {
+		return agoboardruntime.ExecutionResult{}, Error{
+			Class:   agoboardprotocol.FailureRepository,
+			Message: executor.redact(fmt.Sprintf("无法在执行验证命令前固定工作区状态：%v", err)),
+		}
+	}
 	executor.runCommands(ctx, lease, dispatch, plan.Commands, &result)
+	discarded, err := executor.options.Worktrees.Restore(ctx, lease)
+	if err != nil {
+		return agoboardruntime.ExecutionResult{}, Error{
+			Class:   agoboardprotocol.FailureRepository,
+			Message: executor.redact(fmt.Sprintf("无法还原验证命令产生的副作用：%v", err)),
+		}
+	}
+	if len(discarded) > 0 {
+		result.Warnings = append(result.Warnings, executor.redact(fmt.Sprintf(
+			"验证命令产生的文件已被丢弃（命令只用于验证，不能作为交付内容）：%s",
+			strings.Join(discarded, ", "))))
+	}
 
-	// The commands just ran arbitrary model-authored code inside the worktree.
-	// Whatever they wrote is in the tree and would be in the patch, so the
-	// scope gate has to be applied again to the state the patch will actually
-	// capture. Checking only before the commands would let `node build.js` or
-	// `make` write anywhere while the evidence named one in-scope file.
+	// Re-read the tree the patch will actually capture and re-apply the scope
+	// gate to it. After the restore this should equal the checked state; the
+	// check stays because a boundary that is only correct when everything else
+	// worked is not a boundary.
 	changes, err = executor.options.Worktrees.Changes(ctx, lease)
 	if err != nil {
 		return agoboardruntime.ExecutionResult{}, Error{
@@ -327,6 +357,9 @@ func buildContract(dispatch agoboardruntime.Dispatch, listing string) string {
 		fmt.Fprintf(&builder, "- %s\n", criterion)
 	}
 	fmt.Fprintf(&builder, "\n允许修改的路径（超出即失败）：%s\n", strings.Join(dispatch.Task.PathScopes, ", "))
+	builder.WriteString("下面列出的所有文件都可以阅读；只有上面这些路径可以修改。\n")
+	builder.WriteString("commands 只用于验证（例如运行测试）。命令产生的任何文件都会被丢弃，不会成为交付内容；" +
+		"要交付的内容必须写在 edits 里。\n")
 	fmt.Fprintf(&builder, "这是第 %d 次尝试。\n\n", dispatch.AttemptNumber)
 	builder.WriteString("仓库当前内容：\n")
 	builder.WriteString(listing)
@@ -476,43 +509,96 @@ func toChangedFiles(changes []agoworktree.Change) []agoboardprotocol.ChangedFile
 
 // repositoryListing gives the model the content it is allowed to work with. It
 // is bounded so a large repository cannot produce an unbounded prompt.
+// repositoryListing renders what the model may READ.
+//
+// Reading and writing are different permissions. The listing used to be built
+// from the task's write scope, so a task allowed to change greet_test.go could
+// not see greet.go — and the model, correctly, refused to invent assertions
+// about an implementation it had never been shown. Every honest task of that
+// shape stopped and asked a person, which is exactly the interruption this
+// system exists to remove. Isolation is what makes reading safe: the worktree
+// is a private copy, and the write scope still governs what may change.
 func repositoryListing(root string, scopes []string) (string, error) {
+	files, err := readableFiles(root)
+	if err != nil {
+		return "", err
+	}
 	var builder strings.Builder
-	budget := 24 * 1024
-	for _, scope := range scopes {
-		target := filepath.Join(root, filepath.Clean(scope))
-		info, err := os.Stat(target)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
+	builder.WriteString("文件清单：\n")
+	for _, path := range files {
+		fmt.Fprintf(&builder, "- %s\n", path)
+	}
+	builder.WriteString("\n文件内容：\n")
+
+	// In-scope files first: those are the ones the model has to get exactly
+	// right, so they must never be the ones the budget truncates.
+	inScope := map[string]bool{}
+	for _, path := range files {
+		if agoworktree.WithinScope(path, scopes) {
+			inScope[path] = true
 		}
-		if err != nil {
-			return "", err
-		}
-		if info.IsDir() {
-			entries, err := os.ReadDir(target)
+	}
+	budget := 48 * 1024
+	for _, ordered := range [][]string{filterPaths(files, inScope, true), filterPaths(files, inScope, false)} {
+		for _, path := range ordered {
+			if budget <= 0 {
+				builder.WriteString("（其余文件内容已省略）\n")
+				return builder.String(), nil
+			}
+			content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
 			if err != nil {
 				return "", err
 			}
-			for _, entry := range entries {
-				fmt.Fprintf(&builder, "- %s/%s\n", scope, entry.Name())
+			if len(content) > budget {
+				content = content[:budget]
 			}
-			continue
-		}
-		content, err := os.ReadFile(target)
-		if err != nil {
-			return "", err
-		}
-		if len(content) > budget {
-			content = content[:budget]
-		}
-		budget -= len(content)
-		fmt.Fprintf(&builder, "--- %s ---\n%s\n", scope, content)
-		if budget <= 0 {
-			builder.WriteString("（内容已截断）\n")
-			break
+			budget -= len(content)
+			fmt.Fprintf(&builder, "--- %s ---\n%s\n", path, content)
 		}
 	}
 	return builder.String(), nil
+}
+
+func filterPaths(paths []string, member map[string]bool, want bool) []string {
+	var out []string
+	for _, path := range paths {
+		if member[path] == want {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+// readableFiles lists the worktree's own files. Git's own bookkeeping is
+// excluded — it is not project content, and it is large.
+func readableFiles(root string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		name := entry.Name()
+		if entry.IsDir() {
+			if path != root && (name == ".git" || name == "node_modules") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		relative, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		paths = append(paths, filepath.ToSlash(relative))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	return paths, nil
 }
 
 func (executor *Executor) redact(value string) string {
@@ -529,6 +615,28 @@ type SystemCommands struct {
 	// MaxOutputBytes bounds captured output so a runaway command cannot fill
 	// memory. Zero uses 256 KiB.
 	MaxOutputBytes int
+	// HomeDir is the HOME a check runs with. It must NOT be inside the
+	// worktree: real toolchains write caches into HOME, and a Go test run with
+	// HOME set to the worktree left tens of thousands of build-cache and
+	// telemetry files in the tree — every one of them read by the scope check
+	// as an out-of-scope write, which failed honest work as a policy
+	// violation. Zero uses a scratch directory outside any worktree, shared
+	// across commands so a warm toolchain cache is not thrown away.
+	HomeDir string
+}
+
+// scratchHome is the HOME every check shares when none was configured. It is
+// created once: a per-command home would discard the toolchain cache between
+// checks and turn every attempt into a cold build.
+var scratchHome = sync.OnceValues(func() (string, error) {
+	return os.MkdirTemp("", "ago-command-home-")
+})
+
+func (commands SystemCommands) home() (string, error) {
+	if strings.TrimSpace(commands.HomeDir) != "" {
+		return commands.HomeDir, nil
+	}
+	return scratchHome()
 }
 
 func (commands SystemCommands) Run(ctx context.Context, dir, name string, args ...string) (string, int, error) {
@@ -536,21 +644,35 @@ func (commands SystemCommands) Run(ctx context.Context, dir, name string, args .
 	if limit <= 0 {
 		limit = 256 * 1024
 	}
+	home, err := commands.home()
+	if err != nil {
+		return "", 0, fmt.Errorf("agoexec: prepare a scratch home for %q: %w", name, err)
+	}
 	command := exec.CommandContext(ctx, name, args...)
 	command.Dir = dir
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
 	// A minimal environment: a child gets what it needs to run, not the
-	// operator's credentials.
+	// operator's credentials. The cache variables are set explicitly rather
+	// than left to be derived from HOME, so a toolchain that ignores HOME
+	// still writes outside the worktree.
 	command.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + dir,
+		"HOME=" + home,
+		"XDG_CACHE_HOME=" + filepath.Join(home, ".cache"),
+		"TMPDIR=" + filepath.Join(home, "tmp"),
+		"GOCACHE=" + filepath.Join(home, "go-build"),
+		"GOMODCACHE=" + filepath.Join(home, "go-mod"),
+		"GOTELEMETRY=off",
 		"LANG=en_US.UTF-8",
+	}
+	if err := os.MkdirAll(filepath.Join(home, "tmp"), 0o700); err != nil {
+		return "", 0, fmt.Errorf("agoexec: prepare a scratch temporary directory for %q: %w", name, err)
 	}
 	var buffer bytes.Buffer
 	writer := &boundedWriter{limit: limit, buffer: &buffer}
 	command.Stdout, command.Stderr = writer, writer
-	err := command.Run()
+	err = command.Run()
 	exitCode := 0
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {

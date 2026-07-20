@@ -14,6 +14,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"claudexflow/internal/agoartifact"
@@ -535,9 +536,6 @@ func (scheduler *Scheduler) verifyPending(ctx context.Context, boardID string) e
 		if evidence.State != agoboardprotocol.EvidenceSubmitted {
 			continue
 		}
-		if evidence.VerificationAttempts > agoboardprotocol.MaxVerificationAttempts {
-			continue
-		}
 		pending = append(pending, evidence.ID)
 	}
 
@@ -555,6 +553,18 @@ func (scheduler *Scheduler) verifyPending(ctx context.Context, boardID string) e
 		}
 		task, found := taskByID(current, evidence.TaskID)
 		if !found || task.State != agoboardprotocol.TaskVerifying {
+			continue
+		}
+		// Verification that has been deferred to its bound is not "still
+		// pending": nothing will ever look at it again. Leaving it submitted
+		// stranded the task in verifying forever, which no state transition
+		// could reach and which a supervisor reads as merely-pending — so it
+		// spun. The attempt is failed instead, on the record, and escalated
+		// like any other exhausted work.
+		if evidence.VerificationAttempts > agoboardprotocol.MaxVerificationAttempts {
+			if err := scheduler.abandonVerification(ctx, boardID, current, task, evidence); err != nil {
+				return err
+			}
 			continue
 		}
 		proposal, _ := proposalFor(plan, evidence.TaskID)
@@ -613,6 +623,35 @@ func (scheduler *Scheduler) deferVerification(ctx context.Context, boardID, evid
 		Evidence:        &agoboardprotocol.EvidenceSpec{ID: evidenceID},
 		Reason:          scheduler.options.Redactor.String(fmt.Sprintf("验收暂时无法进行：%v", cause)),
 	})
+	return err
+}
+
+// abandonVerification ends an attempt whose evidence could never be judged.
+//
+// It is deliberately NOT a rejection of the work: nothing here says the worker
+// was wrong, only that this system could not obtain a verdict within its
+// bound. That distinction is why the failure class is exhausted rather than
+// verifier-feedback — repairing the task would aim a new attempt at a fault
+// that was never in the task.
+func (scheduler *Scheduler) abandonVerification(ctx context.Context, boardID string, board agoboardprotocol.Board, task agoboardprotocol.Task, evidence agoboardprotocol.Evidence) error {
+	reason := fmt.Sprintf("验收在 %d 次尝试后仍未取得结论：%s",
+		evidence.VerificationAttempts, strings.TrimSpace(task.BlockedReason))
+	_, err := scheduler.options.Store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
+		SchemaVersion:   agoboardprotocol.SchemaVersion,
+		ID:              "verify-abandon:" + evidence.ID,
+		ExpectedVersion: board.Version,
+		Actor:           agoboardprotocol.Actor{ID: scheduler.options.VerifierID, Role: agoboardprotocol.RoleVerifier},
+		TaskID:          evidence.TaskID,
+		AttemptID:       evidence.AttemptID,
+		FencingToken:    fencingTokenFor(board, evidence.AttemptID),
+		Evidence:        &agoboardprotocol.EvidenceSpec{ID: evidence.ID},
+		Type:            agoboardprotocol.CommandEvidenceReject,
+		FailureClass:    agoboardprotocol.FailureExhausted,
+		Reason:          scheduler.options.Redactor.String(reason),
+	})
+	if errors.Is(err, agoboardstore.ErrCommandConflict) {
+		return nil
+	}
 	return err
 }
 

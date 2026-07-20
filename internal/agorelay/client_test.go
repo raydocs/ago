@@ -111,7 +111,10 @@ func TestClientCompleteSendsModelSystemAndUserContent(t *testing.T) {
 		if message.Role == "system" && message.Content == "you are helpful" {
 			sawSystem = true
 		}
-		if message.Role == "user" && message.Content == "say hi" {
+		// The instructions must survive a relay that drops the system role, so
+		// the user message carries them as well as the request itself.
+		if message.Role == "user" && strings.Contains(message.Content, "say hi") &&
+			strings.Contains(message.Content, "you are helpful") {
 			sawUser = true
 		}
 	}

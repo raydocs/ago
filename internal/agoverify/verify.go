@@ -81,6 +81,16 @@ type JudgeInput struct {
 	ArtifactIDs        []string
 	TestNames          []string
 	BaseRevision       string
+	// PatchText is the actual content of the change, read back from the
+	// artifact store and checked against its recorded digest.
+	//
+	// Without it a judge can only see that a file changed and what its hash
+	// became, which is enough to verify code that a test exercises and useless
+	// for anything the criteria describe in prose — a README section, a report,
+	// a documented example. Every such task stopped and asked a person for the
+	// text, which is precisely the interruption this system exists to remove.
+	// It is bounded, and it is the same bytes integration will apply.
+	PatchText string
 }
 
 type JudgeVerdict struct {
@@ -95,7 +105,12 @@ type JudgeVerdict struct {
 // and still matches its recorded digest.
 type Artifacts interface {
 	Verify(ctx context.Context, descriptor agoartifact.Descriptor) error
+	Bytes(ctx context.Context, descriptor agoartifact.Descriptor) ([]byte, error)
 }
+
+// maxPatchTextBytes bounds how much of a change is rendered for judgement, so
+// one enormous diff cannot produce an unbounded prompt.
+const maxPatchTextBytes = 32 * 1024
 
 type Options struct {
 	Judge     Judge
@@ -210,13 +225,23 @@ func (verifier *Verifier) Verify(ctx context.Context, input Input) (Result, erro
 	}
 
 	// 6. Only now is judgement worth paying for.
+	// The change itself, read back from durable bytes rather than taken from
+	// the worker's account of them. A patch that cannot be read is a broken
+	// evidence chain, not a reason to guess.
+	patchText, err := verifier.patchText(ctx, result)
+	if err != nil {
+		return Result{
+			Decision: DecisionRetry, Deterministic: true,
+			Reason: "无法读取该次变更的补丁内容，证据链不完整。",
+		}, nil
+	}
 	verdict, err := verifier.options.Judge.Judge(ctx, JudgeInput{
 		Objective: input.Objective, TaskID: input.TaskID, AttemptNumber: input.AttemptNumber,
 		TaskTitle:       input.TaskTitle,
 		TaskDescription: input.TaskDescription, AcceptanceCriteria: input.AcceptanceCriteria,
 		Evidence: result, EvidenceID: input.EvidenceID,
 		ArtifactIDs: artifactIDs(result), TestNames: testNames(result),
-		BaseRevision: input.IntegratedRevision,
+		BaseRevision: input.IntegratedRevision, PatchText: patchText,
 	})
 	if err != nil {
 		// Unavailability is not a rejection. Propagate it so the caller leaves
@@ -254,6 +279,24 @@ func (verifier *Verifier) Verify(ctx context.Context, input Input) (Result, erro
 		}
 	}
 	return Result{Decision: verdict.Decision, Reason: reason, Criteria: verdict.Criteria}, nil
+}
+
+// patchText reads the recorded change back from the artifact store. A
+// read-only task has no patch, and that is not an error.
+func (verifier *Verifier) patchText(ctx context.Context, result agoboardprotocol.EvidenceResult) (string, error) {
+	if result.Patch == nil || verifier.options.Artifacts == nil {
+		return "", nil
+	}
+	content, err := verifier.options.Artifacts.Bytes(ctx, agoartifact.Descriptor{
+		ID: result.Patch.ArtifactID, Bytes: result.Patch.Bytes, SHA256: result.Patch.SHA256,
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(content) > maxPatchTextBytes {
+		return string(content[:maxPatchTextBytes]) + "\n（补丁内容已截断）\n", nil
+	}
+	return string(content), nil
 }
 
 func artifactIDs(result agoboardprotocol.EvidenceResult) []string {

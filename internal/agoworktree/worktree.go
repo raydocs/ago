@@ -284,6 +284,13 @@ func ViolatesScope(changes []Change, allowedScopes []string) []string {
 	return violations
 }
 
+// WithinScope reports whether a single path is inside the declared write
+// scope. It is exported so callers can distinguish what may be read from what
+// may be changed without reimplementing the prefix rules.
+func WithinScope(path string, scopes []string) bool {
+	return withinAnyScope(path, scopes)
+}
+
 func withinAnyScope(path string, scopes []string) bool {
 	if isUnsafeRelativePath(path) {
 		return false
@@ -351,6 +358,74 @@ func (m *Manager) CreateAt(ctx context.Context, repositoryRoot, attemptID, revis
 	}
 	lease.BaseRevision = strings.TrimSpace(string(resolved))
 	return lease, nil
+}
+
+// Checkpoint records the worktree's current contents as the state to return to.
+//
+// It exists because a verification command is not an author. `go build` drops
+// a compiled binary in the tree, a test runner writes fixtures, a formatter
+// rewrites files — none of that is the change the task proposed, and all of it
+// would otherwise land in the patch. Checkpoint marks the boundary; Restore
+// puts the tree back to it.
+//
+// It stages, rather than commits: the base revision must stay where it is so
+// the patch is still rendered against it.
+func (m *Manager) Checkpoint(ctx context.Context, lease Lease) error {
+	if strings.TrimSpace(lease.Path) == "" {
+		return fmt.Errorf("lease has no path")
+	}
+	if _, err := runGit(ctx, lease.Path, "add", "-A"); err != nil {
+		return fmt.Errorf("checkpoint worktree: %w", err)
+	}
+	return nil
+}
+
+// Restore undoes everything that happened since Checkpoint and reports which
+// paths it discarded.
+//
+// The discarded paths are returned rather than swallowed: a command that
+// rewrote a source file is something the user should see, even though the
+// rewrite is not kept.
+func (m *Manager) Restore(ctx context.Context, lease Lease) ([]string, error) {
+	if strings.TrimSpace(lease.Path) == "" {
+		return nil, fmt.Errorf("lease has no path")
+	}
+	// Tracked-or-staged paths whose working copy drifted from the checkpoint.
+	modified, err := runGit(ctx, lease.Path, "diff", "--name-only", "-z")
+	if err != nil {
+		return nil, fmt.Errorf("read command side effects: %w", err)
+	}
+	// Paths that did not exist at the checkpoint at all. Ignored files are
+	// deliberately included: a build output named in .gitignore is still
+	// something a command created, and leaving it would let it accumulate
+	// across the attempt.
+	untracked, err := runGit(ctx, lease.Path, "ls-files", "--others", "-z")
+	if err != nil {
+		return nil, fmt.Errorf("read command output files: %w", err)
+	}
+	discarded := append(splitNUL(modified), splitNUL(untracked)...)
+	sort.Strings(discarded)
+
+	// Restore staged content over the working tree, then delete everything the
+	// checkpoint did not contain. A file the model created is in the index, so
+	// this keeps it; a file a command created is not, so this removes it.
+	if _, err := runGit(ctx, lease.Path, "checkout-index", "-a", "-f"); err != nil {
+		return nil, fmt.Errorf("restore checkpointed contents: %w", err)
+	}
+	if _, err := runGit(ctx, lease.Path, "clean", "-fdx"); err != nil {
+		return nil, fmt.Errorf("remove files created after the checkpoint: %w", err)
+	}
+	return discarded, nil
+}
+
+func splitNUL(out []byte) []string {
+	var paths []string
+	for _, part := range strings.Split(string(out), "\x00") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			paths = append(paths, trimmed)
+		}
+	}
+	return paths
 }
 
 // Patch renders everything the worktree changed as a durable binary-safe patch.

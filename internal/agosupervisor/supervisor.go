@@ -91,6 +91,10 @@ type Options struct {
 	// must be a coordinator: the supervisor may plan, never execute.
 	CoordinatorID string
 	Now           func() time.Time
+	// After is the injected timer used when the only remaining work is a
+	// scheduled retry. Defaults to time.After; a test supplies its own so no
+	// test is ever paced by real time.
+	After func(time.Duration) <-chan time.Time
 	// OnDecision is called when a decision is queued for the user.
 	OnDecision func(Decision)
 }
@@ -110,6 +114,9 @@ func New(options Options) (*Supervisor, error) {
 	}
 	if options.Now == nil {
 		options.Now = time.Now
+	}
+	if options.After == nil {
+		options.After = time.After
 	}
 	if options.Authorize.MaxRepairsPerTask <= 0 {
 		options.Authorize.MaxRepairsPerTask = defaultMaxRepairsPerTask
@@ -175,8 +182,61 @@ func (supervisor *Supervisor) Run(ctx context.Context, maxSteps int) (Status, er
 		if status.Complete || status.Blocked {
 			return status, nil
 		}
+		// A task inside its retry backoff is not making progress and cannot be
+		// hurried. Spinning through it burned the whole step budget on a goal
+		// whose only remaining work was a scheduled retry — the run then
+		// reported "did not reach a terminal state" for work that was simply
+		// waiting. Wait for the clock instead of the budget.
+		if err := supervisor.waitForRetry(ctx); err != nil {
+			return status, err
+		}
 	}
 	return status, fmt.Errorf("goal did not reach a terminal state within %d supervisory steps", maxSteps)
+}
+
+// waitForRetry pauses until the earliest scheduled retry becomes eligible, but
+// only when a scheduled retry is the ONLY thing left. Any task that could be
+// claimed right now means the next pass has real work to do, so it returns
+// immediately.
+//
+// The wait goes through the injected clock, so a test never sleeps.
+func (supervisor *Supervisor) waitForRetry(ctx context.Context) error {
+	board, err := supervisor.options.Store.Board(ctx, supervisor.options.BoardID)
+	if err != nil {
+		return err
+	}
+	now := supervisor.options.Now()
+	earliest := time.Time{}
+	for _, task := range board.Tasks {
+		if task.State == agoboardprotocol.TaskPassed || task.Cancelled || task.SupersededBy != "" {
+			continue
+		}
+		if task.State != agoboardprotocol.TaskRetryWait {
+			// Something else is outstanding: running, verifying, integrating,
+			// or ready. The next pass has work.
+			if task.State != agoboardprotocol.TaskFailed || !supervisor.alreadyRaised(task.ID) {
+				return nil
+			}
+			continue
+		}
+		if earliest.IsZero() || task.NextEligibleAt.Before(earliest) {
+			earliest = task.NextEligibleAt
+		}
+	}
+	if earliest.IsZero() {
+		return nil
+	}
+	delay := earliest.Sub(now)
+	if delay <= 0 {
+		return nil
+	}
+	timer := supervisor.options.After(delay)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer:
+		return nil
+	}
 }
 
 // reviewStoppedWork decides what to do about every task that has stopped.

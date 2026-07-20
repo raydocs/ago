@@ -24,7 +24,7 @@ func (judge RelayJudge) Judge(ctx context.Context, input JudgeInput) (JudgeVerdi
 		TaskDescription: input.TaskDescription, AcceptanceCriteria: input.AcceptanceCriteria,
 		Evidence: input.Evidence, EvidenceID: input.EvidenceID,
 		ArtifactIDs: input.ArtifactIDs, TestNames: input.TestNames,
-		BaseRevision: input.BaseRevision,
+		BaseRevision: input.BaseRevision, PatchText: input.PatchText,
 	})
 	if err != nil {
 		var unavailable agorelayverifier.UnavailableError
