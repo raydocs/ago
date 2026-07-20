@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -651,4 +652,126 @@ func TestProvidersEndpointReturnsConfiguredProviders(t *testing.T) {
 	if !reflect.DeepEqual(body.Providers, wantProviders) {
 		t.Fatalf("providers = %#v, want %#v", body.Providers, wantProviders)
 	}
+}
+
+// A retrying task must expose its retry accounting so a user can see why work
+// is waiting and for how long, without ever exposing the fencing credential.
+func TestTaskDetailExposesRetryAccountingWithoutLeakingTheFencingToken(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "board.db")
+	handler, store, scheduler := newBoardTestServerWithFailingExecutor(t, dbPath)
+	t.Cleanup(func() { _ = store.Close() })
+
+	created := doRequest(t, handler, http.MethodPost, "/api/v1/goals", goalBody("cmd-retry-detail", chineseDemoObjective, t.TempDir()))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var response goalCreateResponse
+	decodeInto(t, created, &response)
+	boardID := response.Board.BoardID
+
+	if _, err := scheduler.RunOnce(context.Background()); err != nil {
+		t.Fatalf("scheduler cycle: %v", err)
+	}
+	snapshot := snapshotOf(t, handler, boardID)
+
+	var retryingTaskID string
+	for _, column := range snapshot.Columns {
+		if column.Name != "Blocked" {
+			continue
+		}
+		for _, task := range column.Tasks {
+			if task.State == "retry-wait" {
+				retryingTaskID = task.ID
+			}
+		}
+	}
+	if retryingTaskID == "" {
+		t.Fatalf("no task entered retry-wait after a transient failure: %#v", snapshot.Columns)
+	}
+
+	detail := doRequest(t, handler, http.MethodGet, "/api/v1/boards/"+boardID+"/tasks/"+retryingTaskID, nil)
+	if detail.Code != http.StatusOK {
+		t.Fatalf("task detail status = %d, body = %s", detail.Code, detail.Body.String())
+	}
+	var body struct {
+		State          string `json:"state"`
+		AttemptCount   int    `json:"attempt_count"`
+		MaxAttempts    int    `json:"max_attempts"`
+		NextEligibleAt string `json:"next_eligible_at"`
+		FailureClass   string `json:"failure_class"`
+		BlockedReason  string `json:"blocked_reason"`
+		Attempts       []struct {
+			Number        int    `json:"number"`
+			State         string `json:"state"`
+			Generation    uint64 `json:"generation"`
+			FailureClass  string `json:"failure_class"`
+			FailureReason string `json:"failure_reason"`
+		} `json:"attempts"`
+		Leases []struct {
+			State      string `json:"state"`
+			Generation uint64 `json:"generation"`
+			ExpiresAt  string `json:"expires_at"`
+		} `json:"leases"`
+	}
+	decodeInto(t, detail, &body)
+
+	if body.State != "retry-wait" || body.AttemptCount != 1 || body.MaxAttempts != 3 {
+		t.Fatalf("retry accounting = %#v", body)
+	}
+	if body.NextEligibleAt == "" {
+		t.Fatal("task detail does not expose when the retry becomes eligible")
+	}
+	if body.FailureClass != "transient" || body.BlockedReason == "" {
+		t.Fatalf("failure classification = %q / %q", body.FailureClass, body.BlockedReason)
+	}
+	if len(body.Attempts) != 1 || body.Attempts[0].Number != 1 || body.Attempts[0].State != "failed" {
+		t.Fatalf("attempt history = %#v", body.Attempts)
+	}
+	if body.Attempts[0].FailureClass != "transient" || body.Attempts[0].FailureReason == "" {
+		t.Fatalf("attempt failure detail = %#v", body.Attempts[0])
+	}
+	if body.Attempts[0].Generation == 0 {
+		t.Fatal("attempt detail does not expose its generation")
+	}
+	if len(body.Leases) != 1 || body.Leases[0].ExpiresAt == "" {
+		t.Fatalf("lease detail = %#v", body.Leases)
+	}
+	// The credential itself must never reach a client.
+	if strings.Contains(detail.Body.String(), "fencing_token") {
+		t.Fatalf("task detail exposed a fencing token: %s", detail.Body.String())
+	}
+}
+
+// newBoardTestServerWithFailingExecutor wires an executor that always fails
+// transiently, so retry behaviour is observable through the API.
+func newBoardTestServerWithFailingExecutor(t *testing.T, dbPath string) (http.Handler, *agoboardstore.Store, *agoscheduler.Scheduler) {
+	t.Helper()
+	store, err := agoboardstore.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := func() time.Time { return time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC) }
+	runtime := agoboardruntime.New(store, agoplanner.DemoPlanner{}, agoboardruntime.Options{
+		CoordinatorID: apiCoordinatorID, WorkerID: apiWorkerID, VerifierID: apiVerifierID,
+		LeaseDuration: time.Minute, Now: clock,
+	})
+	server, err := agoboardapi.New(agoboardapi.Options{Runtime: runtime, Store: store, PollInterval: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := agoscheduler.New(agoscheduler.Options{
+		Store: store, Runtime: runtime, Executor: failingExecutor{}, Verifier: &fakeAPIVerifier{},
+		CoordinatorID: apiCoordinatorID, WorkerID: apiWorkerID, VerifierID: apiVerifierID,
+		LeaseDuration: time.Minute, Now: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server.Handler(), store, scheduler
+}
+
+type failingExecutor struct{}
+
+func (failingExecutor) Execute(_ context.Context, _ agoboardruntime.Dispatch) (agoboardruntime.ExecutionResult, error) {
+	return agoboardruntime.ExecutionResult{}, errors.New("执行器临时失败")
 }

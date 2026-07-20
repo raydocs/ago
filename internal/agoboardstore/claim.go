@@ -59,8 +59,10 @@ type ClaimResult struct {
 	TaskID  string
 	// AttemptID and FencingToken are set only for ClaimAcquired. They are the
 	// credentials the dispatched executor must present.
-	AttemptID    string
-	LeaseID      string
+	AttemptID string
+	LeaseID   string
+	// Generation orders this attempt against every other one on the board.
+	Generation   uint64
 	FencingToken string
 	Reason       string
 }
@@ -185,7 +187,7 @@ func (s *Store) Claim(ctx context.Context, request ClaimRequest) (ClaimResult, e
 	}
 	return ClaimResult{
 		Outcome: ClaimAcquired, Board: next, Events: events, TaskID: task.ID,
-		AttemptID: attemptID, LeaseID: leaseID, FencingToken: token,
+		AttemptID: attemptID, LeaseID: leaseID, Generation: generationOf(next, attemptID), FencingToken: token,
 	}, nil
 }
 
@@ -338,4 +340,16 @@ func (s *Store) CountAttempts(ctx context.Context, boardID string) (int, error) 
 	var value int
 	err := s.db.QueryRowContext(ctx, query, args...).Scan(&value)
 	return value, err
+}
+
+// generationOf reads back the generation the state machine minted for an
+// attempt. The counter lives in the aggregate, so this is the only place that
+// learns it rather than assuming a value.
+func generationOf(board agoboardprotocol.Board, attemptID string) uint64 {
+	for _, attempt := range board.Attempts {
+		if attempt.ID == attemptID {
+			return attempt.Generation
+		}
+	}
+	return 0
 }

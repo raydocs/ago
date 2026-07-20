@@ -171,17 +171,26 @@ type Snapshot struct {
 }
 
 type TaskAttempt struct {
-	ID         string                        `json:"id"`
-	State      agoboardprotocol.AttemptState `json:"state"`
-	WorkerID   string                        `json:"worker_id"`
-	EvidenceID string                        `json:"evidence_id"`
+	ID       string                        `json:"id"`
+	Number   int                           `json:"number"`
+	State    agoboardprotocol.AttemptState `json:"state"`
+	WorkerID string                        `json:"worker_id"`
+	// Generation orders attempts; the fencing token itself is never exposed,
+	// because it is the credential that authorizes changing this task.
+	Generation    uint64                        `json:"generation"`
+	EvidenceID    string                        `json:"evidence_id"`
+	FailureClass  agoboardprotocol.FailureClass `json:"failure_class,omitempty"`
+	FailureReason string                        `json:"failure_reason,omitempty"`
 }
 
 type TaskLease struct {
-	ID        string                      `json:"id"`
-	AttemptID string                      `json:"attempt_id"`
-	WorkerID  string                      `json:"worker_id"`
-	State     agoboardprotocol.LeaseState `json:"state"`
+	ID         string                      `json:"id"`
+	AttemptID  string                      `json:"attempt_id"`
+	WorkerID   string                      `json:"worker_id"`
+	State      agoboardprotocol.LeaseState `json:"state"`
+	Generation uint64                      `json:"generation"`
+	AcquiredAt time.Time                   `json:"acquired_at,omitempty"`
+	ExpiresAt  time.Time                   `json:"expires_at,omitempty"`
 }
 
 type TaskEvidence struct {
@@ -207,9 +216,16 @@ type TaskDetail struct {
 	VerifierIDs        []string                          `json:"verifier_ids"`
 	ActiveAttemptID    string                            `json:"active_attempt_id"`
 	AcceptedEvidenceID string                            `json:"accepted_evidence_id"`
-	Attempts           []TaskAttempt                     `json:"attempts"`
-	Leases             []TaskLease                       `json:"leases"`
-	Evidence           []TaskEvidence                    `json:"evidence"`
+	AccessMode         agoboardprotocol.AccessMode       `json:"access_mode"`
+	// Retry accounting, so a user can see why work is waiting and for how long.
+	AttemptCount   int                           `json:"attempt_count"`
+	MaxAttempts    int                           `json:"max_attempts"`
+	NextEligibleAt time.Time                     `json:"next_eligible_at,omitempty"`
+	FailureClass   agoboardprotocol.FailureClass `json:"failure_class,omitempty"`
+	BlockedReason  string                        `json:"blocked_reason,omitempty"`
+	Attempts       []TaskAttempt                 `json:"attempts"`
+	Leases         []TaskLease                   `json:"leases"`
+	Evidence       []TaskEvidence                `json:"evidence"`
 }
 
 // -- handlers ----------------------------------------------------------------
@@ -304,6 +320,12 @@ func (server *Server) taskDetail(writer http.ResponseWriter, request *http.Reque
 		VerifierIDs:        []string{},
 		ActiveAttemptID:    task.ActiveAttemptID,
 		AcceptedEvidenceID: task.AcceptedEvidenceID,
+		AccessMode:         task.AccessMode,
+		AttemptCount:       task.AttemptCount,
+		MaxAttempts:        agoboardprotocol.MaxAttempts,
+		NextEligibleAt:     task.NextEligibleAt,
+		FailureClass:       task.FailureClass,
+		BlockedReason:      task.BlockedReason,
 		Attempts:           []TaskAttempt{},
 		Leases:             []TaskLease{},
 		Evidence:           []TaskEvidence{},
@@ -326,12 +348,19 @@ func (server *Server) taskDetail(writer http.ResponseWriter, request *http.Reque
 	}
 	for _, attempt := range board.Attempts {
 		if attempt.TaskID == task.ID {
-			detail.Attempts = append(detail.Attempts, TaskAttempt{ID: attempt.ID, State: attempt.State, WorkerID: attempt.WorkerID, EvidenceID: attempt.EvidenceID})
+			detail.Attempts = append(detail.Attempts, TaskAttempt{
+				ID: attempt.ID, Number: attempt.Number, State: attempt.State, WorkerID: attempt.WorkerID,
+				Generation: attempt.Generation, EvidenceID: attempt.EvidenceID,
+				FailureClass: attempt.FailureClass, FailureReason: attempt.FailureReason,
+			})
 		}
 	}
 	for _, lease := range board.Leases {
 		if lease.TaskID == task.ID {
-			detail.Leases = append(detail.Leases, TaskLease{ID: lease.ID, AttemptID: lease.AttemptID, WorkerID: lease.WorkerID, State: lease.State})
+			detail.Leases = append(detail.Leases, TaskLease{
+				ID: lease.ID, AttemptID: lease.AttemptID, WorkerID: lease.WorkerID, State: lease.State,
+				Generation: lease.Generation, AcquiredAt: lease.AcquiredAt, ExpiresAt: lease.ExpiresAt,
+			})
 		}
 	}
 	for _, evidence := range board.Evidence {
