@@ -59,6 +59,10 @@ type Options struct {
 	Store   *agoboardstore.Store
 	// Providers is the non-secret capability roster reported to clients.
 	Providers []Provider
+	// Decisions reports what the autonomous supervisor could not decide alone.
+	// Nil means no supervisor is running, which is reported as an empty queue
+	// rather than an error: a board with no supervisor simply needs nothing.
+	Decisions DecisionSource
 	// Artifacts serves managed executor output. When nil, the download route
 	// reports that artifact storage is unavailable rather than guessing a path.
 	Artifacts *agoartifact.Store
@@ -72,6 +76,7 @@ type Server struct {
 	runtime      *agoboardruntime.Runtime
 	store        *agoboardstore.Store
 	providers    []Provider
+	decisions    DecisionSource
 	artifacts    *agoartifact.Store
 	pollInterval time.Duration
 
@@ -90,6 +95,7 @@ func New(options Options) (*Server, error) {
 		runtime:      options.Runtime,
 		store:        options.Store,
 		providers:    append([]Provider(nil), options.Providers...),
+		decisions:    options.Decisions,
 		artifacts:    options.Artifacts,
 		pollInterval: options.PollInterval,
 		waiters:      make(map[string]chan struct{}),
@@ -107,6 +113,7 @@ func (server *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/providers", server.listProviders)
 	mux.HandleFunc("GET /api/v1/boards/{boardID}/artifacts/{artifactID}", server.downloadArtifact)
 	mux.HandleFunc("POST /api/v1/boards/{boardID}/tasks/{taskID}/retry", server.retryTask)
+	mux.HandleFunc("GET /api/v1/boards/{boardID}/decisions", server.listDecisions)
 	return mux
 }
 
@@ -773,4 +780,36 @@ func (server *Server) retryTask(writer http.ResponseWriter, request *http.Reques
 	}
 	server.notify(boardID)
 	writeJSON(writer, http.StatusOK, snapshot)
+}
+
+// DecisionSource reports the items an autonomous supervisor needs a person for.
+// It is an interface so the API does not depend on the supervisor package, and
+// so a board can be served with no supervisor at all.
+type DecisionSource interface {
+	PendingDecisions(boardID string) []PendingDecision
+}
+
+// PendingDecision is one item in the user's attention queue. It is deliberately
+// self-contained: a user must never have to go find a worker to understand it.
+type PendingDecision struct {
+	Kind         string    `json:"kind"`
+	TaskID       string    `json:"task_id,omitempty"`
+	Title        string    `json:"title"`
+	Reason       string    `json:"reason"`
+	Suggestion   string    `json:"suggestion"`
+	RaisedAt     time.Time `json:"raised_at"`
+	AttemptsUsed int       `json:"attempts_used,omitempty"`
+}
+
+func (server *Server) listDecisions(writer http.ResponseWriter, request *http.Request) {
+	boardID := request.PathValue("boardID")
+	if _, err := server.store.Board(request.Context(), boardID); err != nil {
+		writeError(writer, err)
+		return
+	}
+	pending := []PendingDecision{}
+	if server.decisions != nil {
+		pending = server.decisions.PendingDecisions(boardID)
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"decisions": pending})
 }

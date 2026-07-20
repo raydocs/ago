@@ -28,6 +28,7 @@ import (
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoredact"
 	"claudexflow/internal/agoscheduler"
+	"claudexflow/internal/agosupervisor"
 
 	"flag"
 )
@@ -90,13 +91,6 @@ func run() error {
 			return fmt.Errorf("reconcile artifact store: %w", err)
 		}
 	}
-	server, err := agoboardapi.New(agoboardapi.Options{
-		Runtime: runtime, Store: store, Providers: demoProviders(), Artifacts: artifacts,
-	})
-	if err != nil {
-		return err
-	}
-
 	provider, err := agofake.New(agofake.Script{Default: agofake.Outcome(*scenario)})
 	if err != nil {
 		return err
@@ -107,6 +101,27 @@ func run() error {
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-demo-worker", VerifierID: "ago-verifier",
 		LeaseDuration: 5 * time.Minute, Interval: time.Second, Now: time.Now,
 		Redactor: agoredact.NewFromEnvironment(os.Getenv),
+	})
+	if err != nil {
+		return err
+	}
+
+	// The supervisor closes the loop: it reviews stopped work, repairs what it
+	// can, and only queues a decision when a person genuinely must choose.
+	// Authorization is deliberately narrow — local file writes and local
+	// commits — so publishing or destructive work becomes a queued decision
+	// rather than something the machine does on its own.
+	supervisorRunner, err := agosupervisor.NewRunner(agosupervisor.RunnerOptions{
+		Store: store, Scheduler: scheduler,
+		Authorize: agosupervisor.Authorization{LocalFileWrites: true, LocalCommits: true},
+		Interval:  2 * time.Second, Now: time.Now,
+	})
+	if err != nil {
+		return err
+	}
+	server, err := agoboardapi.New(agoboardapi.Options{
+		Runtime: runtime, Store: store, Providers: demoProviders(), Artifacts: artifacts,
+		Decisions: supervisorRunner,
 	})
 	if err != nil {
 		return err
@@ -140,18 +155,20 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// The scheduler advances the board; nothing external drives it.
-	schedulerCtx, stopScheduler := context.WithCancel(context.Background())
-	schedulerDone := make(chan struct{})
+	// The supervisor owns the loop and calls the scheduler itself, so there is
+	// exactly one driver. Running the scheduler separately as well would mean
+	// two cycles racing for the same work with nothing gained.
+	supervisorCtx, stopSupervisor := context.WithCancel(context.Background())
+	supervisorDone := make(chan struct{})
 	go func() {
-		defer close(schedulerDone)
-		_ = scheduler.Run(schedulerCtx)
+		defer close(supervisorDone)
+		_ = supervisorRunner.Run(supervisorCtx)
 	}()
-	// Shutdown waits for the scheduler to finish its cycle, so a claimed attempt
-	// is never abandoned mid-dispatch.
+	// Shutdown waits for the current pass, so a claimed attempt is never
+	// abandoned mid-dispatch.
 	defer func() {
-		stopScheduler()
-		<-schedulerDone
+		stopSupervisor()
+		<-supervisorDone
 	}()
 
 	errs := make(chan error, 1)

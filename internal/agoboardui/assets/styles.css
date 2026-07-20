@@ -185,6 +185,14 @@ summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .drawer form input { flex: 1 1 200px; }
 .drawer form button { margin-top: 0; }
 
+.attention { border-color: var(--wait); }
+.attention h2 { color: var(--wait); }
+#attention-list { margin: 0; padding-left: 18px; }
+#attention-list li { margin-bottom: 14px; }
+.decision-head { margin: 0 0 4px; font-weight: 600; }
+#attention-list p { margin: 2px 0; font-size: 13px; }
+#attention-list button { margin-top: 8px; padding: 5px 12px; font-size: 13px; }
+
 .scrim { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 10; }
 
 /* Laptop: the board still shows every column, scrolling horizontally. */

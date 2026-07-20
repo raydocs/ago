@@ -102,6 +102,7 @@ function applySnapshot(snapshot) {
   state.lastSequence = snapshot.latest_event_sequence;
   renderGoal(snapshot);
   renderBoard(snapshot);
+  refreshDecisions();
   if (state.openTaskId) {
     loadTaskDetail(state.openTaskId);
   }
@@ -138,6 +139,47 @@ function renderGoal(snapshot) {
       }
       list.append(item);
     }
+  }
+}
+
+// The attention queue is the only place a user has to look. If the supervisor
+// could not decide something alone, it appears here with enough context to act
+// on — never as a message the user has to go find in some worker's thread.
+async function refreshDecisions() {
+  if (!state.boardId) return;
+  let decisions = [];
+  try {
+    const body = await api(`/api/v1/boards/${state.boardId}/decisions`);
+    decisions = body.decisions || [];
+  } catch (_) {
+    return;
+  }
+  const panel = el("attention");
+  const list = el("attention-list");
+  list.replaceChildren();
+  el("attention-count").textContent = decisions.length ? String(decisions.length) : "";
+  panel.hidden = decisions.length === 0;
+  for (const decision of decisions) {
+    const item = document.createElement("li");
+    item.dataset.testid = `decision-${decision.task_id || decision.kind}`;
+    const head = document.createElement("p");
+    head.className = "decision-head";
+    head.textContent = `[${text(decision.kind)}] ${text(decision.title)}`;
+    const reason = document.createElement("p");
+    reason.textContent = text(decision.reason);
+    const suggestion = document.createElement("p");
+    suggestion.className = "muted";
+    suggestion.textContent = `建议：${text(decision.suggestion)}`;
+    item.append(head, reason, suggestion);
+    if (decision.task_id) {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.dataset.testid = `decision-open-${decision.task_id}`;
+      open.textContent = "打开任务";
+      open.addEventListener("click", () => openTask(decision.task_id));
+      item.append(open);
+    }
+    list.append(item);
   }
 }
 
