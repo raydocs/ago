@@ -16,6 +16,7 @@ import (
 	"claudexflow/internal/agoboardprotocol"
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
+	"claudexflow/internal/agofake"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoredact"
 	"claudexflow/internal/agoscheduler"
@@ -299,5 +300,111 @@ func assertNoSentinel(t *testing.T, surface, content string) {
 			excerpt = excerpt[:800]
 		}
 		t.Fatalf("the sentinel reached %s: %s", surface, excerpt)
+	}
+}
+
+// Task detail must carry the structured evidence, otherwise everything D6
+// records is invisible to the person meant to inspect it.
+func TestTaskDetailExposesStructuredEvidence(t *testing.T) {
+	base := t.TempDir()
+	store, err := agoboardstore.Open(filepath.Join(base, "board.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	artifacts, err := agoartifact.Open(agoartifact.Options{Root: filepath.Join(base, "artifacts")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := func() time.Time { return time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC) }
+	runtime := agoboardruntime.New(store, agoplanner.DemoPlanner{}, agoboardruntime.Options{
+		CoordinatorID: "c", WorkerID: "w", VerifierID: "v", LeaseDuration: time.Minute, Now: clock,
+	})
+	server, err := agoboardapi.New(agoboardapi.Options{Runtime: runtime, Store: store, Artifacts: artifacts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := agofake.New(agofake.Script{Default: agofake.OutcomeSuccess})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := agoscheduler.New(agoscheduler.Options{
+		Store: store, Runtime: runtime,
+		Executor: provider.WithArtifacts(artifacts), Verifier: provider,
+		CoordinatorID: "c", WorkerID: "w", VerifierID: "v", LeaseDuration: time.Minute, Now: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := server.Handler()
+	created := doRequest(t, handler, http.MethodPost, "/api/v1/goals", goalBody("cmd-structured", chineseDemoObjective, t.TempDir()))
+	var response goalCreateResponse
+	decodeInto(t, created, &response)
+	boardID := response.Board.BoardID
+	driveWithScheduler(t, store, scheduler, boardID)
+
+	board, err := store.Board(context.Background(), boardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, task := range board.Tasks {
+		if task.State != agoboardprotocol.TaskPassed {
+			continue
+		}
+		detail := doRequest(t, handler, http.MethodGet, "/api/v1/boards/"+boardID+"/tasks/"+task.ID, nil)
+		var body struct {
+			Evidence []struct {
+				Verdict string `json:"verdict"`
+				Result  struct {
+					Tests []struct {
+						Name     string `json:"name"`
+						Passed   bool   `json:"passed"`
+						Required bool   `json:"required"`
+					} `json:"tests"`
+					ChangedFiles []struct {
+						Path      string `json:"path"`
+						AfterHash string `json:"after_hash"`
+					} `json:"changed_files"`
+					Commands []struct {
+						Display string `json:"display"`
+					} `json:"commands"`
+					Artifacts []struct {
+						ID     string `json:"id"`
+						Bytes  int64  `json:"bytes"`
+						SHA256 string `json:"sha256"`
+					} `json:"artifacts"`
+				} `json:"result"`
+			} `json:"evidence"`
+		}
+		decodeInto(t, detail, &body)
+		if len(body.Evidence) == 0 {
+			t.Fatalf("task %q passed with no evidence in its detail", task.ID)
+		}
+		evidence := body.Evidence[0]
+		if evidence.Verdict != "accept" {
+			t.Fatalf("task %q verdict = %q, want accept", task.ID, evidence.Verdict)
+		}
+		if len(evidence.Result.Tests) == 0 || !evidence.Result.Tests[0].Required || !evidence.Result.Tests[0].Passed {
+			t.Fatalf("task %q tests = %#v", task.ID, evidence.Result.Tests)
+		}
+		if len(evidence.Result.ChangedFiles) == 0 || evidence.Result.ChangedFiles[0].AfterHash == "" {
+			t.Fatalf("task %q changed files = %#v", task.ID, evidence.Result.ChangedFiles)
+		}
+		if len(evidence.Result.Commands) == 0 {
+			t.Fatalf("task %q recorded no commands", task.ID)
+		}
+		if len(evidence.Result.Artifacts) == 0 || evidence.Result.Artifacts[0].SHA256 == "" {
+			t.Fatalf("task %q artifacts = %#v", task.ID, evidence.Result.Artifacts)
+		}
+		// The referenced artifact must actually be downloadable.
+		download := doRequest(t, handler, http.MethodGet, "/api/v1/boards/"+boardID+"/artifacts/"+evidence.Result.Artifacts[0].ID, nil)
+		if download.Code != http.StatusOK || int64(download.Body.Len()) != evidence.Result.Artifacts[0].Bytes {
+			t.Fatalf("artifact download = %d, %d bytes, want 200 and %d", download.Code, download.Body.Len(), evidence.Result.Artifacts[0].Bytes)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("no task passed, so structured evidence was never checked")
 	}
 }

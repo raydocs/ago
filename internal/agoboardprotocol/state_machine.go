@@ -398,6 +398,39 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		taskIndex, _, _ := findTask(next, lease.TaskID)
 		attemptIndex, _, _ := findAttempt(next, lease.AttemptID)
 		emit(Event{Type: EventLeaseRenewed, Task: taskPointer(next.Tasks[taskIndex]), Attempt: attemptPointer(next.Attempts[attemptIndex]), Lease: leasePointer(next.Leases[leaseIndex]), Reason: command.Reason})
+	case CommandTaskRetry:
+		if err := requireInitialized(next); err != nil {
+			return current, nil, err
+		}
+		if err := requireRole(RoleCoordinator); err != nil {
+			return current, nil, err
+		}
+		if command.Reason == "" {
+			return current, nil, fmt.Errorf("task.retry requires a reason recording the decision")
+		}
+		index, task, found := findTask(next, command.TaskID)
+		if !found {
+			return current, nil, fmt.Errorf("task %q not found", command.TaskID)
+		}
+		// Only a stopped task may be restarted. Retrying running or accepted
+		// work would either duplicate a live attempt or discard a decision.
+		if task.State != TaskFailed && task.State != TaskRetryWait {
+			return current, nil, illegalTransition(task.State, "retry")
+		}
+		previous := task
+		// The budget resets because a person decided to spend another one. The
+		// attempts themselves stay in history; nothing is erased.
+		next.Tasks[index].AttemptCount = 0
+		next.Tasks[index].UserRetries = task.UserRetries + 1
+		next.Tasks[index].NextEligibleAt = time.Time{}
+		next.Tasks[index].FailureClass, next.Tasks[index].BlockedReason = FailureNone, ""
+		next.Tasks[index].ActiveAttemptID, next.Tasks[index].ActiveLeaseID = "", ""
+		state := TaskReady
+		if !dependenciesPassed(next, task.ID) {
+			state = TaskBlocked
+		}
+		next.Tasks[index].State = state
+		emit(Event{Type: EventTaskRetryRequested, Task: taskPointer(next.Tasks[index]), PreviousState: previous.State, CurrentState: state, Reason: command.Reason})
 	case CommandBoardPause, CommandBoardResume:
 		if err := requireInitialized(next); err != nil {
 			return current, nil, err

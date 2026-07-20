@@ -185,9 +185,13 @@ type Task struct {
 	AcceptedEvidenceID string           `json:"accepted_evidence_id,omitempty"`
 	// AccessMode decides which repository concurrency slot this task consumes.
 	AccessMode AccessMode `json:"access_mode"`
-	// AttemptCount counts every attempt ever created for this task, including
-	// failed ones. It is the durable bound the state machine enforces.
+	// AttemptCount counts attempts in the current retry budget. It is the
+	// durable bound the state machine enforces against automatic retry.
 	AttemptCount int `json:"attempt_count"`
+	// UserRetries counts how many times a person restarted this task after it
+	// stopped. Attempt history is never discarded, so a reader can always see
+	// what happened before each decision.
+	UserRetries int `json:"user_retries,omitempty"`
 	// NextEligibleAt gates a retry-wait task. A zero value means "no wait".
 	NextEligibleAt time.Time    `json:"next_eligible_at,omitempty"`
 	FailureClass   FailureClass `json:"failure_class,omitempty"`
@@ -342,6 +346,10 @@ const (
 	CommandLeaseRenew  CommandType = "lease.renew"
 	CommandBoardPause  CommandType = "board.pause"
 	CommandBoardResume CommandType = "board.resume"
+	// CommandTaskRetry is a human decision to try a stopped task again. The
+	// automatic attempt bound protects against machine retry loops; a person
+	// choosing to retry is a different act, and it is audited as one.
+	CommandTaskRetry CommandType = "task.retry"
 )
 
 type Command struct {
@@ -426,6 +434,7 @@ const (
 	EventLeaseRenewed        EventType = "lease.renewed"
 	EventBoardPaused         EventType = "board.paused"
 	EventBoardResumed        EventType = "board.resumed"
+	EventTaskRetryRequested  EventType = "task.retry-requested"
 )
 
 type Event struct {

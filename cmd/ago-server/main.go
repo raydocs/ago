@@ -23,6 +23,7 @@ import (
 	"claudexflow/internal/agoboardapi"
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
+	"claudexflow/internal/agoboardui"
 	"claudexflow/internal/agofake"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoredact"
@@ -115,8 +116,18 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
+	// The interface and the API share this origin, so the page needs no CORS
+	// and never has to reach a plaintext localhost address from an HTTPS page.
+	ui, err := agoboardui.Handler()
+	if err != nil {
+		return err
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/api/", server.Handler())
+	mux.Handle("/", ui)
+
 	httpServer := &http.Server{
-		Handler:           server.Handler(),
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		// WriteTimeout stays unset: the event stream is long-lived and its
 		// lifetime is bounded by the client's request context instead.

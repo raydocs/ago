@@ -106,6 +106,7 @@ func (server *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/boards/{boardID}/events", server.events)
 	mux.HandleFunc("GET /api/v1/providers", server.listProviders)
 	mux.HandleFunc("GET /api/v1/boards/{boardID}/artifacts/{artifactID}", server.downloadArtifact)
+	mux.HandleFunc("POST /api/v1/boards/{boardID}/tasks/{taskID}/retry", server.retryTask)
 	return mux
 }
 
@@ -210,6 +211,11 @@ type TaskEvidence struct {
 	Artifact  string                         `json:"artifact"`
 	Summary   string                         `json:"summary"`
 	State     agoboardprotocol.EvidenceState `json:"state"`
+	// Result is the structured record a user inspects: which files changed,
+	// what ran, which checks were required, and what was produced.
+	Result        agoboardprotocol.EvidenceResult `json:"result"`
+	Verdict       string                          `json:"verdict,omitempty"`
+	VerdictReason string                          `json:"verdict_reason,omitempty"`
 }
 
 type TaskDetail struct {
@@ -375,7 +381,11 @@ func (server *Server) taskDetail(writer http.ResponseWriter, request *http.Reque
 	}
 	for _, evidence := range board.Evidence {
 		if evidence.TaskID == task.ID {
-			detail.Evidence = append(detail.Evidence, TaskEvidence{ID: evidence.ID, AttemptID: evidence.AttemptID, WorkerID: evidence.WorkerID, Artifact: evidence.Artifact, Summary: evidence.Summary, State: evidence.State})
+			detail.Evidence = append(detail.Evidence, TaskEvidence{
+				ID: evidence.ID, AttemptID: evidence.AttemptID, WorkerID: evidence.WorkerID,
+				Artifact: evidence.Artifact, Summary: evidence.Summary, State: evidence.State,
+				Result: evidence.Result, Verdict: evidence.Verdict, VerdictReason: evidence.VerdictReason,
+			})
 		}
 	}
 	writeJSON(writer, http.StatusOK, detail)
@@ -711,4 +721,56 @@ func contentDisposition(name string) string {
 		fallback = "artifact"
 	}
 	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, fallback, url.PathEscape(name))
+}
+
+// retryTask records a person's decision to try a stopped task again.
+//
+// The automatic attempt bound exists to stop machine retry loops; a human
+// choosing to spend another budget is a different act, so it is a distinct
+// audited command rather than a way around the bound. Any note the user
+// supplies becomes the recorded reason, which is how the blocked-task input
+// form reaches the durable history.
+func (server *Server) retryTask(writer http.ResponseWriter, request *http.Request) {
+	var input controlRequest
+	if err := decodeRequest(writer, request, &input); err != nil {
+		writeError(writer, err)
+		return
+	}
+	if strings.TrimSpace(input.CommandID) == "" {
+		writeError(writer, statusError{http.StatusBadRequest, "invalid_request", "该请求需要 command_id。", nil})
+		return
+	}
+	boardID, taskID := request.PathValue("boardID"), request.PathValue("taskID")
+	board, err := server.store.Board(request.Context(), boardID)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	reason := strings.TrimSpace(input.Reason)
+	if reason == "" {
+		reason = "用户请求重试"
+	}
+	if _, err := server.store.ApplyBoard(request.Context(), boardID, agoboardprotocol.Command{
+		SchemaVersion:   agoboardprotocol.SchemaVersion,
+		ID:              input.CommandID,
+		ExpectedVersion: board.Version,
+		Actor:           agoboardprotocol.Actor{ID: "ago-operator", Role: agoboardprotocol.RoleCoordinator},
+		Type:            agoboardprotocol.CommandTaskRetry,
+		TaskID:          taskID,
+		Reason:          reason,
+	}); err != nil {
+		if errors.Is(err, agoboardstore.ErrCommandConflict) {
+			writeError(writer, statusError{http.StatusConflict, "command_conflict", "该命令 ID 已用于不同的请求内容。", err})
+			return
+		}
+		writeError(writer, statusError{http.StatusConflict, "illegal_transition", "该任务当前状态不允许重试。", err})
+		return
+	}
+	snapshot, err := server.snapshot(request.Context(), boardID)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	server.notify(boardID)
+	writeJSON(writer, http.StatusOK, snapshot)
 }

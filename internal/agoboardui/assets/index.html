@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ago 目标看板</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="top">
+  <h1>Ago 目标看板</h1>
+  <div class="top-status">
+    <span id="stream-state" class="pill pill-idle" data-testid="stream-state">未连接</span>
+    <span id="provider-health" class="pill" data-testid="provider-health"></span>
+  </div>
+</header>
+
+<main>
+  <section id="composer" class="panel" data-testid="composer">
+    <h2>新建目标</h2>
+    <label for="objective">目标（自然语言）</label>
+    <textarea id="objective" data-testid="objective-input" rows="3"
+      placeholder="分析当前仓库，为 README 增加一个快速开始章节，运行相关测试，并生成完成报告。"></textarea>
+    <div class="row">
+      <div class="field">
+        <label for="repo-root">仓库目录</label>
+        <input id="repo-root" data-testid="repo-input" type="text" placeholder="/path/to/repository">
+      </div>
+      <div class="field field-narrow">
+        <label for="execution-mode">执行方式</label>
+        <select id="execution-mode" data-testid="mode-select">
+          <option value="fake">Fake（离线确定性）</option>
+          <option value="claude-code">Claude Code（本地）</option>
+        </select>
+      </div>
+    </div>
+    <button id="create-goal" data-testid="create-goal" type="button">创建目标</button>
+    <p id="composer-error" class="error" data-testid="composer-error" hidden></p>
+  </section>
+
+  <section id="goal-panel" class="panel" data-testid="goal-panel" hidden>
+    <div class="goal-head">
+      <div>
+        <h2 id="goal-objective" data-testid="goal-objective"></h2>
+        <p id="goal-meta" class="muted" data-testid="goal-meta"></p>
+      </div>
+      <div class="controls">
+        <button id="pause" data-testid="pause-button" type="button">暂停</button>
+        <button id="resume" data-testid="resume-button" type="button">继续</button>
+      </div>
+    </div>
+    <div class="progress" data-testid="goal-progress">
+      <div class="progress-bar"><div id="progress-fill"></div></div>
+      <span id="progress-text" data-testid="progress-text"></span>
+      <span id="paused-badge" class="pill pill-paused" data-testid="paused-badge" hidden>已暂停</span>
+    </div>
+    <details id="plan-preview" data-testid="plan-preview">
+      <summary>计划与依赖预览</summary>
+      <ol id="plan-list" data-testid="plan-list"></ol>
+    </details>
+  </section>
+
+  <section id="board" class="board" data-testid="board" hidden></section>
+</main>
+
+<aside id="drawer" class="drawer" data-testid="task-drawer" hidden>
+  <div class="drawer-head">
+    <h2 id="drawer-title" data-testid="drawer-title"></h2>
+    <button id="drawer-close" data-testid="drawer-close" type="button" aria-label="关闭">×</button>
+  </div>
+  <div id="drawer-body" class="drawer-body" data-testid="drawer-body"></div>
+</aside>
+<div id="scrim" class="scrim" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
