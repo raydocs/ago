@@ -395,3 +395,80 @@ func assertBadCursorResponse(t *testing.T, response *http.Response) {
 		t.Fatalf("error body = %#v", errorBody)
 	}
 }
+
+// The fencing token is the only credential authorizing an attempt. It must not
+// reach a subscriber, who needs no credential at all to open this stream.
+//
+// This is a regression test: the stream previously embedded the protocol event
+// verbatim and shipped every token in plaintext.
+func TestEventStreamNeverDisclosesAFencingToken(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "board.db")
+	handler, store, scheduler := newBoardTestServerWithScheduler(t, dbPath, nil)
+	t.Cleanup(func() { _ = store.Close() })
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+
+	created := createRealBoard(t, httpServer.URL, "sse-no-token", t.TempDir())
+	boardID := created.Board.BoardID
+	driveWithScheduler(t, store, scheduler, boardID)
+	final := snapshotOf(t, handler, boardID)
+
+	// Collect the real tokens straight from the durable aggregate, so the test
+	// searches for the exact secrets rather than a guessed shape.
+	board, err := store.Board(context.Background(), boardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tokens []string
+	for _, attempt := range board.Attempts {
+		if attempt.FencingToken != "" {
+			tokens = append(tokens, attempt.FencingToken)
+		}
+	}
+	if len(tokens) == 0 {
+		t.Fatal("no attempt carried a fencing token; the test would prove nothing")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, httpServer.URL+"/api/v1/boards/"+boardID+"/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	// Read the whole durable history, then stop.
+	body := make([]byte, 0, 64*1024)
+	buffer := make([]byte, 4096)
+	for len(body) < 512*1024 {
+		n, readErr := response.Body.Read(buffer)
+		body = append(body, buffer[:n]...)
+		if readErr != nil {
+			break
+		}
+		if strings.Count(string(body), "\nid: ") >= int(final.LatestEventSequence)-1 {
+			break
+		}
+	}
+	stream := string(body)
+	if !strings.Contains(stream, "lease.acquired") {
+		t.Fatalf("the stream carried no lease.acquired frame, so the test would prove nothing: %d bytes", len(stream))
+	}
+	for _, token := range tokens {
+		if strings.Contains(stream, token) {
+			t.Fatalf("the event stream disclosed fencing token %q", token)
+		}
+	}
+	if strings.Contains(stream, "fencing_token") {
+		t.Fatal("the event stream carries a fencing_token field")
+	}
+	// The generation must still be published: it orders attempts without
+	// authorizing anything.
+	if !strings.Contains(stream, `"generation"`) {
+		t.Fatal("the event stream dropped the attempt generation")
+	}
+}

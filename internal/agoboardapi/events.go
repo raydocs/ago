@@ -26,12 +26,125 @@ const (
 	clientRetryMillis = 2000
 )
 
-// streamedEvent is the durable protocol event plus the sequence a client echoes
-// back in Last-Event-ID. Sequence equals the event's board version, which is the
-// primary key of the append-only events table.
+// streamedEvent is what a subscriber is allowed to see.
+//
+// It is an explicit allowlist rather than an embedding of the protocol event.
+// Embedding published every field the aggregate happened to carry, which
+// included the fencing token — the single credential that authorizes driving an
+// attempt. Building the payload field by field means a field added to the
+// protocol is invisible here until someone deliberately exposes it.
 type streamedEvent struct {
-	agoboardprotocol.Event
-	Sequence uint64 `json:"sequence"`
+	Sequence      uint64                       `json:"sequence"`
+	SchemaVersion int                          `json:"schema_version"`
+	ID            string                       `json:"id"`
+	CommandID     string                       `json:"command_id"`
+	BoardID       string                       `json:"board_id"`
+	Version       uint64                       `json:"version"`
+	Type          agoboardprotocol.EventType   `json:"type"`
+	Actor         streamedActor                `json:"actor"`
+	Task          *streamedTask                `json:"task,omitempty"`
+	Dependency    *agoboardprotocol.Dependency `json:"dependency,omitempty"`
+	Attempt       *streamedAttempt             `json:"attempt,omitempty"`
+	Lease         *streamedLease               `json:"lease,omitempty"`
+	Evidence      *streamedEvidence            `json:"evidence,omitempty"`
+	PreviousState agoboardprotocol.TaskState   `json:"previous_state,omitempty"`
+	CurrentState  agoboardprotocol.TaskState   `json:"current_state,omitempty"`
+	Reason        string                       `json:"reason,omitempty"`
+}
+
+type streamedActor struct {
+	ID   string                     `json:"id"`
+	Role agoboardprotocol.ActorRole `json:"role"`
+}
+
+type streamedTask struct {
+	ID             string                        `json:"id"`
+	Title          string                        `json:"title"`
+	State          agoboardprotocol.TaskState    `json:"state"`
+	AccessMode     agoboardprotocol.AccessMode   `json:"access_mode,omitempty"`
+	AttemptCount   int                           `json:"attempt_count"`
+	NextEligibleAt time.Time                     `json:"next_eligible_at,omitempty"`
+	FailureClass   agoboardprotocol.FailureClass `json:"failure_class,omitempty"`
+	BlockedReason  string                        `json:"blocked_reason,omitempty"`
+}
+
+// streamedAttempt exposes the generation, which orders attempts, but never the
+// fencing token, which authorizes them.
+type streamedAttempt struct {
+	ID            string                        `json:"id"`
+	TaskID        string                        `json:"task_id"`
+	WorkerID      string                        `json:"worker_id"`
+	State         agoboardprotocol.AttemptState `json:"state"`
+	Number        int                           `json:"number"`
+	Generation    uint64                        `json:"generation"`
+	EvidenceID    string                        `json:"evidence_id,omitempty"`
+	FailureClass  agoboardprotocol.FailureClass `json:"failure_class,omitempty"`
+	FailureReason string                        `json:"failure_reason,omitempty"`
+}
+
+type streamedLease struct {
+	ID         string                      `json:"id"`
+	TaskID     string                      `json:"task_id"`
+	AttemptID  string                      `json:"attempt_id"`
+	WorkerID   string                      `json:"worker_id"`
+	State      agoboardprotocol.LeaseState `json:"state"`
+	Generation uint64                      `json:"generation"`
+	AcquiredAt time.Time                   `json:"acquired_at,omitempty"`
+	ExpiresAt  time.Time                   `json:"expires_at,omitempty"`
+}
+
+type streamedEvidence struct {
+	ID        string                          `json:"id"`
+	TaskID    string                          `json:"task_id"`
+	AttemptID string                          `json:"attempt_id"`
+	WorkerID  string                          `json:"worker_id"`
+	Artifact  string                          `json:"artifact"`
+	Summary   string                          `json:"summary"`
+	State     agoboardprotocol.EvidenceState  `json:"state"`
+	Verdict   string                          `json:"verdict,omitempty"`
+	Result    agoboardprotocol.EvidenceResult `json:"result,omitempty"`
+}
+
+// project builds the public payload for one durable event.
+func project(event agoboardprotocol.Event) streamedEvent {
+	out := streamedEvent{
+		Sequence: event.Version, SchemaVersion: event.SchemaVersion, ID: event.ID,
+		CommandID: event.CommandID, BoardID: event.BoardID, Version: event.Version,
+		Type:          event.Type,
+		Actor:         streamedActor{ID: event.Actor.ID, Role: event.Actor.Role},
+		Dependency:    event.Dependency,
+		PreviousState: event.PreviousState, CurrentState: event.CurrentState,
+		Reason: event.Reason,
+	}
+	if task := event.Task; task != nil {
+		out.Task = &streamedTask{
+			ID: task.ID, Title: task.Title, State: task.State, AccessMode: task.AccessMode,
+			AttemptCount: task.AttemptCount, NextEligibleAt: task.NextEligibleAt,
+			FailureClass: task.FailureClass, BlockedReason: task.BlockedReason,
+		}
+	}
+	if attempt := event.Attempt; attempt != nil {
+		out.Attempt = &streamedAttempt{
+			ID: attempt.ID, TaskID: attempt.TaskID, WorkerID: attempt.WorkerID, State: attempt.State,
+			Number: attempt.Number, Generation: attempt.Generation, EvidenceID: attempt.EvidenceID,
+			FailureClass: attempt.FailureClass, FailureReason: attempt.FailureReason,
+		}
+	}
+	if lease := event.Lease; lease != nil {
+		out.Lease = &streamedLease{
+			ID: lease.ID, TaskID: lease.TaskID, AttemptID: lease.AttemptID, WorkerID: lease.WorkerID,
+			State: lease.State, Generation: lease.Generation,
+			AcquiredAt: lease.AcquiredAt, ExpiresAt: lease.ExpiresAt,
+		}
+	}
+	if evidence := event.Evidence; evidence != nil {
+		out.Evidence = &streamedEvidence{
+			ID: evidence.ID, TaskID: evidence.TaskID, AttemptID: evidence.AttemptID,
+			WorkerID: evidence.WorkerID, Artifact: evidence.Artifact, Summary: evidence.Summary,
+			State: evidence.State, Verdict: evidence.Verdict, Result: evidence.Result,
+		}
+	}
+	return out
 }
 
 // events streams a board's append-only history as server-sent events.
@@ -77,7 +190,7 @@ func (server *Server) events(writer http.ResponseWriter, request *http.Request) 
 			return
 		}
 		for _, event := range events {
-			encoded, err := json.Marshal(streamedEvent{Event: event, Sequence: event.Version})
+			encoded, err := json.Marshal(project(event))
 			if err != nil {
 				return
 			}
