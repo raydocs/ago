@@ -34,6 +34,10 @@ type Dispatch struct {
 	Task      agoplanner.TaskProposal `json:"task"`
 	AttemptID string                  `json:"attempt_id"`
 	WorkerID  string                  `json:"worker_id"`
+	// AttemptNumber is this attempt's 1-based position for its task. It comes
+	// from the durable graph, so an executor's behaviour across a retry is a
+	// function of recorded state rather than of process memory.
+	AttemptNumber int `json:"attempt_number"`
 }
 
 type ExecutionResult struct {

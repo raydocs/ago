@@ -22,6 +22,7 @@ import (
 	"claudexflow/internal/agoboardapi"
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
+	"claudexflow/internal/agofake"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoscheduler"
 
@@ -44,6 +45,7 @@ func run() error {
 	databasePath := flags.String("db", filepath.Join(home, ".ago", "demo", "ago.db"), "Ago board SQLite database")
 	listen := flags.String("listen", "127.0.0.1:4317", "loopback listen address")
 	executionMode := flags.String("executor", agoboardapi.ExecutionModeFake, "executor family for admitted goals")
+	scenario := flags.String("scenario", string(agofake.OutcomeSuccess), "scripted fake outcome: success, temporary_failure_then_success, permanent_failure, timeout, verifier_retry_with_feedback, blocked_needs_input, blocked_policy")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -79,8 +81,12 @@ func run() error {
 		return err
 	}
 
+	provider, err := agofake.New(agofake.Script{Default: agofake.Outcome(*scenario)})
+	if err != nil {
+		return err
+	}
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
-		Store: store, Runtime: runtime, Executor: demoExecutor{}, Verifier: demoVerifier{},
+		Store: store, Runtime: runtime, Executor: provider, Verifier: provider,
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-demo-worker", VerifierID: "ago-verifier",
 		LeaseDuration: 5 * time.Minute, Interval: time.Second, Now: time.Now,
 	})
@@ -101,7 +107,7 @@ func run() error {
 
 	// Startup diagnostics are deliberately free of credentials and paths that
 	// could contain them.
-	fmt.Printf("Ago is ready\nUI:       http://%s\nDatabase: %s\nProvider: %s\n", listener.Addr(), *databasePath, *executionMode)
+	fmt.Printf("Ago is ready\nUI:       http://%s\nDatabase: %s\nProvider: %s\nScenario: %s\n", listener.Addr(), *databasePath, *executionMode, *scenario)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -145,24 +151,4 @@ func demoProviders() []agoboardapi.Provider {
 		{ID: "ago-demo-executor", Kind: "executor", Capabilities: []string{"repo-read", "repo-write", "tests", "report"}, AuthConfigured: false},
 		{ID: "ago-verifier", Kind: "verifier", Capabilities: []string{"verification"}, AuthConfigured: false},
 	}
-}
-
-// demoExecutor is the deterministic offline executor for D1 and D2. It records
-// evidence for the dispatched attempt and never decides acceptance. The scripted
-// failure and retry paths arrive with D5.
-type demoExecutor struct{}
-
-func (demoExecutor) Execute(_ context.Context, dispatch agoboardruntime.Dispatch) (agoboardruntime.ExecutionResult, error) {
-	return agoboardruntime.ExecutionResult{
-		Artifact: "artifact://ago-demo/" + dispatch.AttemptID,
-		Summary:  fmt.Sprintf("演示执行器完成任务《%s》。", dispatch.Task.Title),
-	}, nil
-}
-
-// demoVerifier is independent from the worker identity, so the state machine
-// accepts its decision. Evidence-backed verification arrives with D5 and D6.
-type demoVerifier struct{}
-
-func (demoVerifier) Verify(_ context.Context, dispatch agoboardruntime.Dispatch, _ agoboardruntime.ExecutionResult) (agoboardruntime.Review, error) {
-	return agoboardruntime.Review{Accepted: true, Reason: fmt.Sprintf("任务《%s》的证据满足验收标准。", dispatch.Task.Title)}, nil
 }

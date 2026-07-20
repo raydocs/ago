@@ -80,6 +80,7 @@ const (
 	FailurePolicy     FailureClass = "policy"
 	FailureNeedsInput FailureClass = "needs-input"
 	FailureRepository FailureClass = "repository"
+	FailurePermanent  FailureClass = "permanent"
 	FailureExhausted  FailureClass = "exhausted"
 )
 
@@ -98,7 +99,7 @@ func (class FailureClass) Retryable() bool {
 func validFailureClass(class FailureClass) bool {
 	switch class {
 	case FailureNone, FailureTransient, FailureVerifierFeedback,
-		FailureAuth, FailurePolicy, FailureNeedsInput, FailureRepository, FailureExhausted:
+		FailureAuth, FailurePolicy, FailureNeedsInput, FailureRepository, FailurePermanent, FailureExhausted:
 		return true
 	default:
 		return false

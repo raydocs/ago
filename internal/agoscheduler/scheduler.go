@@ -210,11 +210,12 @@ func (scheduler *Scheduler) dispatch(ctx context.Context, boardID string, claim 
 	if !found {
 		return fmt.Errorf("task %q has no planner proposal", claim.TaskID)
 	}
+	attemptNumber := attemptNumberOf(claim.Board, claim.AttemptID)
 	work := agoboardruntime.Dispatch{
 		Goal: goal, Task: proposal,
 		AttemptID: claim.AttemptID, WorkerID: scheduler.options.WorkerID,
+		AttemptNumber: attemptNumber,
 	}
-	attemptNumber := attemptNumberOf(claim.Board, claim.AttemptID)
 
 	started, err := scheduler.apply(ctx, boardID, claim, agoboardprotocol.CommandAttemptStart, func(command *agoboardprotocol.Command) {})
 	if err != nil {

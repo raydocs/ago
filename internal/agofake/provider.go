@@ -1,0 +1,170 @@
+// Package agofake provides the deterministic offline executor and verifier.
+//
+// It performs no network access, reads no credentials, and touches no
+// repository. Its behaviour is a pure function of the scripted outcome and the
+// durable attempt number, so a demo or a CI run reproduces exactly.
+//
+// The split of authority is the same as production: the executor only produces
+// evidence, and a separate verifier decides acceptance. The fake never writes
+// task state directly.
+package agofake
+
+import (
+	"context"
+	"fmt"
+
+	"claudexflow/internal/agoboardprotocol"
+	"claudexflow/internal/agoboardruntime"
+)
+
+// Outcome is a scripted behaviour for one task.
+type Outcome string
+
+const (
+	// OutcomeSuccess executes cleanly and is accepted.
+	OutcomeSuccess Outcome = "success"
+	// OutcomeTemporaryFailureThenSuccess fails the first attempt with a
+	// retryable fault and succeeds on the next one.
+	OutcomeTemporaryFailureThenSuccess Outcome = "temporary_failure_then_success"
+	// OutcomePermanentFailure fails in a way retrying cannot fix.
+	OutcomePermanentFailure Outcome = "permanent_failure"
+	// OutcomeTimeout models a bounded executor that ran out of time. A timeout
+	// is retryable: the work may simply not have finished.
+	OutcomeTimeout Outcome = "timeout"
+	// OutcomeVerifierRetryWithFeedback produces evidence the verifier rejects
+	// with actionable feedback, so the next attempt can correct it.
+	OutcomeVerifierRetryWithFeedback Outcome = "verifier_retry_with_feedback"
+	// OutcomeBlockedNeedsInput stops for a user decision.
+	OutcomeBlockedNeedsInput Outcome = "blocked_needs_input"
+	// OutcomeBlockedPolicy stops because policy forbids the work.
+	OutcomeBlockedPolicy Outcome = "blocked_policy"
+)
+
+// Valid reports whether an outcome is one this provider knows how to script.
+func (outcome Outcome) Valid() bool {
+	switch outcome {
+	case OutcomeSuccess, OutcomeTemporaryFailureThenSuccess, OutcomePermanentFailure,
+		OutcomeTimeout, OutcomeVerifierRetryWithFeedback, OutcomeBlockedNeedsInput, OutcomeBlockedPolicy:
+		return true
+	default:
+		return false
+	}
+}
+
+// Script selects behaviour per task, falling back to Default.
+type Script struct {
+	Default Outcome
+	ByTask  map[string]Outcome
+}
+
+func (script Script) outcomeFor(taskID string) Outcome {
+	if outcome, found := script.ByTask[taskID]; found {
+		return outcome
+	}
+	if script.Default == "" {
+		return OutcomeSuccess
+	}
+	return script.Default
+}
+
+// Error is a classified executor failure. The scheduler reads FailureClass to
+// decide whether the task may be retried, so the fake states its intent rather
+// than leaving it to be guessed.
+type Error struct {
+	Class   agoboardprotocol.FailureClass
+	Message string
+}
+
+func (e Error) Error() string { return e.Message }
+
+// FailureClass satisfies the interface the scheduler uses to classify errors.
+func (e Error) FailureClass() agoboardprotocol.FailureClass { return e.Class }
+
+// Provider implements both the executor and the verifier boundaries. They are
+// separate interfaces and are registered under separate identities, so the
+// state machine still refuses a worker's attempt to review its own evidence.
+type Provider struct {
+	script Script
+}
+
+func New(script Script) (*Provider, error) {
+	if script.Default != "" && !script.Default.Valid() {
+		return nil, fmt.Errorf("unknown default outcome %q", script.Default)
+	}
+	for taskID, outcome := range script.ByTask {
+		if !outcome.Valid() {
+			return nil, fmt.Errorf("task %q has unknown outcome %q", taskID, outcome)
+		}
+	}
+	return &Provider{script: script}, nil
+}
+
+// Execute produces evidence or a classified failure. It never decides whether
+// the task is done.
+func (provider *Provider) Execute(ctx context.Context, dispatch agoboardruntime.Dispatch) (agoboardruntime.ExecutionResult, error) {
+	if err := ctx.Err(); err != nil {
+		return agoboardruntime.ExecutionResult{}, err
+	}
+	outcome := provider.script.outcomeFor(dispatch.Task.ID)
+	switch outcome {
+	case OutcomePermanentFailure:
+		return agoboardruntime.ExecutionResult{}, Error{
+			Class:   agoboardprotocol.FailurePermanent,
+			Message: fmt.Sprintf("任务《%s》遇到无法通过重试修复的错误。", dispatch.Task.Title),
+		}
+	case OutcomeTimeout:
+		return agoboardruntime.ExecutionResult{}, Error{
+			Class:   agoboardprotocol.FailureTransient,
+			Message: fmt.Sprintf("任务《%s》执行超时，已取消。", dispatch.Task.Title),
+		}
+	case OutcomeBlockedNeedsInput:
+		return agoboardruntime.ExecutionResult{}, Error{
+			Class:   agoboardprotocol.FailureNeedsInput,
+			Message: fmt.Sprintf("任务《%s》需要用户补充信息后才能继续。", dispatch.Task.Title),
+		}
+	case OutcomeBlockedPolicy:
+		return agoboardruntime.ExecutionResult{}, Error{
+			Class:   agoboardprotocol.FailurePolicy,
+			Message: fmt.Sprintf("任务《%s》被策略拒绝，需要显式授权。", dispatch.Task.Title),
+		}
+	case OutcomeTemporaryFailureThenSuccess:
+		// The decision reads the durable attempt number, so a restart in the
+		// middle of a retry does not change what happens next.
+		if dispatch.AttemptNumber <= 1 {
+			return agoboardruntime.ExecutionResult{}, Error{
+				Class:   agoboardprotocol.FailureTransient,
+				Message: fmt.Sprintf("任务《%s》第一次执行遇到临时故障。", dispatch.Task.Title),
+			}
+		}
+	}
+	return agoboardruntime.ExecutionResult{
+		Artifact: fmt.Sprintf("artifact://ago-fake/%s/%d", dispatch.Task.ID, dispatch.AttemptNumber),
+		Summary:  fmt.Sprintf("任务《%s》在第 %d 次尝试完成。", dispatch.Task.Title, dispatch.AttemptNumber),
+	}, nil
+}
+
+// Verify is the independent acceptance decision. It runs under the verifier
+// identity, never the worker's.
+func (provider *Provider) Verify(ctx context.Context, dispatch agoboardruntime.Dispatch, result agoboardruntime.ExecutionResult) (agoboardruntime.Review, error) {
+	if err := ctx.Err(); err != nil {
+		return agoboardruntime.Review{}, err
+	}
+	if provider.script.outcomeFor(dispatch.Task.ID) == OutcomeVerifierRetryWithFeedback && dispatch.AttemptNumber <= 1 {
+		return agoboardruntime.Review{
+			Accepted:     false,
+			FailureClass: agoboardprotocol.FailureVerifierFeedback,
+			Reason:       fmt.Sprintf("任务《%s》的证据未覆盖全部验收标准，请在下一次尝试中补充。", dispatch.Task.Title),
+		}, nil
+	}
+	if result.Artifact == "" || result.Summary == "" {
+		return agoboardruntime.Review{
+			Accepted:     false,
+			FailureClass: agoboardprotocol.FailureVerifierFeedback,
+			Reason:       "提交的证据不完整。",
+		}, nil
+	}
+	return agoboardruntime.Review{
+		Accepted: true,
+		Reason:   fmt.Sprintf("任务《%s》的证据满足全部验收标准。", dispatch.Task.Title),
+	}, nil
+}
