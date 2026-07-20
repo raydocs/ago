@@ -247,7 +247,7 @@ This repository grew from the earlier ClaudeX Flow orchestration runtime. Existi
 
 Ago is under active development. Local runtime and synchronized-client foundations are implemented and tested. A broadly distributed macOS release still requires a Developer ID identity, Apple notarization credentials, and a production update-signing key. Managed cloud execution and the complete autonomous board scheduler remain roadmap work.
 
-See the executable [`Ago V0 product contract`](./docs/ago-v0-product-contract.md), the detailed [`delivery plan`](./docs/ago-amp-neo-parity-plan.md), and the [`runtime conformance contract`](./docs/ago-runtime-conformance.md).
+See the executable [`Ago V0 product contract`](./docs/ago-v0-product-contract.md), the [`usable demo delivery plan`](./docs/ago-usable-demo-delivery-plan.md), the broader [`delivery plan`](./docs/ago-amp-neo-parity-plan.md), and the [`runtime conformance contract`](./docs/ago-runtime-conformance.md).
 
 ## Security
 
