@@ -3,9 +3,41 @@
 // types and must apply commands through Apply rather than writing states.
 package agoboardprotocol
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
-const SchemaVersion = 1
+// SchemaVersion 2 adds scheduler-owned durable data: lease generation and
+// fencing tokens, repository identity, access mode, retry accounting, and board
+// pause control. Boards persisted at version 1 are upgraded by the store's
+// migration, which is the only supported path forward.
+const SchemaVersion = 2
+
+// MaxAttempts bounds automatic retry. The state machine enforces it so no
+// scheduler, however buggy, can create an extra attempt.
+const MaxAttempts = 3
+
+// MaxRetryDelay caps the backoff so a bounded retry stays observable.
+const MaxRetryDelay = 30 * time.Second
+
+// RetryDelay is the bounded exponential backoff before the given attempt number
+// may start: min(2^attempt x 2s, 30s). It lives beside the attempt bound so the
+// scheduler and the state machine cannot disagree about the policy.
+func RetryDelay(attemptNumber int) time.Duration {
+	if attemptNumber < 0 {
+		attemptNumber = 0
+	}
+	// Shifting past the cap is pointless and would overflow on absurd input.
+	if attemptNumber > 16 {
+		return MaxRetryDelay
+	}
+	delay := time.Duration(1<<uint(attemptNumber)) * 2 * time.Second
+	if delay > MaxRetryDelay {
+		return MaxRetryDelay
+	}
+	return delay
+}
 
 type TaskState string
 
@@ -18,7 +50,64 @@ const (
 	TaskVerifying TaskState = "verifying"
 	TaskPassed    TaskState = "passed"
 	TaskFailed    TaskState = "failed"
+	// TaskRetryWait is a bounded, durable backoff stop: the previous attempt
+	// failed retryably and the task becomes eligible again only at
+	// NextEligibleAt. It projects onto the Blocked column with a countdown.
+	TaskRetryWait TaskState = "retry-wait"
 )
+
+// AccessMode declares whether a task needs to write the repository. The
+// scheduler uses it to keep repository writers serialized.
+type AccessMode string
+
+const (
+	AccessRead  AccessMode = "read"
+	AccessWrite AccessMode = "write"
+)
+
+// FailureClass records why an attempt ended, and therefore whether the task may
+// be retried. Classification is durable so a restarted scheduler reaches the
+// same decision.
+type FailureClass string
+
+const (
+	FailureNone FailureClass = ""
+	// Retryable classes.
+	FailureTransient        FailureClass = "transient"
+	FailureVerifierFeedback FailureClass = "verifier-feedback"
+	// Terminal classes: retrying cannot fix them without new user input.
+	FailureAuth       FailureClass = "auth"
+	FailurePolicy     FailureClass = "policy"
+	FailureNeedsInput FailureClass = "needs-input"
+	FailureRepository FailureClass = "repository"
+	FailureExhausted  FailureClass = "exhausted"
+)
+
+// Retryable reports whether a failure class may produce a further attempt.
+// Unknown classes are treated as terminal so an unclassified failure fails
+// closed rather than retrying forever.
+func (class FailureClass) Retryable() bool {
+	switch class {
+	case FailureTransient, FailureVerifierFeedback:
+		return true
+	default:
+		return false
+	}
+}
+
+func validFailureClass(class FailureClass) bool {
+	switch class {
+	case FailureNone, FailureTransient, FailureVerifierFeedback,
+		FailureAuth, FailurePolicy, FailureNeedsInput, FailureRepository, FailureExhausted:
+		return true
+	default:
+		return false
+	}
+}
+
+func validAccessMode(mode AccessMode) bool {
+	return mode == AccessRead || mode == AccessWrite
+}
 
 type AttemptState string
 
@@ -73,6 +162,16 @@ type Board struct {
 	Attempts      []Attempt    `json:"attempts"`
 	Leases        []Lease      `json:"leases"`
 	Evidence      []Evidence   `json:"evidence"`
+	// Repository identifies the single local repository this board's work
+	// touches. The scheduler serializes writers per repository.
+	Repository string `json:"repository,omitempty"`
+	// NextGeneration is the board's monotonic fencing counter. It only ever
+	// increases, so a token minted for a superseded attempt can never be
+	// reissued.
+	NextGeneration uint64 `json:"next_generation"`
+	// Paused stops new claims without cancelling running attempts.
+	Paused      bool   `json:"paused"`
+	PauseReason string `json:"pause_reason,omitempty"`
 }
 
 type Task struct {
@@ -83,6 +182,15 @@ type Task struct {
 	ActiveAttemptID    string           `json:"active_attempt_id,omitempty"`
 	ActiveLeaseID      string           `json:"active_lease_id,omitempty"`
 	AcceptedEvidenceID string           `json:"accepted_evidence_id,omitempty"`
+	// AccessMode decides which repository concurrency slot this task consumes.
+	AccessMode AccessMode `json:"access_mode"`
+	// AttemptCount counts every attempt ever created for this task, including
+	// failed ones. It is the durable bound the state machine enforces.
+	AttemptCount int `json:"attempt_count"`
+	// NextEligibleAt gates a retry-wait task. A zero value means "no wait".
+	NextEligibleAt time.Time    `json:"next_eligible_at,omitempty"`
+	FailureClass   FailureClass `json:"failure_class,omitempty"`
+	BlockedReason  string       `json:"blocked_reason,omitempty"`
 }
 
 type Dependency struct {
@@ -97,6 +205,15 @@ type Attempt struct {
 	WorkerID   string       `json:"worker_id"`
 	State      AttemptState `json:"state"`
 	EvidenceID string       `json:"evidence_id,omitempty"`
+	// Number is this attempt's 1-based position for its task.
+	Number int `json:"number"`
+	// Generation and FencingToken bind every later message from the executor
+	// to exactly this attempt. A superseded attempt keeps its values so late
+	// traffic can be recognised and rejected rather than silently applied.
+	Generation    uint64       `json:"generation"`
+	FencingToken  string       `json:"fencing_token,omitempty"`
+	FailureClass  FailureClass `json:"failure_class,omitempty"`
+	FailureReason string       `json:"failure_reason,omitempty"`
 }
 
 type Lease struct {
@@ -105,6 +222,14 @@ type Lease struct {
 	AttemptID string     `json:"attempt_id"`
 	WorkerID  string     `json:"worker_id"`
 	State     LeaseState `json:"state"`
+	// Generation and FencingToken mirror the attempt they were acquired for.
+	Generation   uint64 `json:"generation"`
+	FencingToken string `json:"fencing_token,omitempty"`
+	// AcquiredAt and ExpiresAt are durable so a restarted scheduler reconciles
+	// from SQLite rather than from process memory. A zero ExpiresAt means the
+	// lease has no deadline.
+	AcquiredAt time.Time `json:"acquired_at,omitempty"`
+	ExpiresAt  time.Time `json:"expires_at,omitempty"`
 }
 
 type Evidence struct {
@@ -130,6 +255,15 @@ const (
 	CommandEvidenceAccept CommandType = "evidence.accept"
 	CommandEvidenceReject CommandType = "evidence.reject"
 	CommandAttemptFail    CommandType = "attempt.fail"
+	// CommandLeaseExpire is the coordinator's reconciliation of a lease whose
+	// deadline elapsed or whose worker is unreachable. It supersedes the
+	// attempt so late traffic from it can no longer authenticate.
+	CommandLeaseExpire CommandType = "lease.expire"
+	// CommandLeaseRenew extends an active lease's deadline. Only the current
+	// generation may renew, so a superseded worker cannot keep a lease alive.
+	CommandLeaseRenew  CommandType = "lease.renew"
+	CommandBoardPause  CommandType = "board.pause"
+	CommandBoardResume CommandType = "board.resume"
 )
 
 type Command struct {
@@ -146,17 +280,26 @@ type Command struct {
 	AttemptID       string          `json:"attempt_id,omitempty"`
 	Evidence        *EvidenceSpec   `json:"evidence,omitempty"`
 	Reason          string          `json:"reason,omitempty"`
+	// FencingToken authenticates a worker or verifier against the exact attempt
+	// it is acting on. Commands from a superseded attempt cannot match.
+	FencingToken string `json:"fencing_token,omitempty"`
+	// FailureClass and NextEligibleAt carry the scheduler's durable retry
+	// decision. The state machine still enforces the attempt bound itself.
+	FailureClass   FailureClass `json:"failure_class,omitempty"`
+	NextEligibleAt time.Time    `json:"next_eligible_at,omitempty"`
 }
 
 type BoardSpec struct {
-	ID    string `json:"id"`
-	Title string `json:"title"`
+	ID         string `json:"id"`
+	Title      string `json:"title"`
+	Repository string `json:"repository,omitempty"`
 }
 
 type TaskSpec struct {
 	ID               string           `json:"id"`
 	Title            string           `json:"title"`
 	TerminalContract TerminalContract `json:"terminal_contract"`
+	AccessMode       AccessMode       `json:"access_mode"`
 }
 
 type DependencySpec struct {
@@ -170,6 +313,14 @@ type LeaseSpec struct {
 	AttemptID string `json:"attempt_id"`
 	TaskID    string `json:"task_id"`
 	WorkerID  string `json:"worker_id"`
+	// FencingToken must be unpredictable and never reused. The state machine
+	// rejects a token already present on the board.
+	FencingToken string `json:"fencing_token"`
+	// AcquiredAt is the scheduler's clock reading for this claim. It is the
+	// value the state machine compares against a retry-wait deadline, so
+	// backoff is enforced by the protocol rather than by scheduler discipline.
+	AcquiredAt time.Time `json:"acquired_at"`
+	ExpiresAt  time.Time `json:"expires_at,omitempty"`
 }
 
 type EvidenceSpec struct {
@@ -192,6 +343,10 @@ const (
 	EventEvidenceSubmitted   EventType = "evidence.submitted"
 	EventEvidenceAccepted    EventType = "evidence.accepted"
 	EventEvidenceRejected    EventType = "evidence.rejected"
+	EventLeaseExpired        EventType = "lease.expired"
+	EventLeaseRenewed        EventType = "lease.renewed"
+	EventBoardPaused         EventType = "board.paused"
+	EventBoardResumed        EventType = "board.resumed"
 )
 
 type Event struct {
@@ -236,6 +391,22 @@ func (board Board) Validate() error {
 		if !validTaskState(task.State) {
 			return fmt.Errorf("task %q has invalid state %q", task.ID, task.State)
 		}
+		if !validAccessMode(task.AccessMode) {
+			return fmt.Errorf("task %q has invalid access mode %q", task.ID, task.AccessMode)
+		}
+		if !validFailureClass(task.FailureClass) {
+			return fmt.Errorf("task %q has invalid failure class %q", task.ID, task.FailureClass)
+		}
+		// Only the lower bound is a structural invariant. The attempt ceiling is
+		// enforced by Apply when a lease is acquired, so a board migrated from
+		// schema 1 with more historical attempts stays readable instead of
+		// forcing the migration to rewrite history to a legal-looking number.
+		if task.AttemptCount < 0 {
+			return fmt.Errorf("task %q has a negative attempt count", task.ID)
+		}
+		if task.State == TaskRetryWait && task.NextEligibleAt.IsZero() {
+			return fmt.Errorf("task %q is waiting to retry without a next eligible time", task.ID)
+		}
 		tasks[task.ID] = task
 	}
 	dependencies := make(map[string]struct{}, len(board.Dependencies))
@@ -263,6 +434,9 @@ func (board Board) Validate() error {
 		}
 		edges[edge] = struct{}{}
 	}
+	if board.Paused && board.PauseReason == "" {
+		return fmt.Errorf("a paused board requires a reason")
+	}
 	if err := validateAcyclic(tasks, board.Dependencies); err != nil {
 		return err
 	}
@@ -286,7 +460,7 @@ func (contract TerminalContract) validate() error {
 
 func validTaskState(state TaskState) bool {
 	switch state {
-	case TaskPlanned, TaskBlocked, TaskReady, TaskLeased, TaskRunning, TaskVerifying, TaskPassed, TaskFailed:
+	case TaskPlanned, TaskBlocked, TaskReady, TaskLeased, TaskRunning, TaskVerifying, TaskPassed, TaskFailed, TaskRetryWait:
 		return true
 	default:
 		return false
@@ -343,6 +517,18 @@ func validateAttemptsLeasesEvidence(board Board, tasks map[string]Task) error {
 		default:
 			return fmt.Errorf("attempt %q has invalid state %q", attempt.ID, attempt.State)
 		}
+		if !validFailureClass(attempt.FailureClass) {
+			return fmt.Errorf("attempt %q has invalid failure class %q", attempt.ID, attempt.FailureClass)
+		}
+		// A token always implies a generation. The converse is not required:
+		// attempts migrated from schema 1 carry neither, which is what denies
+		// a historical executor any fencing authority.
+		if attempt.FencingToken != "" && attempt.Generation == 0 {
+			return fmt.Errorf("attempt %q has a fencing token without a generation", attempt.ID)
+		}
+		if attempt.Generation >= board.NextGeneration && attempt.Generation != 0 {
+			return fmt.Errorf("attempt %q generation %d is not below the board's next generation %d", attempt.ID, attempt.Generation, board.NextGeneration)
+		}
 		attempts[attempt.ID] = attempt
 	}
 	leases := make(map[string]struct{}, len(board.Leases))
@@ -360,6 +546,11 @@ func validateAttemptsLeasesEvidence(board Board, tasks map[string]Task) error {
 		}
 		if lease.State != LeaseActive && lease.State != LeaseCompleted {
 			return fmt.Errorf("lease %q has invalid state %q", lease.ID, lease.State)
+		}
+		// The lease and its attempt must agree on fencing identity, otherwise a
+		// message could authenticate against one and act on the other.
+		if lease.Generation != attempt.Generation || lease.FencingToken != attempt.FencingToken {
+			return fmt.Errorf("lease %q fencing identity does not match its attempt", lease.ID)
 		}
 	}
 	evidence := make(map[string]struct{}, len(board.Evidence))

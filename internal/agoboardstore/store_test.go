@@ -12,6 +12,9 @@ import (
 	"claudexflow/internal/agoboardprotocol"
 )
 
+// testClock keeps lease timing deterministic; no store test may sleep.
+var testClock = time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+
 func TestReopenPreservesGraphLeaseBindingAndReplay(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "board.db")
@@ -135,7 +138,7 @@ func TestExactConcurrentLeaseReplayHasOneFreshOwner(t *testing.T) {
 	}
 }
 
-func TestRenewAndExpireAreDurableIdempotentAndRestoreReadiness(t *testing.T) {
+func TestRenewAndExpireAreDurableIdempotentAndScheduleBoundedRetry(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "expiry.db")
 	store := openStore(t, path)
@@ -169,9 +172,24 @@ func TestRenewAndExpireAreDurableIdempotentAndRestoreReadiness(t *testing.T) {
 	if err != nil || len(expired) != 1 {
 		t.Fatalf("ExpireDueLeases = %#v, %v", expired, err)
 	}
-	ready, err := store.Ready(ctx, board.ID)
-	if err != nil || len(ready) != 1 || ready[0].ID != "task" {
-		t.Fatalf("Ready after expiry = %#v, %v", ready, err)
+	// Expiry no longer makes a task instantly ready again: it schedules a
+	// bounded retry, so a flapping worker cannot be redispatched in a loop.
+	expiredBoard, err := store.Board(ctx, board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, task, found := taskByID(expiredBoard, "task")
+	if !found || task.State != agoboardprotocol.TaskRetryWait {
+		t.Fatalf("task after expiry = %#v (found %v), want state %q", task, found, agoboardprotocol.TaskRetryWait)
+	}
+	if !task.NextEligibleAt.After(renewedExpiry) {
+		t.Fatalf("next eligible time %s must be after the elapsed deadline %s", task.NextEligibleAt, renewedExpiry)
+	}
+	if task.ActiveAttemptID != "" || task.ActiveLeaseID != "" {
+		t.Fatalf("expired task still points at an attempt or lease: %#v", task)
+	}
+	if ready, err := store.Ready(ctx, board.ID); err != nil || len(ready) != 0 {
+		t.Fatalf("Ready during backoff = %#v, %v, want none", ready, err)
 	}
 	completion, err := store.Completion(ctx, board.ID)
 	if err != nil || completion.Status != CompletionInProgress || completion.Remaining != 1 {
@@ -215,18 +233,18 @@ func TestMultiBoardTargetingAndBoardLocalEventIDs(t *testing.T) {
 	defer store.Close()
 	actors := []agoboardprotocol.Actor{{ID: "one", Role: agoboardprotocol.RoleCoordinator}, {ID: "two", Role: agoboardprotocol.RoleCoordinator}}
 	for index, boardID := range []string{"board-one", "board-two"} {
-		created, err := store.Create(ctx, agoboardprotocol.Command{SchemaVersion: 1, ID: "same-create-id", Actor: actors[index], Type: agoboardprotocol.CommandBoardCreate, Board: &agoboardprotocol.BoardSpec{ID: boardID, Title: boardID}})
+		created, err := store.Create(ctx, agoboardprotocol.Command{SchemaVersion: agoboardprotocol.SchemaVersion, ID: "same-create-id", Actor: actors[index], Type: agoboardprotocol.CommandBoardCreate, Board: &agoboardprotocol.BoardSpec{ID: boardID, Title: boardID}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		command := agoboardprotocol.Command{SchemaVersion: 1, ID: "same-add-id", ExpectedVersion: created.Board.Version, Actor: actors[index], Type: agoboardprotocol.CommandTaskAdd, Task: &agoboardprotocol.TaskSpec{ID: "task", Title: "Task", TerminalContract: agoboardprotocol.TerminalContract{Outcome: "done", AcceptanceCriteria: []string{"verified"}}}}
+		command := agoboardprotocol.Command{SchemaVersion: agoboardprotocol.SchemaVersion, ID: "same-add-id", ExpectedVersion: created.Board.Version, Actor: actors[index], Type: agoboardprotocol.CommandTaskAdd, Task: &agoboardprotocol.TaskSpec{ID: "task", AccessMode: agoboardprotocol.AccessRead, Title: "Task", TerminalContract: agoboardprotocol.TerminalContract{Outcome: "done", AcceptanceCriteria: []string{"verified"}}}}
 		result, err := store.ApplyBoard(ctx, boardID, command)
 		if err != nil || result.Board.ID != boardID {
 			t.Fatalf("ApplyBoard(%s) = %#v, %v", boardID, result, err)
 		}
 	}
 	sharedActor := agoboardprotocol.Actor{ID: "shared", Role: agoboardprotocol.RoleCoordinator}
-	activate := agoboardprotocol.Command{SchemaVersion: 1, ID: "same-targeted-command", ExpectedVersion: 2, Actor: sharedActor, Type: agoboardprotocol.CommandTaskActivate, TaskID: "task"}
+	activate := agoboardprotocol.Command{SchemaVersion: agoboardprotocol.SchemaVersion, ID: "same-targeted-command", ExpectedVersion: 2, Actor: sharedActor, Type: agoboardprotocol.CommandTaskActivate, TaskID: "task"}
 	if _, err := store.ApplyBoard(ctx, "board-one", activate); err != nil {
 		t.Fatal(err)
 	}
@@ -293,9 +311,9 @@ func TestCreateGraphCommitsDefinitionAndWholeGraphAtomically(t *testing.T) {
 func graphCommands(boardID string, invalid bool) []agoboardprotocol.Command {
 	actor := coordinator()
 	commands := []agoboardprotocol.Command{
-		{SchemaVersion: 1, ID: boardID + ":create", Actor: actor, Type: agoboardprotocol.CommandBoardCreate, Board: &agoboardprotocol.BoardSpec{ID: boardID, Title: "Board"}},
-		{SchemaVersion: 1, ID: boardID + ":add", ExpectedVersion: 1, Actor: actor, Type: agoboardprotocol.CommandTaskAdd, Task: &agoboardprotocol.TaskSpec{ID: "task", Title: "Task", TerminalContract: agoboardprotocol.TerminalContract{Outcome: "done", AcceptanceCriteria: []string{"verified"}}}},
-		{SchemaVersion: 1, ID: boardID + ":activate", ExpectedVersion: 2, Actor: actor, Type: agoboardprotocol.CommandTaskActivate, TaskID: "task"},
+		{SchemaVersion: agoboardprotocol.SchemaVersion, ID: boardID + ":create", Actor: actor, Type: agoboardprotocol.CommandBoardCreate, Board: &agoboardprotocol.BoardSpec{ID: boardID, Title: "Board"}},
+		{SchemaVersion: agoboardprotocol.SchemaVersion, ID: boardID + ":add", ExpectedVersion: 1, Actor: actor, Type: agoboardprotocol.CommandTaskAdd, Task: &agoboardprotocol.TaskSpec{ID: "task", AccessMode: agoboardprotocol.AccessRead, Title: "Task", TerminalContract: agoboardprotocol.TerminalContract{Outcome: "done", AcceptanceCriteria: []string{"verified"}}}},
+		{SchemaVersion: agoboardprotocol.SchemaVersion, ID: boardID + ":activate", ExpectedVersion: 2, Actor: actor, Type: agoboardprotocol.CommandTaskActivate, TaskID: "task"},
 	}
 	if invalid {
 		commands[1].Task.TerminalContract.AcceptanceCriteria = nil
@@ -315,15 +333,15 @@ func openStore(t *testing.T, path string) *Store {
 func createReadyBoard(t *testing.T, store *Store) agoboardprotocol.Board {
 	t.Helper()
 	ctx := context.Background()
-	result, err := store.Create(ctx, agoboardprotocol.Command{SchemaVersion: 1, ID: "create", Actor: coordinator(), Type: agoboardprotocol.CommandBoardCreate, Board: &agoboardprotocol.BoardSpec{ID: "board", Title: "Board"}})
+	result, err := store.Create(ctx, agoboardprotocol.Command{SchemaVersion: agoboardprotocol.SchemaVersion, ID: "create", Actor: coordinator(), Type: agoboardprotocol.CommandBoardCreate, Board: &agoboardprotocol.BoardSpec{ID: "board", Title: "Board"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err = store.Apply(ctx, agoboardprotocol.Command{SchemaVersion: 1, ID: "add", ExpectedVersion: result.Board.Version, Actor: coordinator(), Type: agoboardprotocol.CommandTaskAdd, Task: &agoboardprotocol.TaskSpec{ID: "task", Title: "Task", TerminalContract: agoboardprotocol.TerminalContract{Outcome: "done", AcceptanceCriteria: []string{"tests pass"}}}})
+	result, err = store.Apply(ctx, agoboardprotocol.Command{SchemaVersion: agoboardprotocol.SchemaVersion, ID: "add", ExpectedVersion: result.Board.Version, Actor: coordinator(), Type: agoboardprotocol.CommandTaskAdd, Task: &agoboardprotocol.TaskSpec{ID: "task", AccessMode: agoboardprotocol.AccessRead, Title: "Task", TerminalContract: agoboardprotocol.TerminalContract{Outcome: "done", AcceptanceCriteria: []string{"tests pass"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err = store.Apply(ctx, agoboardprotocol.Command{SchemaVersion: 1, ID: "activate", ExpectedVersion: result.Board.Version, Actor: coordinator(), Type: agoboardprotocol.CommandTaskActivate, TaskID: "task"})
+	result, err = store.Apply(ctx, agoboardprotocol.Command{SchemaVersion: agoboardprotocol.SchemaVersion, ID: "activate", ExpectedVersion: result.Board.Version, Actor: coordinator(), Type: agoboardprotocol.CommandTaskActivate, TaskID: "task"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,9 +349,19 @@ func createReadyBoard(t *testing.T, store *Store) agoboardprotocol.Board {
 }
 
 func leaseCommand(board agoboardprotocol.Board, leaseID, attemptID, workerID, commandID string) agoboardprotocol.Command {
-	return agoboardprotocol.Command{SchemaVersion: 1, ID: commandID, ExpectedVersion: board.Version, Actor: coordinator(), Type: agoboardprotocol.CommandLeaseAcquire, Lease: &agoboardprotocol.LeaseSpec{ID: leaseID, TaskID: "task", AttemptID: attemptID, WorkerID: workerID}}
+	return agoboardprotocol.Command{SchemaVersion: agoboardprotocol.SchemaVersion, ID: commandID, ExpectedVersion: board.Version, Actor: coordinator(), Type: agoboardprotocol.CommandLeaseAcquire, Lease: &agoboardprotocol.LeaseSpec{ID: leaseID, TaskID: "task", AttemptID: attemptID, WorkerID: workerID, FencingToken: "token-" + attemptID, AcquiredAt: testClock}}
 }
 
 func coordinator() agoboardprotocol.Actor {
 	return agoboardprotocol.Actor{ID: "coordinator", Role: agoboardprotocol.RoleCoordinator}
+}
+
+// taskByID finds a task in a board aggregate.
+func taskByID(board agoboardprotocol.Board, id string) (int, agoboardprotocol.Task, bool) {
+	for index, task := range board.Tasks {
+		if task.ID == id {
+			return index, task, true
+		}
+	}
+	return -1, agoboardprotocol.Task{}, false
 }

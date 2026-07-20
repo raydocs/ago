@@ -4,6 +4,7 @@ package agoboardruntime
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -142,7 +143,7 @@ func (runtime *Runtime) Create(ctx context.Context, goal Goal) (BoardView, error
 		SchemaVersion: agoboardprotocol.SchemaVersion,
 		ID:            stableID("command", goal.BoardID, "create"), Actor: actor,
 		Type:  agoboardprotocol.CommandBoardCreate,
-		Board: &agoboardprotocol.BoardSpec{ID: goal.BoardID, Title: goal.Objective.Summary},
+		Board: &agoboardprotocol.BoardSpec{ID: goal.BoardID, Title: goal.Objective.Summary, Repository: goal.Repository.ID},
 	}}
 	version := uint64(1)
 	for _, proposal := range plan.Tasks {
@@ -151,7 +152,7 @@ func (runtime *Runtime) Create(ctx context.Context, goal Goal) (BoardView, error
 			ID:            stableID("command", goal.BoardID, "add-task", proposal.ID), ExpectedVersion: version,
 			Actor: actor, Type: agoboardprotocol.CommandTaskAdd,
 			Task: &agoboardprotocol.TaskSpec{
-				ID: proposal.ID, Title: proposal.Title,
+				ID: proposal.ID, Title: proposal.Title, AccessMode: accessModeFor(proposal),
 				TerminalContract: agoboardprotocol.TerminalContract{Outcome: proposal.Description, AcceptanceCriteria: append([]string(nil), proposal.AcceptanceCriteria...)},
 			},
 		})
@@ -263,16 +264,28 @@ func (runtime *Runtime) tick(ctx context.Context, boardID, idempotencyKey string
 	}
 	attemptID := stableID("attempt", boardID, task.ID, strconv.Itoa(attemptNumber))
 	leaseID := stableID("lease", boardID, task.ID, strconv.Itoa(attemptNumber))
+	now := runtime.options.Now().UTC()
+	// A fencing token must be unguessable, or a superseded executor could forge
+	// authority over the attempt that replaced it. Randomness is safe for
+	// replay because the durable receipt is consulted before a token is minted:
+	// a repeated claim returns the recorded result instead of re-deriving one.
+	fencingToken, err := newFencingToken()
+	if err != nil {
+		return BoardView{}, err
+	}
 	if acquireCommandID == "" {
 		acquireCommandID = stableID("command", boardID, "acquire", task.ID, strconv.Itoa(attemptNumber))
 	}
-	acquired, fresh, err := runtime.store.AcquireLeaseBoardOnce(ctx, boardID, agoboardprotocol.Command{
+	acquired, fresh, err2 := runtime.store.AcquireLeaseBoardOnce(ctx, boardID, agoboardprotocol.Command{
 		SchemaVersion: agoboardprotocol.SchemaVersion,
 		ID:            acquireCommandID, ExpectedVersion: board.Version,
 		Actor: runtime.coordinator(), Type: agoboardprotocol.CommandLeaseAcquire,
-		Lease: &agoboardprotocol.LeaseSpec{ID: leaseID, TaskID: task.ID, AttemptID: attemptID, WorkerID: runtime.options.WorkerID},
-	}, runtime.options.Now().Add(runtime.options.LeaseDuration), nil)
-	if err != nil {
+		Lease: &agoboardprotocol.LeaseSpec{
+			ID: leaseID, TaskID: task.ID, AttemptID: attemptID, WorkerID: runtime.options.WorkerID,
+			FencingToken: fencingToken, AcquiredAt: now, ExpiresAt: now.Add(runtime.options.LeaseDuration),
+		},
+	}, now.Add(runtime.options.LeaseDuration), nil)
+	if err := err2; err != nil {
 		latest, readErr := runtime.store.Board(ctx, boardID)
 		if readErr == nil && !taskIsReady(latest, task.ID) {
 			return projectBoard(latest), nil
@@ -288,7 +301,7 @@ func (runtime *Runtime) tick(ctx context.Context, boardID, idempotencyKey string
 	}
 	started, err := runtime.store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
 		SchemaVersion: agoboardprotocol.SchemaVersion,
-		ID:            stableID("command", boardID, "start", attemptID), ExpectedVersion: acquired.Board.Version,
+		ID:            stableID("command", boardID, "start", attemptID), ExpectedVersion: acquired.Board.Version, FencingToken: fencingToken,
 		Actor: runtime.worker(), Type: agoboardprotocol.CommandAttemptStart, TaskID: task.ID, AttemptID: attemptID,
 	})
 	if err != nil {
@@ -303,7 +316,8 @@ func (runtime *Runtime) tick(ctx context.Context, boardID, idempotencyKey string
 		}
 		failed, failErr := runtime.store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
 			SchemaVersion: agoboardprotocol.SchemaVersion,
-			ID:            stableID("command", boardID, "fail", attemptID), ExpectedVersion: started.Board.Version,
+			ID:            stableID("command", boardID, "fail", attemptID), ExpectedVersion: started.Board.Version, FencingToken: fencingToken,
+			FailureClass: agoboardprotocol.FailureTransient, NextEligibleAt: now.Add(agoboardprotocol.RetryDelay(attemptNumber)),
 			Actor: runtime.worker(), Type: agoboardprotocol.CommandAttemptFail,
 			TaskID: task.ID, AttemptID: attemptID, Reason: reason,
 		})
@@ -315,7 +329,7 @@ func (runtime *Runtime) tick(ctx context.Context, boardID, idempotencyKey string
 	evidenceID := stableID("evidence", boardID, attemptID)
 	submitted, err := runtime.store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
 		SchemaVersion: agoboardprotocol.SchemaVersion,
-		ID:            stableID("command", boardID, "submit-evidence", attemptID), ExpectedVersion: started.Board.Version,
+		ID:            stableID("command", boardID, "submit-evidence", attemptID), ExpectedVersion: started.Board.Version, FencingToken: fencingToken,
 		Actor: runtime.worker(), Type: agoboardprotocol.CommandEvidenceSubmit,
 		TaskID: task.ID, AttemptID: attemptID,
 		Evidence: &agoboardprotocol.EvidenceSpec{ID: evidenceID, TaskID: task.ID, AttemptID: attemptID, Artifact: evidence.Artifact, Summary: evidence.Summary},
@@ -333,7 +347,8 @@ func (runtime *Runtime) tick(ctx context.Context, boardID, idempotencyKey string
 	}
 	decided, err := runtime.store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
 		SchemaVersion: agoboardprotocol.SchemaVersion,
-		ID:            stableID("command", boardID, "review", attemptID), ExpectedVersion: submitted.Board.Version,
+		ID:            stableID("command", boardID, "review", attemptID), ExpectedVersion: submitted.Board.Version, FencingToken: fencingToken,
+		FailureClass: agoboardprotocol.FailureVerifierFeedback, NextEligibleAt: now.Add(agoboardprotocol.RetryDelay(attemptNumber)),
 		Actor: runtime.verifierActor(), Type: commandType,
 		TaskID: task.ID, AttemptID: attemptID, Evidence: &agoboardprotocol.EvidenceSpec{ID: evidenceID}, Reason: review.Reason,
 	})
@@ -485,4 +500,26 @@ func clonePlan(plan agoplanner.Plan) agoplanner.Plan {
 	var cloned agoplanner.Plan
 	_ = json.Unmarshal(encoded, &cloned)
 	return cloned
+}
+
+// accessModeFor derives a task's repository access mode from its declared
+// capabilities. Anything that can write the repository is serialized, so an
+// unrecognised capability set is treated as a writer rather than assumed safe.
+func accessModeFor(proposal agoplanner.TaskProposal) agoboardprotocol.AccessMode {
+	for _, tag := range proposal.CapabilityTags {
+		switch tag {
+		case "repo-write", "write", "shell":
+			return agoboardprotocol.AccessWrite
+		}
+	}
+	return agoboardprotocol.AccessRead
+}
+
+// newFencingToken returns an unpredictable single-use credential.
+func newFencingToken() (string, error) {
+	buffer := make([]byte, 32)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", fmt.Errorf("generate fencing token: %w", err)
+	}
+	return hex.EncodeToString(buffer), nil
 }

@@ -1,6 +1,22 @@
 package agoboardprotocol
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+// testClock is a fixed clock: no protocol test may depend on wall time.
+var testClock = time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+
+// fenced fills in the fencing token the board issued for an attempt, which is
+// what a legitimate worker or verifier receives at dispatch. Negative tests use
+// it too, so they keep failing for the reason they are testing.
+func fenced(board Board, command Command) Command {
+	if _, attempt, found := findAttempt(board, command.AttemptID); found {
+		command.FencingToken = attempt.FencingToken
+	}
+	return command
+}
 
 func TestBlockedTaskCannotLeaseAndBecomesReadyWhenDependencyPasses(t *testing.T) {
 	board := createBoard(t)
@@ -31,24 +47,24 @@ func TestOnlyLeaseOwnerCanRunAndOnlyVerifierCanAccept(t *testing.T) {
 
 	wrongWorker := command(board, RoleWorker, "worker-2", CommandAttemptStart, "wrong-worker")
 	wrongWorker.TaskID, wrongWorker.AttemptID = "task", "attempt"
-	if _, _, err := Apply(board, wrongWorker); err == nil {
+	if _, _, err := Apply(board, fenced(board, wrongWorker)); err == nil {
 		t.Fatal("worker without the lease started the attempt")
 	}
 
 	start := command(board, RoleWorker, "worker-1", CommandAttemptStart, "start")
 	start.TaskID, start.AttemptID = "task", "attempt"
-	board = mustApply(t, board, start)
+	board = mustApply(t, board, fenced(board, start))
 
 	submit := command(board, RoleWorker, "worker-1", CommandEvidenceSubmit, "submit")
 	submit.TaskID, submit.AttemptID = "task", "attempt"
 	submit.Evidence = &EvidenceSpec{ID: "evidence", TaskID: "task", AttemptID: "attempt", Artifact: "commit:abc", Summary: "tests passed"}
-	board = mustApply(t, board, submit)
+	board = mustApply(t, board, fenced(board, submit))
 	assertTaskState(t, board, "task", TaskVerifying)
 
 	workerAccept := command(board, RoleWorker, "worker-1", CommandEvidenceAccept, "worker-accept")
 	workerAccept.TaskID, workerAccept.AttemptID = "task", "attempt"
 	workerAccept.Evidence = &EvidenceSpec{ID: "evidence"}
-	if _, _, err := Apply(board, workerAccept); err == nil {
+	if _, _, err := Apply(board, fenced(board, workerAccept)); err == nil {
 		t.Fatal("worker accepted evidence and set passed")
 	}
 	assertTaskState(t, board, "task", TaskVerifying)
@@ -56,7 +72,7 @@ func TestOnlyLeaseOwnerCanRunAndOnlyVerifierCanAccept(t *testing.T) {
 	accept := command(board, RoleVerifier, "verifier-1", CommandEvidenceAccept, "accept")
 	accept.TaskID, accept.AttemptID = "task", "attempt"
 	accept.Evidence = &EvidenceSpec{ID: "evidence"}
-	board = mustApply(t, board, accept)
+	board = mustApply(t, board, fenced(board, accept))
 	assertTaskState(t, board, "task", TaskPassed)
 	if board.Evidence[0].State != EvidenceAccepted {
 		t.Fatalf("evidence state = %s, want accepted", board.Evidence[0].State)
@@ -70,16 +86,16 @@ func TestEvidenceReviewerMustBeIndependentFromAttemptWorker(t *testing.T) {
 	board = mustApply(t, board, leaseCommand(board, "task", "lease", "attempt", "worker-1"))
 	start := command(board, RoleWorker, "worker-1", CommandAttemptStart, "start-independent")
 	start.TaskID, start.AttemptID = "task", "attempt"
-	board = mustApply(t, board, start)
+	board = mustApply(t, board, fenced(board, start))
 	submit := command(board, RoleWorker, "worker-1", CommandEvidenceSubmit, "submit-independent")
 	submit.TaskID, submit.AttemptID = "task", "attempt"
 	submit.Evidence = &EvidenceSpec{ID: "evidence", TaskID: "task", AttemptID: "attempt", Artifact: "artifact", Summary: "summary"}
-	board = mustApply(t, board, submit)
+	board = mustApply(t, board, fenced(board, submit))
 
 	selfReview := command(board, RoleVerifier, "worker-1", CommandEvidenceAccept, "self-review")
 	selfReview.TaskID, selfReview.AttemptID = "task", "attempt"
 	selfReview.Evidence = &EvidenceSpec{ID: "evidence"}
-	if _, _, err := Apply(board, selfReview); err == nil {
+	if _, _, err := Apply(board, fenced(board, selfReview)); err == nil {
 		t.Fatal("attempt worker accepted its own evidence by changing actor role")
 	}
 	assertTaskState(t, board, "task", TaskVerifying)
@@ -92,7 +108,7 @@ func TestVerifierAttemptFailRequiresActiveLease(t *testing.T) {
 	board = mustApply(t, board, leaseCommand(board, "task", "lease", "attempt", "worker-1"))
 	start := command(board, RoleWorker, "worker-1", CommandAttemptStart, "start")
 	start.TaskID, start.AttemptID = "task", "attempt"
-	board = mustApply(t, board, start)
+	board = mustApply(t, board, fenced(board, start))
 	board.Leases[0].State = LeaseCompleted
 	if err := board.Validate(); err != nil {
 		t.Fatalf("fixture must remain valid: %v", err)
@@ -100,7 +116,8 @@ func TestVerifierAttemptFailRequiresActiveLease(t *testing.T) {
 
 	fail := command(board, RoleWorker, "worker-1", CommandAttemptFail, "fail")
 	fail.TaskID, fail.AttemptID = "task", "attempt"
-	if _, _, err := Apply(board, fail); err == nil {
+	fail.FailureClass = FailureTransient
+	if _, _, err := Apply(board, fenced(board, fail)); err == nil {
 		t.Fatal("worker failed attempt with an inactive lease")
 	}
 }
@@ -108,7 +125,7 @@ func TestVerifierAttemptFailRequiresActiveLease(t *testing.T) {
 func TestIllegalTransitionsAndTerminalStatesAreRejected(t *testing.T) {
 	board := createBoard(t)
 	contract := TerminalContract{Outcome: "immutable outcome", AcceptanceCriteria: []string{"immutable criterion"}}
-	spec := &TaskSpec{ID: "task", Title: "Task", TerminalContract: contract}
+	spec := &TaskSpec{ID: "task", Title: "Task", AccessMode: AccessRead, TerminalContract: contract}
 	add := coordinatorCommand(board, CommandTaskAdd, "add", func(command *Command) { command.Task = spec })
 	board = mustApply(t, board, add)
 	spec.TerminalContract.Outcome = "changed"
@@ -148,7 +165,7 @@ func createBoard(t *testing.T) Board {
 func addTask(t *testing.T, board Board, id string) Board {
 	t.Helper()
 	return mustApply(t, board, coordinatorCommand(board, CommandTaskAdd, "add-"+id, func(command *Command) {
-		command.Task = &TaskSpec{ID: id, Title: id, TerminalContract: TerminalContract{Outcome: "complete " + id, AcceptanceCriteria: []string{"tests pass"}}}
+		command.Task = &TaskSpec{ID: id, Title: id, AccessMode: AccessRead, TerminalContract: TerminalContract{Outcome: "complete " + id, AcceptanceCriteria: []string{"tests pass"}}}
 	}))
 }
 
@@ -172,20 +189,20 @@ func completeTask(t *testing.T, board Board, taskID, workerID string) Board {
 	board = mustApply(t, board, leaseCommand(board, taskID, leaseID, attemptID, workerID))
 	start := command(board, RoleWorker, workerID, CommandAttemptStart, "start-"+taskID)
 	start.TaskID, start.AttemptID = taskID, attemptID
-	board = mustApply(t, board, start)
+	board = mustApply(t, board, fenced(board, start))
 	submit := command(board, RoleWorker, workerID, CommandEvidenceSubmit, "submit-"+taskID)
 	submit.TaskID, submit.AttemptID = taskID, attemptID
 	submit.Evidence = &EvidenceSpec{ID: evidenceID, TaskID: taskID, AttemptID: attemptID, Artifact: "commit:" + taskID, Summary: "verified"}
-	board = mustApply(t, board, submit)
+	board = mustApply(t, board, fenced(board, submit))
 	accept := command(board, RoleVerifier, "verifier", CommandEvidenceAccept, "accept-"+taskID)
 	accept.TaskID, accept.AttemptID = taskID, attemptID
 	accept.Evidence = &EvidenceSpec{ID: evidenceID}
-	return mustApply(t, board, accept)
+	return mustApply(t, board, fenced(board, accept))
 }
 
 func leaseCommand(board Board, taskID, leaseID, attemptID, workerID string) Command {
 	return coordinatorCommand(board, CommandLeaseAcquire, "acquire-"+leaseID, func(command *Command) {
-		command.Lease = &LeaseSpec{ID: leaseID, TaskID: taskID, AttemptID: attemptID, WorkerID: workerID}
+		command.Lease = &LeaseSpec{ID: leaseID, TaskID: taskID, AttemptID: attemptID, WorkerID: workerID, FencingToken: "token-" + attemptID, AcquiredAt: testClock}
 	})
 }
 

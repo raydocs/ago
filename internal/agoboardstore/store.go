@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const CurrentSchemaVersion = 2
+const CurrentSchemaVersion = 3
 
 // Sentinel errors let transport layers map durable store outcomes onto their
 // own status codes without matching on message text.
@@ -30,6 +30,9 @@ var (
 
 //go:embed migrations/001_initial.sql
 var initialSchema string
+
+//go:embed migrations/002_scheduler.sql
+var schedulerSchema string
 
 type Store struct{ db *sql.DB }
 
@@ -68,6 +71,10 @@ type LeaseCommand struct {
 	LeaseID         string                 `json:"lease_id"`
 	ExpiresAt       time.Time              `json:"expires_at,omitempty"`
 	Reason          string                 `json:"reason,omitempty"`
+	// FailureClass and NextEligibleAt carry the retry decision for an expiry.
+	// They are ignored by a renewal.
+	FailureClass   agoboardprotocol.FailureClass `json:"failure_class,omitempty"`
+	NextEligibleAt time.Time                     `json:"next_eligible_at,omitempty"`
 }
 
 func Open(path string) (*Store, error) {
@@ -113,11 +120,15 @@ func (s *Store) initialize(ctx context.Context) error {
 	if version > CurrentSchemaVersion {
 		return fmt.Errorf("board store schema version %d is newer than supported version %d", version, CurrentSchemaVersion)
 	}
+	// A fresh database is built as the schema-2 baseline and then walked
+	// through the same upgrade steps as an existing one. There is therefore a
+	// single definition of every delta, and a newly created store is provably
+	// identical to a migrated one.
 	if version == 0 {
 		if _, err := tx.ExecContext(ctx, initialSchema); err != nil {
 			return fmt.Errorf("initialize board store schema: %w", err)
 		}
-		version = CurrentSchemaVersion
+		version = 2
 	}
 	if version == 1 {
 		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS board_definitions (
@@ -128,15 +139,151 @@ definition_json BLOB NOT NULL
 		}
 		version = 2
 	}
-	if version == CurrentSchemaVersion {
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, version)); err != nil {
-			return err
+	if version == 2 {
+		if _, err := tx.ExecContext(ctx, schedulerSchema); err != nil {
+			return fmt.Errorf("migrate scheduler schema: %w", err)
 		}
+		if err := backfillSchedulerFields(ctx, tx); err != nil {
+			return fmt.Errorf("backfill scheduler fields: %w", err)
+		}
+		version = 3
+	}
+	if version != CurrentSchemaVersion {
+		return fmt.Errorf("board store schema version %d cannot be migrated to %d", version, CurrentSchemaVersion)
+	}
+	// PRAGMA user_version participates in the enclosing transaction, so a
+	// failure above leaves the recorded version untouched along with the data.
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, version)); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit board store migration: %w", err)
 	}
 	return nil
+}
+
+// backfillSchedulerFields upgrades every stored board aggregate to protocol
+// schema 2 and re-projects it into the new columns.
+//
+// The policy is deliberately conservative about authority: no historical
+// attempt or lease is given a generation or fencing token. An executor that was
+// running before the upgrade therefore holds no credential any command can
+// satisfy, so it cannot influence the graph after the upgrade; the scheduler's
+// reconciler is left to expire those leases and create a properly fenced
+// attempt. Nothing is deleted, and no attempt or event is rewritten.
+func backfillSchedulerFields(ctx context.Context, tx *sql.Tx) error {
+	// leases.expires_at was, until this migration, the only fact living solely
+	// in SQL. Read it before the aggregate becomes canonical for it.
+	deadlines := make(map[string]int64)
+	rows, err := tx.QueryContext(ctx, `SELECT board_id,lease_id,expires_at FROM leases`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var boardID, leaseID string
+		var expiry int64
+		if err := rows.Scan(&boardID, &leaseID, &expiry); err != nil {
+			rows.Close()
+			return err
+		}
+		deadlines[boardID+"\x00"+leaseID] = expiry
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	boards, err := tx.QueryContext(ctx, `SELECT board_id,board_json FROM boards ORDER BY board_id`)
+	if err != nil {
+		return err
+	}
+	type pending struct {
+		id    string
+		board agoboardprotocol.Board
+	}
+	var upgraded []pending
+	for boards.Next() {
+		var id string
+		var encoded []byte
+		if err := boards.Scan(&id, &encoded); err != nil {
+			boards.Close()
+			return err
+		}
+		// Schema-1 JSON decodes into the schema-2 struct with zero values for
+		// every new field, which is exactly the "no authority" state we want.
+		var board agoboardprotocol.Board
+		if err := json.Unmarshal(encoded, &board); err != nil {
+			boards.Close()
+			return fmt.Errorf("decode board %q: %w", id, err)
+		}
+		board.SchemaVersion = agoboardprotocol.SchemaVersion
+		if board.NextGeneration == 0 {
+			board.NextGeneration = 1
+		}
+		attemptsPerTask := make(map[string]int, len(board.Tasks))
+		for index := range board.Attempts {
+			attempt := &board.Attempts[index]
+			attemptsPerTask[attempt.TaskID]++
+			if attempt.Number == 0 {
+				attempt.Number = attemptsPerTask[attempt.TaskID]
+			}
+		}
+		for index := range board.Tasks {
+			task := &board.Tasks[index]
+			if task.AccessMode == "" {
+				// Legacy tasks declared no access mode. Assuming write keeps
+				// them serialized per repository, which can only be too
+				// cautious, never unsafe.
+				task.AccessMode = agoboardprotocol.AccessWrite
+			}
+			if task.AttemptCount == 0 {
+				task.AttemptCount = attemptsPerTask[task.ID]
+			}
+		}
+		for index := range board.Leases {
+			lease := &board.Leases[index]
+			if lease.ExpiresAt.IsZero() {
+				if expiry, found := deadlines[id+"\x00"+lease.ID]; found && expiry > 0 {
+					lease.ExpiresAt = time.Unix(0, expiry).UTC()
+				}
+			}
+		}
+		if err := board.Validate(); err != nil {
+			boards.Close()
+			return fmt.Errorf("migrated board %q is invalid: %w", id, err)
+		}
+		upgraded = append(upgraded, pending{id: id, board: board})
+	}
+	if err := boards.Close(); err != nil {
+		return err
+	}
+	if err := boards.Err(); err != nil {
+		return err
+	}
+
+	for _, item := range upgraded {
+		encoded, err := json.Marshal(item.board)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE boards SET board_json=?,repository_id=?,paused=?,next_generation=? WHERE board_id=?`,
+			encoded, item.board.Repository, boolToInt(item.board.Paused), item.board.NextGeneration, item.id); err != nil {
+			return err
+		}
+		if err := syncProjection(ctx, tx, item.board); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *Store) Close() error {
@@ -253,7 +400,7 @@ func (s *Store) CreateGraph(ctx context.Context, commands []agoboardprotocol.Com
 	if err != nil {
 		return Result{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO boards(board_id,version,title,board_json) VALUES(?,?,?,?)`, current.ID, current.Version, current.Title, encoded); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO boards(board_id,version,title,board_json,repository_id,paused,next_generation) VALUES(?,?,?,?,?,?,?)`, current.ID, current.Version, current.Title, encoded, current.Repository, boolToInt(current.Paused), current.NextGeneration); err != nil {
 		return Result{}, fmt.Errorf("insert admitted board: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO board_definitions(board_id,definition_json) VALUES(?,?)`, current.ID, []byte(definition)); err != nil {
@@ -353,6 +500,14 @@ func (s *Store) apply(ctx context.Context, boardID string, command agoboardproto
 			return Result{}, err
 		}
 	}
+	// The deadline used to be applied to the SQL column after the fact. It now
+	// belongs to the aggregate, so it is folded into the command before the
+	// request is hashed and replay stays exact.
+	if command.Lease != nil && !expiresAt.IsZero() && command.Lease.ExpiresAt.IsZero() {
+		spec := *command.Lease
+		spec.ExpiresAt = expiresAt.UTC()
+		command.Lease = &spec
+	}
 	hash, err := commandRequestHash(boardID, command, expiresAt, binding)
 	if err != nil {
 		return Result{}, err
@@ -379,7 +534,7 @@ func (s *Store) apply(ctx context.Context, boardID string, command agoboardproto
 	}
 	if command.Type == agoboardprotocol.CommandBoardCreate {
 		encoded, _ := json.Marshal(next)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO boards(board_id,version,title,board_json) VALUES(?,?,?,?)`, next.ID, next.Version, next.Title, encoded); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO boards(board_id,version,title,board_json,repository_id,paused,next_generation) VALUES(?,?,?,?,?,?,?)`, next.ID, next.Version, next.Title, encoded, next.Repository, boolToInt(next.Paused), next.NextGeneration); err != nil {
 			return Result{}, fmt.Errorf("insert board: %w", err)
 		}
 	} else if err := updateBoard(ctx, tx, next); err != nil {
@@ -390,11 +545,6 @@ func (s *Store) apply(ctx context.Context, boardID string, command agoboardproto
 	}
 	if err := syncProjection(ctx, tx, next); err != nil {
 		return Result{}, err
-	}
-	if command.Lease != nil && !expiresAt.IsZero() {
-		if _, err := tx.ExecContext(ctx, `UPDATE leases SET expires_at=? WHERE board_id=? AND lease_id=?`, expiresAt.UnixNano(), next.ID, command.Lease.ID); err != nil {
-			return Result{}, err
-		}
 	}
 	if binding != nil {
 		if command.Lease == nil || binding.BoardID != next.ID || binding.AttemptID != command.Lease.AttemptID || binding.ThreadID == "" {
@@ -628,57 +778,38 @@ func (s *Store) mutateLease(ctx context.Context, command LeaseCommand, expire bo
 		}
 		return Result{}, false, fmt.Errorf("expected board version %d, got %d", command.ExpectedVersion, board.Version)
 	}
-	leaseIndex, taskIndex, attemptIndex := -1, -1, -1
-	for i := range board.Leases {
-		if board.Leases[i].ID == command.LeaseID {
-			leaseIndex = i
-		}
-	}
-	if leaseIndex < 0 || board.Leases[leaseIndex].State != agoboardprotocol.LeaseActive {
-		return Result{}, false, fmt.Errorf("active lease %q not found", command.LeaseID)
-	}
-	lease := &board.Leases[leaseIndex]
-	for i := range board.Tasks {
-		if board.Tasks[i].ID == lease.TaskID {
-			taskIndex = i
-		}
-	}
-	for i := range board.Attempts {
-		if board.Attempts[i].ID == lease.AttemptID {
-			attemptIndex = i
-		}
-	}
-	if taskIndex < 0 || attemptIndex < 0 {
-		return Result{}, false, fmt.Errorf("lease graph is incomplete")
-	}
-	eventType := agoboardprotocol.EventType("lease.renewed")
+	// Every aggregate transition goes through the state machine. Before
+	// schema 3 this function edited the board by hand, which meant lease expiry
+	// silently skipped fencing supersession and retry accounting.
+	protocolType := agoboardprotocol.CommandLeaseRenew
 	if expire {
-		eventType = agoboardprotocol.EventType("lease.expired")
-		lease.State = agoboardprotocol.LeaseCompleted
-		board.Attempts[attemptIndex].State = agoboardprotocol.AttemptFailed
-		board.Tasks[taskIndex].State = agoboardprotocol.TaskReady
-		board.Tasks[taskIndex].ActiveAttemptID, board.Tasks[taskIndex].ActiveLeaseID = "", ""
+		protocolType = agoboardprotocol.CommandLeaseExpire
 	}
-	board.Version++
-	event := agoboardprotocol.Event{SchemaVersion: agoboardprotocol.SchemaVersion, ID: fmt.Sprintf("%s:1", command.ID), CommandID: command.ID, BoardID: board.ID, Version: board.Version, Actor: command.Actor, Type: eventType, Task: &board.Tasks[taskIndex], Attempt: &board.Attempts[attemptIndex], Lease: lease, Reason: command.Reason}
-	if err := updateBoard(ctx, tx, board); err != nil {
+	next, events, err := agoboardprotocol.Apply(board, agoboardprotocol.Command{
+		SchemaVersion:   agoboardprotocol.SchemaVersion,
+		ID:              command.ID,
+		ExpectedVersion: board.Version,
+		Actor:           command.Actor,
+		Type:            protocolType,
+		Lease:           &agoboardprotocol.LeaseSpec{ID: command.LeaseID, ExpiresAt: command.ExpiresAt},
+		Reason:          command.Reason,
+		FailureClass:    command.FailureClass,
+		NextEligibleAt:  command.NextEligibleAt,
+	})
+	if err != nil {
 		return Result{}, false, err
 	}
-	if err := appendEvents(ctx, tx, []agoboardprotocol.Event{event}); err != nil {
+	if err := updateBoard(ctx, tx, next); err != nil {
 		return Result{}, false, err
 	}
-	expires := command.ExpiresAt.UTC()
-	if expire {
-		expires = time.Time{}
-	}
-	if err := syncProjection(ctx, tx, board); err != nil {
+	if err := appendEvents(ctx, tx, events); err != nil {
 		return Result{}, false, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE leases SET expires_at=? WHERE board_id=? AND lease_id=?`, timeNanos(expires), board.ID, command.LeaseID); err != nil {
+	if err := syncProjection(ctx, tx, next); err != nil {
 		return Result{}, false, err
 	}
-	result := Result{Board: board, Events: []agoboardprotocol.Event{event}}
-	if err := insertResult(ctx, tx, command.Actor.ID, command.ID, hash, board.ID, result); err != nil {
+	result := Result{Board: next, Events: events}
+	if err := insertResult(ctx, tx, command.Actor.ID, command.ID, hash, next.ID, result); err != nil {
 		return Result{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -717,8 +848,27 @@ func (s *Store) ExpireDueLeases(ctx context.Context, now time.Time, actor agoboa
 		if err != nil {
 			return nil, err
 		}
+		// The retry decision is computed from durable state, so two schedulers
+		// reconciling the same lease reach the same next-eligible time and the
+		// idempotency receipt absorbs the loser.
+		attemptNumber := 0
+		for _, lease := range board.Leases {
+			if lease.ID != d.lease {
+				continue
+			}
+			for _, task := range board.Tasks {
+				if task.ID == lease.TaskID {
+					attemptNumber = task.AttemptCount
+				}
+			}
+		}
 		identity := expiryCommandID(d.board, d.lease, d.expiry)
-		result, expired, err := s.mutateLease(ctx, LeaseCommand{ID: identity, ExpectedVersion: board.Version, Actor: actor, BoardID: d.board, LeaseID: d.lease, Reason: "lease deadline elapsed"}, true, &d.expiry)
+		result, expired, err := s.mutateLease(ctx, LeaseCommand{
+			ID: identity, ExpectedVersion: board.Version, Actor: actor, BoardID: d.board, LeaseID: d.lease,
+			Reason:         "lease deadline elapsed",
+			FailureClass:   agoboardprotocol.FailureTransient,
+			NextEligibleAt: now.UTC().Add(agoboardprotocol.RetryDelay(attemptNumber)),
+		}, true, &d.expiry)
 		if err != nil {
 			return nil, err
 		}
@@ -741,7 +891,7 @@ func expiryCommandID(boardID, leaseID string, expiry int64) string {
 
 func updateBoard(ctx context.Context, tx *sql.Tx, board agoboardprotocol.Board) error {
 	encoded, _ := json.Marshal(board)
-	result, err := tx.ExecContext(ctx, `UPDATE boards SET version=?,title=?,board_json=? WHERE board_id=?`, board.Version, board.Title, encoded, board.ID)
+	result, err := tx.ExecContext(ctx, `UPDATE boards SET version=?,title=?,board_json=?,repository_id=?,paused=?,next_generation=? WHERE board_id=?`, board.Version, board.Title, encoded, board.Repository, boolToInt(board.Paused), board.NextGeneration, board.ID)
 	if err != nil {
 		return err
 	}
@@ -761,10 +911,22 @@ func appendEvents(ctx context.Context, tx *sql.Tx, events []agoboardprotocol.Eve
 	return nil
 }
 
+// syncProjection rewrites the normalized tables from the board aggregate.
+//
+// boards.board_json is the single source of truth: every column written here is
+// derived from it on every command, so a projection can never disagree with the
+// aggregate. Adding a scheduler column therefore means adding it to this
+// function and to the DO UPDATE SET clause, never writing it from anywhere else.
 func syncProjection(ctx context.Context, tx *sql.Tx, board agoboardprotocol.Board) error {
 	for _, value := range board.Tasks {
 		encoded, _ := json.Marshal(value)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO tasks VALUES(?,?,?,?) ON CONFLICT(board_id,task_id) DO UPDATE SET state=excluded.state,task_json=excluded.task_json`, board.ID, value.ID, value.State, encoded); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(board_id,task_id,state,task_json,access_mode,attempt_count,next_eligible_at,failure_class)
+VALUES(?,?,?,?,?,?,?,?)
+ON CONFLICT(board_id,task_id) DO UPDATE SET
+state=excluded.state,task_json=excluded.task_json,access_mode=excluded.access_mode,
+attempt_count=excluded.attempt_count,next_eligible_at=excluded.next_eligible_at,failure_class=excluded.failure_class`,
+			board.ID, value.ID, value.State, encoded, value.AccessMode, value.AttemptCount,
+			timeNanos(value.NextEligibleAt), value.FailureClass); err != nil {
 			return err
 		}
 	}
@@ -774,15 +936,37 @@ func syncProjection(ctx context.Context, tx *sql.Tx, board agoboardprotocol.Boar
 			return err
 		}
 	}
+	accessModes := make(map[string]agoboardprotocol.AccessMode, len(board.Tasks))
+	for _, task := range board.Tasks {
+		accessModes[task.ID] = task.AccessMode
+	}
 	for _, value := range board.Attempts {
 		encoded, _ := json.Marshal(value)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO attempts VALUES(?,?,?,?,?,?) ON CONFLICT(board_id,attempt_id) DO UPDATE SET state=excluded.state,attempt_json=excluded.attempt_json`, board.ID, value.ID, value.TaskID, value.WorkerID, value.State, encoded); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(board_id,attempt_id,task_id,worker_id,state,attempt_json,attempt_number,generation,fencing_token,failure_class)
+VALUES(?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(board_id,attempt_id) DO UPDATE SET
+state=excluded.state,attempt_json=excluded.attempt_json,attempt_number=excluded.attempt_number,
+generation=excluded.generation,fencing_token=excluded.fencing_token,failure_class=excluded.failure_class`,
+			board.ID, value.ID, value.TaskID, value.WorkerID, value.State, encoded,
+			value.Number, value.Generation, value.FencingToken, value.FailureClass); err != nil {
 			return err
 		}
 	}
 	for _, value := range board.Leases {
 		encoded, _ := json.Marshal(value)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO leases VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(board_id,lease_id) DO UPDATE SET state=excluded.state,lease_json=excluded.lease_json`, board.ID, value.ID, value.TaskID, value.AttemptID, value.WorkerID, value.State, 0, encoded); err != nil {
+		// expires_at is derived from the aggregate like every other column.
+		// Before schema 3 it was written out of band, which let a lease created
+		// through a path that forgot the extra UPDATE keep a zero deadline and
+		// so never be swept. Deriving it removes that whole class of bug.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO leases(board_id,lease_id,task_id,attempt_id,worker_id,state,expires_at,lease_json,generation,fencing_token,acquired_at,access_mode,repository_id)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(board_id,lease_id) DO UPDATE SET
+state=excluded.state,lease_json=excluded.lease_json,expires_at=excluded.expires_at,
+generation=excluded.generation,fencing_token=excluded.fencing_token,acquired_at=excluded.acquired_at,
+access_mode=excluded.access_mode,repository_id=excluded.repository_id`,
+			board.ID, value.ID, value.TaskID, value.AttemptID, value.WorkerID, value.State,
+			timeNanos(value.ExpiresAt), encoded, value.Generation, value.FencingToken,
+			timeNanos(value.AcquiredAt), accessModes[value.TaskID], board.Repository); err != nil {
 			return err
 		}
 	}

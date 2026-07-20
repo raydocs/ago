@@ -61,8 +61,10 @@ func TestChineseGoalRunsThroughBoardClaimEvidenceAndIndependentReview(t *testing
 	}
 }
 
-func TestVerifierRejectionProjectsBlockedAndFailedCompletion(t *testing.T) {
-	runtime, _, _, verifier := newFixtureRuntime(t)
+// A first rejection earns a bounded retry rather than stopping the task: the
+// verifier's feedback is retryable and the attempt budget is not yet spent.
+func TestVerifierRejectionSchedulesBoundedRetryBeforeStopping(t *testing.T) {
+	runtime, store, _, verifier := newFixtureRuntime(t)
 	goal, plan := fixtureGoalAndPlan()
 	runtime.planner = agoplanner.FixturePlanner{Proposal: plan}
 	verifier.review = Review{Accepted: false, Reason: "验收标准未满足"}
@@ -73,9 +75,26 @@ func TestVerifierRejectionProjectsBlockedAndFailedCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
+	// Retry-wait projects onto Blocked so the user sees a stop with a countdown.
 	assertOnlyTaskInColumn(t, view, ColumnBlocked)
+
+	board, err := store.Board(context.Background(), goal.BoardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := board.Tasks[0]
+	if task.State != agoboardprotocol.TaskRetryWait {
+		t.Fatalf("task state = %q, want %q", task.State, agoboardprotocol.TaskRetryWait)
+	}
+	if task.AttemptCount != 1 || task.FailureClass != agoboardprotocol.FailureVerifierFeedback {
+		t.Fatalf("retry accounting = attempts %d class %q", task.AttemptCount, task.FailureClass)
+	}
+	if task.NextEligibleAt.IsZero() {
+		t.Fatal("a retry-wait task must carry a durable next eligible time")
+	}
+	// The work is not finished and not failed: it is waiting.
 	completion, err := runtime.Completion(context.Background(), goal.BoardID)
-	if err != nil || completion.Status != agoboardstore.CompletionFailed {
+	if err != nil || completion.Status != agoboardstore.CompletionInProgress || completion.Remaining != 1 {
 		t.Fatalf("Completion = %#v, %v", completion, err)
 	}
 }
