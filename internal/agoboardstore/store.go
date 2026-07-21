@@ -51,20 +51,19 @@ type Binding struct {
 	ExecutorID string `json:"executor_id,omitempty"`
 }
 
-type CompletionStatus string
+// Completion and its status are the protocol's, re-exported so callers that
+// already speak to the store need not import both. There is exactly one
+// definition, in agoboardprotocol.
+type CompletionStatus = agoboardprotocol.CompletionStatus
 
 const (
-	CompletionInProgress CompletionStatus = "in-progress"
-	CompletionPassed     CompletionStatus = "passed"
-	CompletionFailed     CompletionStatus = "failed"
+	CompletionInProgress = agoboardprotocol.CompletionInProgress
+	CompletionUnproven   = agoboardprotocol.CompletionUnproven
+	CompletionPassed     = agoboardprotocol.CompletionPassed
+	CompletionFailed     = agoboardprotocol.CompletionFailed
 )
 
-type Completion struct {
-	Status    CompletionStatus `json:"status"`
-	Passed    int              `json:"passed"`
-	Failed    int              `json:"failed"`
-	Remaining int              `json:"remaining"`
-}
+type Completion = agoboardprotocol.Completion
 
 type LeaseCommand struct {
 	ID              string                 `json:"id"`
@@ -734,36 +733,9 @@ func (s *Store) Completion(ctx context.Context, boardID string) (Completion, err
 	if err != nil {
 		return Completion{}, err
 	}
-	c := Completion{Status: CompletionInProgress}
-	for _, task := range board.Tasks {
-		switch task.State {
-		case agoboardprotocol.TaskPassed:
-			c.Passed++
-		case agoboardprotocol.TaskFailed:
-			c.Failed++
-		default:
-			c.Remaining++
-		}
-	}
-	if c.Failed > 0 {
-		c.Status = CompletionFailed
-	} else if len(board.Tasks) > 0 && c.Remaining == 0 {
-		// Every task passing is not the same claim as the integrated result
-		// holding together: two individually correct changes can combine into
-		// something broken. Where a gate was established, it decides.
-		switch {
-		case !board.Gate.Established():
-			c.Status = CompletionPassed
-		case board.Gate.SatisfiedAt(board.IntegratedRevision):
-			c.Status = CompletionPassed
-		case board.Gate.State == agoboardprotocol.GateFailed:
-			c.Status = CompletionFailed
-		default:
-			// Tasks are done and the gate has not proved this revision yet.
-			c.Status = CompletionInProgress
-		}
-	}
-	return c, nil
+	// One implementation, in the protocol. There were three of these and they
+	// disagreed with each other.
+	return agoboardprotocol.EvaluateCompletion(board), nil
 }
 
 func (s *Store) Binding(ctx context.Context, boardID, attemptID string) (Binding, error) {

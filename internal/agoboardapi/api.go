@@ -32,6 +32,7 @@ import (
 	"claudexflow/internal/agoboardprotocol"
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
+	"claudexflow/internal/agogate"
 	"claudexflow/internal/agoplanner"
 )
 
@@ -135,6 +136,9 @@ type repositoryRequest struct {
 }
 
 type goalRequest struct {
+	// GateCommands are the checks the integrated result must pass. Omitted
+	// means "ask the repository". A model never supplies these.
+	GateCommands  []string          `json:"gate_commands,omitempty"`
 	CommandID     string            `json:"command_id"`
 	Objective     string            `json:"objective"`
 	Repository    repositoryRequest `json:"repository"`
@@ -196,6 +200,21 @@ type Snapshot struct {
 	Progress            SnapshotProgress     `json:"progress"`
 	Paused              bool                 `json:"paused"`
 	Completed           bool                 `json:"completed"`
+	// Gate is the project-level proof. A caller must be able to tell "every
+	// task passed" from "the integrated result was proven", and both from
+	// "there was nothing to prove it against".
+	Gate SnapshotGate `json:"gate"`
+}
+
+// SnapshotGate is what the goal had to prove and whether it did.
+type SnapshotGate struct {
+	// State is absent, pending, passed, or failed. Absent is not a pass: it
+	// means this repository offered no checks, so completion can only ever
+	// mean "every task was checked".
+	State    string   `json:"state"`
+	Commands []string `json:"commands,omitempty"`
+	Revision string   `json:"revision,omitempty"`
+	Summary  string   `json:"summary,omitempty"`
 }
 
 type TaskAttempt struct {
@@ -488,8 +507,19 @@ func (server *Server) snapshot(ctx context.Context, boardID string) (Snapshot, e
 			Status: completion.Status, Passed: completion.Passed,
 			Failed: completion.Failed, Remaining: completion.Remaining, Total: total,
 		},
-		Paused:    board.Paused,
-		Completed: total > 0 && completion.Remaining == 0,
+		Paused: board.Paused,
+		// Done, not "no tasks remaining". Counting tasks here is what let the
+		// API report a goal complete while the store called it in-progress and
+		// the integrated result had never been checked — the false-green the
+		// project gate exists to close, surviving in the one place a user
+		// actually looks.
+		Completed: completion.Done,
+		Gate: SnapshotGate{
+			State:    string(board.Gate.State),
+			Commands: board.Gate.Commands,
+			Revision: board.Gate.Revision,
+			Summary:  board.Gate.Summary,
+		},
 	}, nil
 }
 
@@ -544,11 +574,34 @@ func (server *Server) buildGoal(input goalRequest) (agoboardruntime.Goal, error)
 		Repository: agoplanner.Repository{ID: root, Revision: revision},
 		// The objective is stored exactly as the user wrote it; nothing
 		// normalizes, translates, or truncates the Chinese text.
-		Objective:     agoplanner.Objective{ID: derivedID("objective", commandID), Summary: objective},
+		Objective: agoplanner.Objective{ID: derivedID("objective", commandID), Summary: objective},
+		// The checks the INTEGRATED result must pass, discovered from the
+		// repository. Without these the goal would complete on task-level
+		// acceptance alone — which is exactly how this API reported success on
+		// a result whose own tests failed. A user-supplied set overrides
+		// discovery; a model never proposes them.
+		GateCommands:  gateCommandsFor(root, input.GateCommands),
 		ProjectGates:  defaultProjectGates(),
 		Constraints:   defaultConstraints(),
 		ExecutionMode: mode,
 	}, nil
+}
+
+// gateCommandsFor decides what this goal must prove. An explicit set from the
+// caller wins; otherwise the repository is asked. A repository that offers
+// nothing gets no gate, and the snapshot reports that as "absent" rather than
+// letting it look like a pass.
+func gateCommandsFor(root string, supplied []string) []string {
+	cleaned := make([]string, 0, len(supplied))
+	for _, command := range supplied {
+		if trimmed := strings.TrimSpace(command); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	if len(cleaned) > 0 {
+		return cleaned
+	}
+	return agogate.Discover(root)
 }
 
 func defaultProjectGates() []agoplanner.ProjectGate {

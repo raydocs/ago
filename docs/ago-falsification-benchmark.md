@@ -1,6 +1,10 @@
 # Falsification benchmark — design, frozen before any code changes
 
-**Status: proposed. Freeze this before building the project gate.**
+**Status: NOT YET FROZEN.** §3 and §4 are still blank — no repositories, no
+commits, no goals. Until they are filled in, the anti-tampering rule in §2
+protects nothing, and a review correctly pointed out that the project gate was
+built before this was frozen, which is the opposite of the order this document
+argues for. Fill §3–§6 in, commit them, and only then start the harness.
 
 The order matters. Once the gate exists it becomes very easy to adjust the
 question until the gate passes it, and that is exactly the failure this
@@ -25,16 +29,30 @@ integration stage are ceremony. Everything else Ago does — isolation, crash
 recovery, audit — is real but commodity, and the project should stop being a
 product and become a library.
 
-### The three outcomes, decided now
+### The outcomes, decided now
 
-| Outcome | Meaning | What I do |
+Let `d` = the control's false-completion rate minus Ago's, in percentage
+points. Positive means Ago is better. The bands are exhaustive and disjoint —
+an earlier version of this table had a gap between 15 and 30 and an overlap at
+zero, which is exactly the kind of room to argue afterwards this document
+exists to remove.
+
+| `d` | Outcome | What I do |
 |---|---|---|
-| **Ago wins** — false-completion rate at least 30 points lower than the control, with human messages ≤ control | The thesis holds | Continue; build routing next |
-| **Tie** — within 15 points either way | The ceremony is not paying for itself yet | Continue one more month **only** on the specific failure mode the data names. No new features. |
-| **Ago loses** — equal or higher false completion, or needs more human messages | The thesis is wrong as built | Stop the product. Keep the code as a library for durable task execution and safe integration. |
+| `d ≥ 25` **and** Ago's human messages ≤ control's | **Ago wins** | Continue; build routing next |
+| `d ≥ 25` but Ago needs more human messages | **Tie** | It bought correctness with interruption, which is not the claim. One more month on that specifically. |
+| `0 < d < 25` | **Tie** | The ceremony is not paying for itself yet. One more month on the failure mode the data names. No new features. |
+| `d ≤ 0` | **Ago loses** | Stop the product. Keep the code as a library for durable task execution and safe integration. |
 
-30 and 15 are chosen before seeing data and do not move. If the sample is too
-small to distinguish them, that is a "tie" and I say so.
+25 is chosen before seeing data and does not move. Ties resolve toward
+stopping, not continuing: `d = 0` is a loss, not a tie, because a system that
+adds a verifier, a graph, and an integration stage and lands exactly on the
+control has not earned them.
+
+On sample size: with 15 goals × 3 runs the smallest difference this can
+distinguish at all is roughly one goal's worth, about 7 points. A `d` inside
+that is reported as "indistinguishable" and counts as a **tie**, and I state
+the observed spread rather than only the mean.
 
 ---
 

@@ -868,3 +868,84 @@ type GateSpec struct {
 	// no clock, so every timestamp on the board arrives in a command.
 	RanAt time.Time `json:"ran_at"`
 }
+
+// CompletionStatus is how far a goal has got. It is deliberately four values,
+// not a boolean: "every task settled" and "the result was proven" are
+// different claims, and collapsing them is what let a goal report success on
+// an integrated result nobody had checked.
+type CompletionStatus string
+
+const (
+	CompletionInProgress CompletionStatus = "in-progress"
+	// CompletionUnproven means every task settled but the project gate has not
+	// yet proved the integrated result. It is not success and it is not
+	// failure; it is work waiting on its own proof.
+	CompletionUnproven CompletionStatus = "unproven"
+	CompletionPassed   CompletionStatus = "passed"
+	CompletionFailed   CompletionStatus = "failed"
+)
+
+// Completion is the single answer to "is this goal done?".
+type Completion struct {
+	Status    CompletionStatus `json:"status"`
+	Passed    int              `json:"passed"`
+	Failed    int              `json:"failed"`
+	Remaining int              `json:"remaining"`
+	// Done is true only for a goal that finished successfully. Anything that
+	// reports completion to a user reads this and nothing else.
+	Done bool `json:"done"`
+}
+
+// EvaluateCompletion answers the question once, so nobody answers it again
+// differently.
+//
+// There were three implementations of this — in the store, in the supervisor,
+// and in the HTTP API — and they disagreed. The API's counted tasks and
+// ignored the gate entirely, so it reported a goal complete while the store
+// called it in-progress and the integrated result had never been checked.
+// That is the false-green the gate was built to close, surviving in the one
+// place a user actually looks.
+func EvaluateCompletion(board Board) Completion {
+	completion := Completion{Status: CompletionInProgress}
+	settled := 0
+	for _, task := range board.Tasks {
+		switch {
+		case task.State == TaskPassed:
+			completion.Passed++
+			settled++
+		case task.Cancelled || task.SupersededBy != "":
+			// Replaced or withdrawn on the record. Resolved, but not a pass.
+			settled++
+		case task.State == TaskFailed:
+			completion.Failed++
+		default:
+			completion.Remaining++
+		}
+	}
+	if completion.Failed > 0 {
+		completion.Status = CompletionFailed
+		return completion
+	}
+	if len(board.Tasks) == 0 || settled != len(board.Tasks) {
+		return completion
+	}
+	// Every task is settled. Whether that means the GOAL is done depends on
+	// whether anything proved the integrated result.
+	switch {
+	case !board.Gate.Established():
+		// Nothing to prove against. This completes on the weaker claim —
+		// every part was checked — and callers that care can see the gate is
+		// not established rather than being told it passed.
+		completion.Status, completion.Done = CompletionPassed, true
+	case board.IntegratedRevision == "":
+		// A read-only goal integrated nothing, so there is nothing to prove.
+		completion.Status, completion.Done = CompletionPassed, true
+	case board.Gate.SatisfiedAt(board.IntegratedRevision):
+		completion.Status, completion.Done = CompletionPassed, true
+	case board.Gate.State == GateFailed && board.Gate.Revision == board.IntegratedRevision:
+		completion.Status = CompletionFailed
+	default:
+		completion.Status = CompletionUnproven
+	}
+	return completion
+}

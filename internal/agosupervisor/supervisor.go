@@ -575,26 +575,9 @@ func (supervisor *Supervisor) status(ctx context.Context) (Status, error) {
 		Passed: completion.Passed, Failed: completion.Failed, Remaining: completion.Remaining,
 		Decisions: append([]Decision(nil), supervisor.decisions...),
 	}
-	// The goal is complete only when nothing is left. A superseded or cancelled
-	// task counts as resolved: it was replaced or withdrawn on the record.
-	outstanding := 0
-	for _, task := range board.Tasks {
-		switch {
-		case task.State == agoboardprotocol.TaskPassed:
-		case task.Cancelled || task.SupersededBy != "":
-		default:
-			outstanding++
-		}
-	}
-	// Every task passing is a weaker claim than the integrated result holding
-	// together, and reporting the first as the second is how a goal whose
-	// parts were each correct could still be broken. Where the goal
-	// established a gate, the gate decides — and it has to have proved THIS
-	// revision, not an earlier one.
-	status.Complete = outstanding == 0 &&
-		(!board.Gate.Established() ||
-			board.IntegratedRevision == "" ||
-			board.Gate.SatisfiedAt(board.IntegratedRevision))
+	// One implementation, in the protocol. This used to be its own, and it
+	// disagreed with the store's and the API's about the same board.
+	status.Complete = completion.Done
 	status.GateState = board.Gate.State
 	status.GateSummary = board.Gate.Summary
 	// Blocked means every remaining stop is waiting on a person: there is
