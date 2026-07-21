@@ -61,6 +61,7 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 			// Generations start at 1 so zero can mean "no fencing authority",
 			// which is what migrated schema-1 attempts carry.
 			NextGeneration: 1,
+			Gate:           newProjectGate(command.Board.GateCommands),
 		}
 		emit(Event{Type: EventBoardCreated})
 	case CommandTaskAdd:
@@ -576,6 +577,48 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 			next.PauseReason, eventType = command.Reason, EventBoardPaused
 		}
 		emit(Event{Type: eventType, Reason: command.Reason})
+	case CommandGatePass, CommandGateFail:
+		if err := requireInitialized(next); err != nil {
+			return current, nil, err
+		}
+		// Coordinator only. The gate is the one judgement the workers do not
+		// get to make about themselves, at the level of the whole goal.
+		if err := requireRole(RoleCoordinator); err != nil {
+			return current, nil, err
+		}
+		if !next.Gate.Established() {
+			return current, nil, fmt.Errorf("this goal has no project gate to record a result for")
+		}
+		if command.Gate == nil || strings.TrimSpace(command.Gate.Summary) == "" {
+			return current, nil, fmt.Errorf("a gate result requires a summary")
+		}
+		revision := strings.TrimSpace(command.Revision)
+		if revision == "" {
+			return current, nil, fmt.Errorf("a gate result requires the revision it ran against")
+		}
+		// A result is about one revision. Recording it against anything other
+		// than what is currently integrated would let a pass outlive the work
+		// it was about.
+		if revision != next.IntegratedRevision {
+			return current, nil, fmt.Errorf(
+				"gate result is for revision %s but the board is integrated at %s",
+				revision, next.IntegratedRevision)
+		}
+		next.Gate.Revision = revision
+		next.Gate.Summary = command.Gate.Summary
+		next.Gate.RanAt = command.Gate.RanAt.UTC()
+		if command.Type == CommandGatePass {
+			next.Gate.State, next.Gate.FailureOutput = GatePassed, ""
+			next.Gate.Failures = 0
+			emit(Event{Type: EventGatePassed, Reason: command.Gate.Summary})
+			break
+		}
+		next.Gate.State = GateFailed
+		next.Gate.FailureOutput = command.Gate.FailureOutput
+		// Counted here, where the failure is durable, so a restarted
+		// supervisor spends the same repair budget as the one it replaced.
+		next.Gate.Failures++
+		emit(Event{Type: EventGateFailed, Reason: command.Gate.Summary})
 	default:
 		return current, nil, fmt.Errorf("unsupported command type %q", command.Type)
 	}
@@ -635,6 +678,22 @@ func recordAttemptFailure(board *Board, taskIndex, attemptIndex, leaseIndex int,
 		task.FailureClass = FailureExhausted
 	}
 	return nil
+}
+
+// newProjectGate establishes what this goal must prove. A goal whose
+// repository offered no checks gets an absent gate — which is not a pass: it
+// means completion can only ever mean "every task was checked".
+func newProjectGate(commands []string) ProjectGate {
+	cleaned := make([]string, 0, len(commands))
+	for _, command := range commands {
+		if trimmed := strings.TrimSpace(command); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	if len(cleaned) == 0 {
+		return ProjectGate{State: GateAbsent}
+	}
+	return ProjectGate{State: GatePending, Commands: cleaned}
 }
 
 func expiryUTC(value time.Time) time.Time {

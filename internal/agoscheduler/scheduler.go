@@ -21,6 +21,7 @@ import (
 	"claudexflow/internal/agoboardprotocol"
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agoboardstore"
+	"claudexflow/internal/agogate"
 	"claudexflow/internal/agointegrate"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoredact"
@@ -39,6 +40,11 @@ type Options struct {
 	Store    *agoboardstore.Store
 	Runtime  *agoboardruntime.Runtime
 	Executor agoboardruntime.Executor
+	// Gate proves the integrated result. A board whose goal established no
+	// checks, or a scheduler built without one, simply never runs it — and
+	// completion then means "every task was checked", never "the result was
+	// proven".
+	Gate ProjectGate
 	// Verification reads persisted evidence and decides acceptance. It is a
 	// pipeline, not an object the executor could also be: independence is
 	// structural here rather than a matter of using a different identity.
@@ -206,6 +212,13 @@ func (scheduler *Scheduler) runCycle(ctx context.Context, onlyBoard string) (Cyc
 			}
 			cycle.Claimed++
 			cycle.Dispatched++
+		}
+		// Last, because it is about the whole goal rather than any one task:
+		// once nothing is outstanding, prove the INTEGRATED result. Every task
+		// passing is a different claim, and reporting completion without this
+		// is how a goal whose parts were each correct could still be broken.
+		if err := scheduler.runProjectGate(ctx, boardID); err != nil {
+			return cycle, err
 		}
 	}
 	if scheduler.options.OnCycle != nil {
@@ -655,6 +668,90 @@ func (scheduler *Scheduler) abandonVerification(ctx context.Context, boardID str
 	return err
 }
 
+// runProjectGate proves the integrated result, once there is nothing else to
+// do and the gate has not already proved this exact revision.
+//
+// It is the scheduler's job rather than the supervisor's because it executes:
+// the supervisor observes and issues commands, and never runs anything. The
+// result is recorded durably, so a restart does not re-run a gate that already
+// answered for this revision.
+func (scheduler *Scheduler) runProjectGate(ctx context.Context, boardID string) error {
+	if scheduler.options.Gate == nil {
+		return nil
+	}
+	board, err := scheduler.options.Store.Board(ctx, boardID)
+	if err != nil {
+		return err
+	}
+	if !board.Gate.Established() || board.Paused {
+		return nil
+	}
+	// Nothing may still be moving. A gate run against a revision that is about
+	// to change would answer a question nobody asked.
+	for _, task := range board.Tasks {
+		if task.State == agoboardprotocol.TaskPassed || task.Cancelled || task.SupersededBy != "" {
+			continue
+		}
+		return nil
+	}
+	revision := strings.TrimSpace(board.IntegratedRevision)
+	if revision == "" {
+		// Nothing was integrated, so there is nothing to prove. A read-only
+		// goal legitimately reaches this state.
+		return nil
+	}
+	// Already answered for exactly this revision, either way.
+	if board.Gate.Revision == revision && board.Gate.State != agoboardprotocol.GatePending {
+		return nil
+	}
+
+	result, err := scheduler.options.Gate.Run(ctx, board.Repository, revision, board.Gate.Commands)
+	if err != nil {
+		// The gate could not be run. That is not a pass and not a failure of
+		// the work — it is left for the next cycle, exactly like a verifier
+		// outage.
+		return nil
+	}
+
+	command := agoboardprotocol.Command{
+		SchemaVersion:   agoboardprotocol.SchemaVersion,
+		ID:              fmt.Sprintf("gate:%s:%s", boardID, revision),
+		ExpectedVersion: board.Version,
+		Actor:           scheduler.coordinator(),
+		Revision:        revision,
+		Gate: &agoboardprotocol.GateSpec{
+			Summary: scheduler.options.Redactor.String(result.Summary),
+			RanAt:   scheduler.options.Now().UTC(),
+		},
+	}
+	if result.Passed {
+		command.Type = agoboardprotocol.CommandGatePass
+	} else {
+		command.Type = agoboardprotocol.CommandGateFail
+		command.Gate.FailureOutput = scheduler.options.Redactor.String(gateFailureOutput(result))
+	}
+	if _, err := scheduler.options.Store.ApplyBoard(ctx, boardID, command); err != nil {
+		if errors.Is(err, agoboardstore.ErrCommandConflict) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// gateFailureOutput is what a repair task is aimed at: which checks failed,
+// and what they said.
+func gateFailureOutput(result agogate.Result) string {
+	var builder strings.Builder
+	for _, check := range result.Checks {
+		if check.Passed {
+			continue
+		}
+		fmt.Fprintf(&builder, "$ %s\n退出码 %d\n%s\n\n", check.Command, check.ExitCode, check.Output)
+	}
+	return strings.TrimSpace(builder.String())
+}
+
 // applyVerdict turns a decision into the one protocol command that expresses it.
 // The state machine remains the authority: this only submits.
 func (scheduler *Scheduler) applyVerdict(ctx context.Context, boardID string, board agoboardprotocol.Board, task agoboardprotocol.Task, evidence agoboardprotocol.Evidence, result agoverify.Result) error {
@@ -807,4 +904,10 @@ func sameUnderlyingObject(executor agoboardruntime.Executor, verification Verifi
 	default:
 		return left.Type() == right.Type() && left.Type().Comparable() && left.Interface() == right.Interface()
 	}
+}
+
+// ProjectGate is the narrow slice of the gate the scheduler needs. It is an
+// interface so a test can drive every outcome without a toolchain.
+type ProjectGate interface {
+	Run(ctx context.Context, repository, revision string, commands []string) (agogate.Result, error)
 }

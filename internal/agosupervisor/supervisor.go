@@ -135,6 +135,10 @@ type Status struct {
 	Failed    int
 	Remaining int
 	Decisions []Decision
+	// GateState and GateSummary report the project-level proof, so a caller
+	// can tell "every task passed" from "the result was proven".
+	GateState   agoboardprotocol.GateState
+	GateSummary string
 }
 
 // Step advances the goal by one supervisory pass and reports the result.
@@ -155,6 +159,9 @@ func (supervisor *Supervisor) Step(ctx context.Context) (Status, error) {
 		return Status{}, err
 	}
 	if err := supervisor.reviewStoppedWork(ctx, board); err != nil {
+		return Status{}, err
+	}
+	if err := supervisor.reviewFailedGate(ctx); err != nil {
 		return Status{}, err
 	}
 	return supervisor.status(ctx)
@@ -293,6 +300,130 @@ func (supervisor *Supervisor) reviewStoppedWork(ctx context.Context, board agobo
 				AttemptsUsed: task.AttemptCount,
 			})
 		}
+	}
+	return nil
+}
+
+// reviewFailedGate acts on a project gate that the integrated result did not
+// pass.
+//
+// It repairs by retrying the task that produced the current integrated
+// revision, with the gate's failure output added to its acceptance. That is a
+// heuristic — a gate can fail because of an interaction between changes rather
+// than the last one — but it is the honest one available: a task added by
+// plan patch is not added to the plan definition, so it would have no path
+// scopes and could write nothing. Fixing that is worth doing; inventing a
+// repair task that cannot edit anything is not.
+//
+// The retry starts from the current integrated revision, so the model sees the
+// broken combination and fixes forward rather than reverting.
+func (supervisor *Supervisor) reviewFailedGate(ctx context.Context) error {
+	board, err := supervisor.options.Store.Board(ctx, supervisor.options.BoardID)
+	if err != nil {
+		return err
+	}
+	if board.Gate.State != agoboardprotocol.GateFailed {
+		return nil
+	}
+	// The failure has to be about what is integrated NOW. After a repair is
+	// retried the state stays failed until the gate runs again, and acting on
+	// that stale verdict would spend the whole budget in one pass.
+	if board.Gate.Revision != board.IntegratedRevision {
+		return nil
+	}
+	// And nothing may still be moving, for the same reason.
+	for _, task := range board.Tasks {
+		if task.State == agoboardprotocol.TaskPassed || task.Cancelled || task.SupersededBy != "" {
+			continue
+		}
+		return nil
+	}
+	if supervisor.alreadyRaised(gateDecisionID) {
+		return nil
+	}
+	if board.Gate.Failures > agoboardprotocol.MaxGateRepairs {
+		supervisor.raise(Decision{
+			Kind: DecisionExhausted, TaskID: gateDecisionID, Title: "项目门禁未通过",
+			Reason:     fmt.Sprintf("%s\n\n%s", board.Gate.Summary, board.Gate.FailureOutput),
+			Suggestion: "自动修复已用尽。请检查集成分支上的失败，或缩小目标范围后重试。",
+			RaisedAt:   supervisor.options.Now().UTC(),
+		})
+		return nil
+	}
+	target, found := lastIntegratedTask(board)
+	if !found {
+		// Nothing to aim a repair at. Saying so is better than looping.
+		supervisor.raise(Decision{
+			Kind: DecisionExhausted, TaskID: gateDecisionID, Title: "项目门禁未通过",
+			Reason:     fmt.Sprintf("%s\n\n%s", board.Gate.Summary, board.Gate.FailureOutput),
+			Suggestion: "没有可以承接修复的写任务，需要人工处理。",
+			RaisedAt:   supervisor.options.Now().UTC(),
+		})
+		return nil
+	}
+	return supervisor.repairForGate(ctx, board, target)
+}
+
+// gateDecisionID names the goal-level decision, which belongs to no task.
+const gateDecisionID = "project-gate"
+
+// lastIntegratedTask is the task whose accepted change produced the revision
+// the gate just rejected.
+func lastIntegratedTask(board agoboardprotocol.Board) (agoboardprotocol.Task, bool) {
+	for index := len(board.Tasks) - 1; index >= 0; index-- {
+		task := board.Tasks[index]
+		if task.IntegratedRevision == board.IntegratedRevision && !task.Cancelled && task.SupersededBy == "" {
+			return task, true
+		}
+	}
+	return agoboardprotocol.Task{}, false
+}
+
+// repairForGate sharpens a task's acceptance with the gate failure and retries
+// it. The patch and the retry are ordinary protocol commands: the supervisor
+// still never writes a task row itself.
+func (supervisor *Supervisor) repairForGate(ctx context.Context, board agoboardprotocol.Board, task agoboardprotocol.Task) error {
+	round := board.Gate.Failures
+	criterion := fmt.Sprintf("修复集成结果的项目门禁失败：%s\n%s", board.Gate.Summary, board.Gate.FailureOutput)
+	acceptance := agoboardprotocol.TerminalContract{
+		Outcome:            task.TerminalContract.Outcome,
+		AcceptanceCriteria: append(append([]string(nil), task.TerminalContract.AcceptanceCriteria...), criterion),
+	}
+	patchID := fmt.Sprintf("gate-repair:%s:%d", task.ID, round)
+	if _, err := supervisor.options.Store.ApplyBoard(ctx, supervisor.options.BoardID, agoboardprotocol.Command{
+		SchemaVersion:   agoboardprotocol.SchemaVersion,
+		ID:              "cmd:" + patchID,
+		ExpectedVersion: board.Version,
+		Actor:           supervisor.coordinator(),
+		Type:            agoboardprotocol.CommandPlanPatch,
+		Patch: &agoboardprotocol.PatchSpec{
+			ID:     patchID,
+			Reason: fmt.Sprintf("集成结果未通过项目门禁，自动修复（第 %d 次）", round),
+			Steps: []agoboardprotocol.PatchStep{{
+				Operation: agoboardprotocol.PatchUpdateAcceptance,
+				TaskID:    task.ID, Acceptance: &acceptance,
+			}},
+		},
+	}); err != nil {
+		if !errors.Is(err, agoboardstore.ErrCommandConflict) {
+			return fmt.Errorf("apply gate repair patch for %q: %w", task.ID, err)
+		}
+		return nil
+	}
+	updated, err := supervisor.options.Store.Board(ctx, supervisor.options.BoardID)
+	if err != nil {
+		return err
+	}
+	if _, err := supervisor.options.Store.ApplyBoard(ctx, supervisor.options.BoardID, agoboardprotocol.Command{
+		SchemaVersion:   agoboardprotocol.SchemaVersion,
+		ID:              "cmd:retry:" + patchID,
+		ExpectedVersion: updated.Version,
+		Actor:           supervisor.coordinator(),
+		Type:            agoboardprotocol.CommandTaskRetry,
+		TaskID:          task.ID,
+		Reason:          fmt.Sprintf("项目门禁修复第 %d 次", round),
+	}); err != nil && !errors.Is(err, agoboardstore.ErrCommandConflict) {
+		return fmt.Errorf("retry %q for the gate: %w", task.ID, err)
 	}
 	return nil
 }
@@ -455,7 +586,17 @@ func (supervisor *Supervisor) status(ctx context.Context) (Status, error) {
 			outstanding++
 		}
 	}
-	status.Complete = outstanding == 0
+	// Every task passing is a weaker claim than the integrated result holding
+	// together, and reporting the first as the second is how a goal whose
+	// parts were each correct could still be broken. Where the goal
+	// established a gate, the gate decides — and it has to have proved THIS
+	// revision, not an earlier one.
+	status.Complete = outstanding == 0 &&
+		(!board.Gate.Established() ||
+			board.IntegratedRevision == "" ||
+			board.Gate.SatisfiedAt(board.IntegratedRevision))
+	status.GateState = board.Gate.State
+	status.GateSummary = board.Gate.Summary
 	// Blocked means every remaining stop is waiting on a person: there is
 	// nothing left the supervisor is allowed to do by itself.
 	if !status.Complete {

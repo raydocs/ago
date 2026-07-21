@@ -33,6 +33,9 @@ type Goal struct {
 	// silently discarding changes.
 	BaseRevision   string `json:"base_revision,omitempty"`
 	IntegrationRef string `json:"integration_ref,omitempty"`
+	// GateCommands are the checks the integrated result must pass. Discovered
+	// from the repository or given by the user; never proposed by a model.
+	GateCommands []string `json:"gate_commands,omitempty"`
 }
 
 type Dispatch struct {
@@ -164,6 +167,7 @@ func (runtime *Runtime) Create(ctx context.Context, goal Goal) (BoardView, error
 		Board: &agoboardprotocol.BoardSpec{
 			ID: goal.BoardID, Title: goal.Objective.Summary, Repository: goal.Repository.ID,
 			BaseRevision: goal.BaseRevision, IntegrationRef: goal.IntegrationRef,
+			GateCommands: goal.GateCommands,
 		},
 	}}
 	version := uint64(1)

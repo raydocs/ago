@@ -27,6 +27,7 @@ import (
 	"claudexflow/internal/agoboardui"
 	"claudexflow/internal/agoexec"
 	"claudexflow/internal/agofake"
+	"claudexflow/internal/agogate"
 	"claudexflow/internal/agointegrate"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agoredact"
@@ -116,9 +117,18 @@ func Serve(cfg Config) error {
 	if err != nil {
 		return err
 	}
+	// The project gate proves the integrated result. It runs the repository's
+	// own checks in a throwaway checkout, so a goal completes on what was
+	// promoted rather than on every task having been individually accepted.
+	gate, err := agogate.New(agogate.Options{
+		Commands: agoexec.SystemCommands{}, Worktrees: integrator, Timeout: 10 * time.Minute,
+	})
+	if err != nil {
+		return err
+	}
 	scheduler, err := agoscheduler.New(agoscheduler.Options{
 		Store: store, Runtime: runtime, Executor: executor, Verification: verification,
-		Integrator: integrator, Artifacts: artifacts,
+		Integrator: integrator, Artifacts: artifacts, Gate: gate,
 		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
 		LeaseDuration: 5 * time.Minute, Interval: time.Second, Now: time.Now,
 		Redactor: agoredact.NewFromEnvironment(os.Getenv),

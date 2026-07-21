@@ -12,7 +12,7 @@ import (
 // hashes, command and test records, artifact references, warnings, and the
 // verifier's verdict. Boards persisted at an earlier version are upgraded by
 // the store's migration, which is the only supported path forward.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 // MaxAttempts bounds automatic retry. The state machine enforces it so no
 // scheduler, however buggy, can create an extra attempt.
@@ -193,6 +193,67 @@ type Board struct {
 	// Paused stops new claims without cancelling running attempts.
 	Paused      bool   `json:"paused"`
 	PauseReason string `json:"pause_reason,omitempty"`
+	// Gate is the project-level proof that the INTEGRATED result holds
+	// together. Every task passing is a different claim: two individually
+	// correct changes can combine into something broken, and without this the
+	// board reported such a goal complete.
+	Gate ProjectGate `json:"gate"`
+}
+
+// GateState is how far the project gate has got.
+type GateState string
+
+const (
+	// GateAbsent means no checks were established for this goal. It is not a
+	// pass. A goal without a gate can still complete, but it completes as
+	// "every task was checked", never as "the result was proven".
+	GateAbsent GateState = "absent"
+	// GatePending means there are checks and they have not been run against
+	// the current integrated revision.
+	GatePending GateState = "pending"
+	GatePassed  GateState = "passed"
+	GateFailed  GateState = "failed"
+)
+
+// MaxGateRepairs bounds how many times a failing gate may be repaired
+// automatically before it becomes a decision for a person. The third failure
+// is escalated rather than repaired.
+const MaxGateRepairs = 2
+
+// ProjectGate is the goal-level contract, and the only place completion is
+// decided by something other than counting tasks.
+//
+// Commands are established when the goal is admitted — discovered from the
+// repository or supplied by the user — and a model never proposes them.
+// Letting the planner choose what would prove its own plan is the
+// self-certification problem the independent verifier exists to prevent,
+// re-introduced one level up.
+type ProjectGate struct {
+	State    GateState `json:"state"`
+	Commands []string  `json:"commands,omitempty"`
+	// Revision the gate last ran against, so a stale pass cannot be mistaken
+	// for a current one after more work is integrated.
+	Revision string `json:"revision,omitempty"`
+	// Summary and FailureOutput are what a repair task is aimed at.
+	Summary       string `json:"summary,omitempty"`
+	FailureOutput string `json:"failure_output,omitempty"`
+	// Failures counts how many times this gate has rejected an integrated
+	// result. It bounds automatic repair, and it is named for what it counts
+	// rather than for what it is used for.
+	Failures int       `json:"failures,omitempty"`
+	RanAt    time.Time `json:"ran_at,omitempty"`
+}
+
+// Established reports whether this goal has anything to prove.
+func (gate ProjectGate) Established() bool { return len(gate.Commands) > 0 }
+
+// SatisfiedAt reports whether the gate proves THIS revision. A pass recorded
+// against an earlier revision says nothing about a later one.
+func (gate ProjectGate) SatisfiedAt(revision string) bool {
+	if !gate.Established() {
+		return false
+	}
+	return gate.State == GatePassed && gate.Revision == revision
 }
 
 type Task struct {
@@ -420,6 +481,12 @@ const (
 	// verifier's feedback, or a plan that turned out to be wrong. Earlier graph
 	// versions are never rewritten; a superseded task keeps its history.
 	CommandPlanPatch CommandType = "plan.patch"
+	// CommandGatePass and CommandGateFail record whether the INTEGRATED result
+	// proved itself. Only a coordinator may submit one: the gate exists so
+	// that completion is decided by something other than the workers, and a
+	// worker able to record its own gate result would undo that.
+	CommandGatePass CommandType = "gate.pass"
+	CommandGateFail CommandType = "gate.fail"
 )
 
 type Command struct {
@@ -436,9 +503,12 @@ type Command struct {
 	AttemptID       string          `json:"attempt_id,omitempty"`
 	Evidence        *EvidenceSpec   `json:"evidence,omitempty"`
 	Patch           *PatchSpec      `json:"patch,omitempty"`
-	// Revision is the integrated revision an integration command produced.
+	// Revision is the integrated revision an integration command produced, or
+	// the one a gate command ran against.
 	Revision string `json:"revision,omitempty"`
-	Reason   string `json:"reason,omitempty"`
+	// Gate carries a project gate outcome. Only a coordinator may submit one.
+	Gate   *GateSpec `json:"gate,omitempty"`
+	Reason string    `json:"reason,omitempty"`
 	// FencingToken authenticates a worker or verifier against the exact attempt
 	// it is acting on. Commands from a superseded attempt cannot match.
 	FencingToken string `json:"fencing_token,omitempty"`
@@ -495,6 +565,10 @@ type BoardSpec struct {
 	// board is admitted. A board without them can still run read-only work.
 	BaseRevision   string `json:"base_revision,omitempty"`
 	IntegrationRef string `json:"integration_ref,omitempty"`
+	// GateCommands are the checks the INTEGRATED result must pass. They are
+	// established when the goal is admitted — discovered from the repository
+	// or supplied by the user — and a model never proposes them.
+	GateCommands []string `json:"gate_commands,omitempty"`
 }
 
 type TaskSpec struct {
@@ -550,6 +624,8 @@ const (
 	EventLeaseRenewed         EventType = "lease.renewed"
 	EventBoardPaused          EventType = "board.paused"
 	EventBoardResumed         EventType = "board.resumed"
+	EventGatePassed           EventType = "gate.passed"
+	EventGateFailed           EventType = "gate.failed"
 	EventTaskRetryRequested   EventType = "task.retry-requested"
 	EventPlanPatched          EventType = "plan.patched"
 	EventIntegrationComplete  EventType = "integration.completed"
@@ -780,4 +856,15 @@ func validateAttemptsLeasesEvidence(board Board, tasks map[string]Task) error {
 		}
 	}
 	return nil
+}
+
+// GateSpec is a project gate outcome being recorded on the board.
+type GateSpec struct {
+	// Summary is safe to show a user.
+	Summary string `json:"summary"`
+	// FailureOutput is bounded evidence a repair can act on. Empty on a pass.
+	FailureOutput string `json:"failure_output,omitempty"`
+	// RanAt comes from the caller because Apply is pure: the state machine has
+	// no clock, so every timestamp on the board arrives in a command.
+	RanAt time.Time `json:"ran_at"`
 }

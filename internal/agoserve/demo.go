@@ -2,7 +2,6 @@ package agoserve
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +16,7 @@ import (
 
 	"claudexflow/internal/agoboardruntime"
 	"claudexflow/internal/agodemo"
+	"claudexflow/internal/agogate"
 	"claudexflow/internal/agointegrate"
 	"claudexflow/internal/agoplanner"
 	"claudexflow/internal/agorelay"
@@ -112,7 +112,7 @@ func Demo(args []string, out io.Writer) error {
 	// restart recovery observable rather than a claim: the board comes back
 	// exactly where it stopped. An empty directory left by an interrupted
 	// first run is finished rather than reused.
-	if _, err := os.Stat(filepath.Join(repository, ".git")); created || errors.Is(err, os.ErrNotExist) {
+	if created || !usableRepository(repository) {
 		// A run killed part-way through leaves files here but no repository.
 		// Since Ago can prove it made this directory, it clears it and starts
 		// again — otherwise the half-built copy is debris that nothing can
@@ -126,8 +126,6 @@ func Demo(args []string, out io.Writer) error {
 			return fmt.Errorf("创建示例仓库：%w", err)
 		}
 		fmt.Fprintf(out, "示例仓库已创建：%s\n", repository)
-	} else if err != nil {
-		return err
 	} else {
 		fmt.Fprintf(out, "沿用已有的示例仓库：%s\n", repository)
 	}
@@ -149,6 +147,23 @@ func Demo(args []string, out io.Writer) error {
 			}
 		},
 	})
+}
+
+// usableRepository reports whether the sample repository is one Ago can
+// actually work in.
+//
+// The presence of .git is not enough. A run killed between `git init` and the
+// first commit leaves a repository with no HEAD, and everything downstream —
+// establishing the integration ref, creating a worktree — fails on it. That
+// state was reachable in practice, and the run that inherited it reported
+// "reusing the existing sample repository" on its way to an unexplained exit.
+func usableRepository(root string) bool {
+	if _, err := os.Lstat(filepath.Join(root, ".git")); err != nil {
+		return false
+	}
+	command := exec.Command("git", "rev-parse", "--verify", "HEAD")
+	command.Dir = root
+	return command.Run() == nil
 }
 
 const demoBoardID = "ago-demo"
@@ -183,6 +198,10 @@ func plantDemoGoal(ctx context.Context, out io.Writer, s *Stack, repository, obj
 			VerifierIDs:    []string{"ago-verifier"},
 		},
 		ExecutionMode: s.mode, BaseRevision: base, IntegrationRef: ref,
+		// Discovered from the repository, never proposed by a model. Without
+		// this the goal would complete on task-level acceptance alone, which
+		// is a weaker claim than the integrated result holding together.
+		GateCommands: agogate.Discover(repository),
 	})
 	if err != nil {
 		return fmt.Errorf("规划这个目标失败：%w", err)

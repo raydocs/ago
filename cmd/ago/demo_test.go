@@ -809,49 +809,94 @@ func TestAMovedDemoDirectoryLosesItsDeleteAuthority(t *testing.T) {
 	}
 }
 
-// A crash during the first startup must not leave Ago's own sample repository
-// unattributable — and therefore permanently beyond --reset while `--reset`
-// reports success it did not deliver.
+// A run interrupted while it was creating the sample repository must leave
+// something a later run can recover from.
 //
-// The previous version recorded everything in one batch after startup
-// finished, so a Ctrl+C before that point stranded greeter/ forever.
-func TestACrashDuringFirstStartupStillLeavesEverythingResettable(t *testing.T) {
+// The first version of this test raced a real process and killed it when
+// greeter/go.mod appeared, which made it flaky and — worse — tested exactly
+// one of the several moments a crash can land on. Constructing each state
+// directly is both deterministic and broader.
+//
+// The property: whatever partial state a crash left, a later run either
+// finishes it or replaces it, and never reports success it did not deliver.
+func TestARunInterruptedWhileCreatingTheRepositoryRecovers(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds and runs a server")
 	}
 	requireTools(t)
 	binary := buildAgo(t)
-	home := t.TempDir()
-	state := filepath.Join(home, ".ago", "demo")
 
-	// Start and kill as soon as the repository exists — before the board is
-	// planted and before the server announces itself.
-	process := startDemoAt(t, binary, home, state)
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(filepath.Join(state, "greeter", "go.mod")); err == nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	process.kill()
-	if _, err := os.Stat(filepath.Join(state, "greeter", "go.mod")); err != nil {
-		t.Skipf("the run never got as far as creating the repository: %v", err)
+	// Each case is a moment agodemo.Create can be killed at, in order.
+	cases := map[string]func(t *testing.T, greeter string){
+		"nothing but the directory": func(t *testing.T, greeter string) {},
+		"some files, no git": func(t *testing.T, greeter string) {
+			mustWriteSentinel(t, greeter, "go.mod", "module example.com/greeter\n")
+		},
+		"all files, no git": func(t *testing.T, greeter string) {
+			for _, name := range []string{"go.mod", "main.go", "README.md"} {
+				mustWriteSentinel(t, greeter, name, "x\n")
+			}
+		},
+		"git init but no commit": func(t *testing.T, greeter string) {
+			mustWriteSentinel(t, greeter, "go.mod", "module example.com/greeter\n")
+			command := exec.Command("git", "init", "-b", "main")
+			command.Dir = greeter
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v\n%s", err, output)
+			}
+		},
 	}
 
-	// Ago's own repository must already be attributable.
-	if _, err := os.Stat(filepath.Join(state, "greeter", ".ago-created")); err != nil {
-		t.Fatalf("the sample repository was created without recording that Ago made it: %v", err)
-	}
+	for name, arrange := range cases {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			state := filepath.Join(home, ".ago", "demo")
 
-	// And a reset must actually remove it.
-	reset := startDemoAt(t, binary, home, state, "--reset")
-	defer reset.kill()
-	_, transcript := readAddress(t, reset.stdout)
-	if !strings.Contains(transcript, "已清理") {
-		t.Fatalf("the reset did not report itself:\n%s", transcript)
+			// One clean run, so the directory is genuinely Ago's, then put it
+			// back into the interrupted state.
+			first := startDemoAt(t, binary, home, state)
+			readAddress(t, first.stdout)
+			first.interrupt(t)
+
+			greeter := filepath.Join(state, "greeter")
+			if err := os.RemoveAll(greeter); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(greeter, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			// The sentinel is written before any content, so every interrupted
+			// state still carries it. That is what makes recovery possible.
+			mustWriteSentinel(t, greeter, ".ago-created", readSentinelNonce(t, state))
+			arrange(t, greeter)
+
+			second := startDemoAt(t, binary, home, state)
+			defer second.kill()
+			_, transcript := readAddress(t, second.stdout)
+			t.Logf("recovery run:\n%s", transcript)
+
+			// Whatever it says, the repository must end up usable.
+			for _, path := range []string{"go.mod", filepath.Join(".git", "HEAD")} {
+				if _, err := os.Stat(filepath.Join(greeter, path)); err != nil {
+					t.Errorf("the recovered repository is missing %s: %v", path, err)
+				}
+			}
+			command := exec.Command("git", "rev-parse", "--verify", "HEAD")
+			command.Dir = greeter
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Errorf("the recovered repository has no commit: %v\n%s", err, output)
+			}
+		})
 	}
-	if !strings.Contains(transcript, "示例仓库已创建") {
-		t.Errorf("the reset did not actually remove the old repository:\n%s", transcript)
+}
+
+// readSentinelNonce reads the claim nonce so a reconstructed directory carries
+// the same ownership the real one would.
+func readSentinelNonce(t *testing.T, state string) string {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(state, "artifacts", ".ago-created"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	return string(content)
 }

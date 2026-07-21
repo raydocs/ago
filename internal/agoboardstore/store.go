@@ -748,7 +748,20 @@ func (s *Store) Completion(ctx context.Context, boardID string) (Completion, err
 	if c.Failed > 0 {
 		c.Status = CompletionFailed
 	} else if len(board.Tasks) > 0 && c.Remaining == 0 {
-		c.Status = CompletionPassed
+		// Every task passing is not the same claim as the integrated result
+		// holding together: two individually correct changes can combine into
+		// something broken. Where a gate was established, it decides.
+		switch {
+		case !board.Gate.Established():
+			c.Status = CompletionPassed
+		case board.Gate.SatisfiedAt(board.IntegratedRevision):
+			c.Status = CompletionPassed
+		case board.Gate.State == agoboardprotocol.GateFailed:
+			c.Status = CompletionFailed
+		default:
+			// Tasks are done and the gate has not proved this revision yet.
+			c.Status = CompletionInProgress
+		}
 	}
 	return c, nil
 }

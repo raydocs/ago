@@ -77,6 +77,11 @@ type harness struct {
 	verifier  *countingJudge
 	clock     *clock
 	boardID   string
+	// gateCommands is what the next createGoal establishes as the project
+	// gate. Empty means the goal has no goal-level proof, which is the
+	// default everywhere else.
+	gateCommands []string
+	baseRevision string
 }
 
 func newHarness(t *testing.T, dbPath string) *harness {
@@ -103,6 +108,32 @@ func newHarness(t *testing.T, dbPath string) *harness {
 	return &harness{store: store, runtime: runtime, scheduler: scheduler, executor: executor, verifier: verifier, clock: testClock}
 }
 
+// withGate rebuilds the harness scheduler with a project gate attached, so a
+// test can drive the goal-level proof without a toolchain.
+func (h *harness) withGate(t *testing.T, gate agoscheduler.ProjectGate, _ []string) {
+	t.Helper()
+	scheduler, err := agoscheduler.New(agoscheduler.Options{
+		Store: h.store, Runtime: h.runtime, Executor: h.executor,
+		Verification:  mustSchedulerVerification(t, h.verifier),
+		Gate:          gate,
+		CoordinatorID: "ago-scheduler", WorkerID: "ago-worker", VerifierID: "ago-verifier",
+		LeaseDuration: time.Minute, Now: h.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.scheduler = scheduler
+}
+
+func (h *harness) createGoalWithGate(t *testing.T, boardID string, commands []string) {
+	t.Helper()
+	// A gate proves an INTEGRATED revision, so the goal needs an integration
+	// chain for there to be anything to prove.
+	h.gateCommands, h.baseRevision = commands, "base-revision"
+	h.createGoal(t, boardID)
+	h.gateCommands, h.baseRevision = nil, ""
+}
+
 func (h *harness) createGoal(t *testing.T, boardID string) {
 	t.Helper()
 	_, err := h.runtime.Create(context.Background(), agoboardruntime.Goal{
@@ -119,6 +150,8 @@ func (h *harness) createGoal(t *testing.T, boardID string) {
 			VerifierIDs:    []string{"ago-verifier"},
 		},
 		ExecutionMode: "fake",
+		GateCommands:  h.gateCommands,
+		BaseRevision:  h.baseRevision,
 	})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)

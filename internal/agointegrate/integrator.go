@@ -321,3 +321,32 @@ func (integrator *Integrator) alreadyApplied(ctx context.Context, dir string, pa
 // RefName is the conventional integration ref for a board, as a method so a
 // caller can depend on the setup interface rather than the package.
 func (integrator *Integrator) RefName(boardID string) string { return RefName(boardID) }
+
+// Scratch checks a revision out into a throwaway worktree and returns it with
+// the function that removes it.
+//
+// It exists so the project gate can prove the integrated revision in a tree
+// nothing else has touched. A check that passes in a worktree some task worked
+// in proves nothing about what was promoted.
+func (integrator *Integrator) Scratch(ctx context.Context, repository, revision string) (string, func(), error) {
+	if strings.TrimSpace(repository) == "" || strings.TrimSpace(revision) == "" {
+		return "", nil, fmt.Errorf("a repository and a revision are required")
+	}
+	dir, err := os.MkdirTemp(integrator.root, "gate-")
+	if err != nil {
+		return "", nil, err
+	}
+	// Detached, like every worktree Ago creates: `worktree add -b` would write
+	// a real branch into the user's repository that `worktree remove` leaves
+	// behind.
+	if _, err := integrator.git(ctx, repository, "worktree", "add", "--detach", dir, revision); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("prepare gate worktree at %s: %w", revision, err)
+	}
+	remove := func() {
+		clean := context.WithoutCancel(ctx)
+		_, _ = integrator.git(clean, repository, "worktree", "remove", "--force", dir)
+		_ = os.RemoveAll(dir)
+	}
+	return dir, remove, nil
+}
