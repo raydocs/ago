@@ -4,7 +4,7 @@ I'd like a hard, skeptical review of this system. You have no repository access,
 
 **What I want from you:** find what is actually wrong or fragile, not a summary of what I wrote. Be specific — name the file, the scenario, and the inputs. If an area is genuinely sound, say so plainly rather than inventing a concern to seem thorough. If you think a design decision is wrong, say what you'd do instead and what it costs.
 
-The specific questions I want answered are in §8. Everything before that is context.
+The specific questions I want answered are in §8 (the system) and §9 (whether the bet is worth making at all). Everything before those is context.
 
 ---
 
@@ -345,3 +345,64 @@ Repair budget and retry counts come from the durable graph, not process memory, 
 8. **Where is this system most likely to fail in a way none of the above anticipates?** That is the question I actually care about.
 
 Please rank your findings by severity, give a concrete failure scenario with specific inputs for each, and separate what you traced through the code shown from what you are inferring.
+
+---
+
+## 9. Competitive framing — and where my own claim is not yet true
+
+I am building this because I think it can be better than [Amp](https://ampcode.com), whose July 2026 release [Puck](https://ampcode.com/news/meet-puck) is the closest thing to what I want. **Please treat this section adversarially too — I am more interested in where my thesis is wrong than in confirmation.**
+
+### What Amp ships today
+
+- **Orbs** — remote sandboxes where agents run unsupervised. 1–16 CPUs, up to 32 GB, $0.10–$1.66/hour, billed by the minute.
+- **Puck** — a conversational assistant and "home base for launching and coordinating other agents". You say *"For each script in ./scripts, spawn an agent in an orb to try and run it against the dev server, then compile their feedback about what worked"*, and it fans out and aggregates.
+- Agents can spawn agents, message each other, and exchange files across threads.
+- The interaction model is conversational; the user decides what to start and reviews the outcome.
+- **The announcement makes no claim about verification, code review, or quality control.**
+
+That last point is the whole basis of my thesis, so I want it challenged rather than assumed.
+
+### My thesis
+
+Puck fans out and **compiles feedback**. What I want is to fan out and **integrate work** — several agents' output combined into one product that has been proven to hold together. The four differences I believe are structural, not cosmetic:
+
+1. **The centre is a durable graph, not a conversation.** Puck's coordination lives in a thread. Ago's lives in SQLite with fencing tokens, leases, exactly-once claims, and generations. Kill the process mid-flight and the graph resumes; a second scheduler cannot duplicate a claim. A conversation that is the coordinator cannot survive its own context window.
+
+2. **Verification is a role, not a step someone remembers to take.** The executor structurally cannot mark its own work done — construction refuses a fused executor/verifier pair. Deterministic gates run before and outrank model judgement. "Compile their feedback" has no such property: the thing reporting success is the thing that did the work.
+
+3. **Integration is a first-class stage.** Accepted work is promoted onto a ref Ago owns, and sequential write tasks inherit the previous integrated revision — so task 4 builds on the *verified* output of tasks 1–3, not on a stale base. Aggregating text is easy; aggregating code that still compiles and passes its own tests is where swarms usually fail.
+
+4. **The autonomy boundary is defined, not emergent.** §6 lists exactly which failure classes interrupt a human. "You retain oversight of outcomes" is not a boundary, it is a disclaimer.
+
+Plus a smaller one: this runs locally against any OpenAI-compatible endpoint. No per-hour VM. That is a real cost difference, and also a real capability difference in Amp's favour — see below.
+
+### Where I am behind, stated plainly
+
+- **Amp has remote execution infrastructure and I have none.** Orbs are a product; my worktrees are directories on one laptop. Anything that needs isolation stronger than a POSIX process, or more machine than the user has, I cannot do.
+- **Amp is a shipped product** with distribution, a subscription, and models included. I have one demo fixture and a sample repository.
+- **No multi-repo, no team features, no cross-agent messaging.**
+
+### The part where my own pitch is currently false
+
+I describe Ago as combining several agents' strengths — routing each kind of work to the model best suited to it. **That is not what the code does.** Concretely:
+
+- `agoscheduler` has exactly **one** `Executor` and dispatches every task to it (`scheduler.go:41`, `:303`).
+- `CapabilityTags` exist on every task and are validated by the planner, but nothing consumes them for dispatch — the scheduler never reads them.
+- There *is* an `internal/router` package, from an earlier system. **The Ago path does not import it.**
+- What genuinely exists is per-**role** model selection: planner, executor, and verifier can be three different models via three environment variables. That is three roles, not a swarm of specialists.
+
+So today Ago is: one planner model, one executor model applied to every task, one verifier model — coordinated by a durable graph with real verification. The graph, the isolation, the verification, and the integration are built and tested. **The heterogeneity is not.**
+
+I would rather you review the system that exists and tell me whether the missing piece is the important one, than review the pitch.
+
+### Questions for this section
+
+9. **Is my thesis actually a difference, or am I describing an implementation detail as an architecture?** Specifically: does a durable graph beat a conversational coordinator for real work, or does it just move the failure? Amp's bet seems to be that a good enough model with good enough tools does not need the ceremony. Where is that bet right?
+
+10. **Is "verification as a structural role" worth what it costs?** It roughly doubles model calls per task and adds a whole failure surface (outages, malformed verdicts, deferral limits). Is there a cheaper mechanism that gets most of the benefit? Would you rather have one strong model self-reviewing than a weaker one policed by a separate call?
+
+11. **Which missing piece would you build first** — capability routing (the swarm I claim and don't have), remote execution (the thing Amp has and I don't), or multi-repo? Argue for one, not a list. Assume I can do exactly one well in the next month.
+
+12. **Is "integration is a first-class stage" the real moat, or the hardest thing to get right and therefore the worst place to plant a flag?** Sequential write tasks inheriting verified revisions works for a 6-task DAG on one repository. What breaks at 50 tasks, at conflicting concurrent writes, at a task whose acceptance depends on another's runtime behaviour rather than its diff?
+
+13. **What is Amp likely to ship next that would make this project pointless?** Be concrete. If the answer is "verification gates on Puck's fan-out", say so, and say how long I have.
