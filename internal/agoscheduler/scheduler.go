@@ -704,13 +704,20 @@ func (scheduler *Scheduler) runProjectGate(ctx context.Context, boardID string) 
 	if board.Gate.Revision == revision && board.Gate.State != agoboardprotocol.GatePending {
 		return nil
 	}
-
-	result, err := scheduler.options.Gate.Run(ctx, board.Repository, revision, board.Gate.Commands)
-	if err != nil {
-		// The gate could not be run. That is not a pass and not a failure of
-		// the work — it is left for the next cycle, exactly like a verifier
-		// outage.
+	// Out of attempts to even run it. The supervisor turns this into a
+	// decision; retrying forever would keep it silent.
+	if board.Gate.Unavailable >= agoboardprotocol.MaxGateUnavailable {
 		return nil
+	}
+
+	result, runErr := scheduler.options.Gate.Run(ctx, board.Repository, revision, board.Gate.Commands)
+	if runErr != nil {
+		// The gate could not be RUN. That is not a pass, and it is not a
+		// verdict on the work either — so it is recorded as its own durable
+		// state rather than swallowed. Returning nil here left a goal not
+		// done, with nothing runnable and nothing in the attention queue,
+		// forever: the one outcome this system must never produce.
+		return scheduler.recordGateUnavailable(ctx, boardID, board, revision, runErr)
 	}
 
 	command := agoboardprotocol.Command{
@@ -737,6 +744,27 @@ func (scheduler *Scheduler) runProjectGate(ctx context.Context, boardID string) 
 		return err
 	}
 	return nil
+}
+
+// recordGateUnavailable counts a gate that could not run, durably, so a
+// restarted process does not begin the tally again.
+func (scheduler *Scheduler) recordGateUnavailable(ctx context.Context, boardID string, board agoboardprotocol.Board, revision string, cause error) error {
+	_, err := scheduler.options.Store.ApplyBoard(ctx, boardID, agoboardprotocol.Command{
+		SchemaVersion:   agoboardprotocol.SchemaVersion,
+		ID:              fmt.Sprintf("gate-unavailable:%s:%s:%d", boardID, revision, board.Gate.Unavailable),
+		ExpectedVersion: board.Version,
+		Actor:           scheduler.coordinator(),
+		Type:            agoboardprotocol.CommandGateUnavailable,
+		Revision:        revision,
+		Gate: &agoboardprotocol.GateSpec{
+			Summary: scheduler.options.Redactor.String(fmt.Sprintf("项目门禁无法运行：%v", cause)),
+			RanAt:   scheduler.options.Now().UTC(),
+		},
+	})
+	if errors.Is(err, agoboardstore.ErrCommandConflict) {
+		return nil
+	}
+	return err
 }
 
 // gateFailureOutput is what a repair task is aimed at: which checks failed,

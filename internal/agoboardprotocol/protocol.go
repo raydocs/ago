@@ -220,6 +220,13 @@ const (
 // is escalated rather than repaired.
 const MaxGateRepairs = 2
 
+// MaxGateUnavailable bounds how many times a gate may fail to RUN before the
+// goal stops and asks for a person. Without a bound, a permanently broken
+// toolchain left the goal not done, with nothing runnable and nothing in the
+// attention queue — silence being the one outcome the system must never
+// produce.
+const MaxGateUnavailable = 5
+
 // ProjectGate is the goal-level contract, and the only place completion is
 // decided by something other than counting tasks.
 //
@@ -240,8 +247,16 @@ type ProjectGate struct {
 	// Failures counts how many times this gate has rejected an integrated
 	// result. It bounds automatic repair, and it is named for what it counts
 	// rather than for what it is used for.
-	Failures int       `json:"failures,omitempty"`
-	RanAt    time.Time `json:"ran_at,omitempty"`
+	Failures int `json:"failures,omitempty"`
+	// Unavailable counts consecutive times the gate could not be RUN at all —
+	// a missing toolchain, an unreadable repository, a worktree that cannot be
+	// created. That is not a verdict on the work, so it is counted separately
+	// and never spends the repair budget. It is durable because a restarted
+	// process must not begin the tally again and hang forever.
+	Unavailable int `json:"unavailable,omitempty"`
+	// LastError is why it could not be run, for the decision that reports it.
+	LastError string    `json:"last_error,omitempty"`
+	RanAt     time.Time `json:"ran_at,omitempty"`
 }
 
 // Established reports whether this goal has anything to prove.
@@ -487,6 +502,10 @@ const (
 	// worker able to record its own gate result would undo that.
 	CommandGatePass CommandType = "gate.pass"
 	CommandGateFail CommandType = "gate.fail"
+	// CommandGateUnavailable records that the gate could not be run. It is
+	// deliberately not a failure of the work: conflating an outage with a
+	// verdict would punish a worker for a broken toolchain.
+	CommandGateUnavailable CommandType = "gate.unavailable"
 )
 
 type Command struct {
@@ -626,6 +645,7 @@ const (
 	EventBoardResumed         EventType = "board.resumed"
 	EventGatePassed           EventType = "gate.passed"
 	EventGateFailed           EventType = "gate.failed"
+	EventGateUnavailable      EventType = "gate.unavailable"
 	EventTaskRetryRequested   EventType = "task.retry-requested"
 	EventPlanPatched          EventType = "plan.patched"
 	EventIntegrationComplete  EventType = "integration.completed"
@@ -877,6 +897,8 @@ type CompletionStatus string
 
 const (
 	CompletionInProgress CompletionStatus = "in-progress"
+	// CompletionPassed means Done. It does NOT mean Proven — read Completion's
+	// Proven field for that, and the board's gate for why.
 	// CompletionUnproven means every task settled but the project gate has not
 	// yet proved the integrated result. It is not success and it is not
 	// failure; it is work waiting on its own proof.
@@ -885,15 +907,26 @@ const (
 	CompletionFailed   CompletionStatus = "failed"
 )
 
-// Completion is the single answer to "is this goal done?".
+// Completion is the single answer, and it answers TWO questions that must
+// never be collapsed again:
+//
+//	Done   — the goal reached a successful terminal state. Nothing further
+//	         will happen on its own.
+//	Proven — a project gate ran against the integrated revision and passed.
+//
+// Done without Proven is a real and legitimate outcome: a repository that
+// offers no checks, or a read-only goal that integrated nothing, finishes
+// without anything having proved the result. What is NOT legitimate is
+// reporting that as though the result had been proved, which is what a single
+// `completed` boolean invites. Both fields are exported, both are in the API
+// snapshot, and neither implies the other.
 type Completion struct {
 	Status    CompletionStatus `json:"status"`
 	Passed    int              `json:"passed"`
 	Failed    int              `json:"failed"`
 	Remaining int              `json:"remaining"`
-	// Done is true only for a goal that finished successfully. Anything that
-	// reports completion to a user reads this and nothing else.
-	Done bool `json:"done"`
+	Done      bool             `json:"done"`
+	Proven    bool             `json:"proven"`
 }
 
 // EvaluateCompletion answers the question once, so nobody answers it again
@@ -933,15 +966,15 @@ func EvaluateCompletion(board Board) Completion {
 	// whether anything proved the integrated result.
 	switch {
 	case !board.Gate.Established():
-		// Nothing to prove against. This completes on the weaker claim —
-		// every part was checked — and callers that care can see the gate is
-		// not established rather than being told it passed.
+		// Nothing to prove against: this repository offered no checks. The
+		// goal is finished, and it is NOT proven. Done without Proven.
 		completion.Status, completion.Done = CompletionPassed, true
 	case board.IntegratedRevision == "":
 		// A read-only goal integrated nothing, so there is nothing to prove.
 		completion.Status, completion.Done = CompletionPassed, true
 	case board.Gate.SatisfiedAt(board.IntegratedRevision):
-		completion.Status, completion.Done = CompletionPassed, true
+		// The only path that earns Proven.
+		completion.Status, completion.Done, completion.Proven = CompletionPassed, true, true
 	case board.Gate.State == GateFailed && board.Gate.Revision == board.IntegratedRevision:
 		completion.Status = CompletionFailed
 	default:

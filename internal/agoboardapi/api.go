@@ -200,6 +200,7 @@ type Snapshot struct {
 	Progress            SnapshotProgress     `json:"progress"`
 	Paused              bool                 `json:"paused"`
 	Completed           bool                 `json:"completed"`
+	Proven              bool                 `json:"proven"`
 	// Gate is the project-level proof. A caller must be able to tell "every
 	// task passed" from "the integrated result was proven", and both from
 	// "there was nothing to prove it against".
@@ -514,6 +515,12 @@ func (server *Server) snapshot(ctx context.Context, boardID string) (Snapshot, e
 		// project gate exists to close, surviving in the one place a user
 		// actually looks.
 		Completed: completion.Done,
+		// Separate on purpose. Done means the goal finished; Proven means a
+		// project gate ran against the integrated revision and passed. A
+		// repository that offers no checks finishes Done and unproven, and a
+		// caller reading only `completed` must not be able to mistake that for
+		// a proved result.
+		Proven: completion.Proven,
 		Gate: SnapshotGate{
 			State:    string(board.Gate.State),
 			Commands: board.Gate.Commands,

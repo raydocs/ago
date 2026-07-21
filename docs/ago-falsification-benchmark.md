@@ -31,28 +31,33 @@ product and become a library.
 
 ### The outcomes, decided now
 
+**The unit of analysis is the goal, not the run.** Three runs of the same goal
+on the same repository are not independent observations, so aggregating 45 runs
+per arm would overstate the precision. Each goal gets **one** outcome per arm —
+false completion if a majority of its three runs falsely completed — and the
+rate is over the 15 goals. That makes the smallest distinguishable difference
+exactly one goal, `1/15 ≈ 6.7` points, and every possible `d` a multiple of it.
+
 Let `d` = the control's false-completion rate minus Ago's, in percentage
-points. Positive means Ago is better. The bands are exhaustive and disjoint —
-an earlier version of this table had a gap between 15 and 30 and an overlap at
-zero, which is exactly the kind of room to argue afterwards this document
-exists to remove.
+points, computed that way. Positive means Ago is better.
 
 | `d` | Outcome | What I do |
 |---|---|---|
-| `d ≥ 25` **and** Ago's human messages ≤ control's | **Ago wins** | Continue; build routing next |
-| `d ≥ 25` but Ago needs more human messages | **Tie** | It bought correctness with interruption, which is not the claim. One more month on that specifically. |
-| `0 < d < 25` | **Tie** | The ceremony is not paying for itself yet. One more month on the failure mode the data names. No new features. |
+| `d ≥ 26.7` (≥ 4 goals) **and** Ago's human messages ≤ control's | **Ago wins** | Continue; build routing next |
+| `d ≥ 26.7` but Ago needs more human messages | **Tie** | It bought correctness with interruption, which is not the claim. One more month on that specifically. |
+| `6.7 ≤ d < 26.7` (1–3 goals) | **Tie** | The ceremony is not paying for itself yet. One more month on the failure mode the data names. No new features. |
 | `d ≤ 0` | **Ago loses** | Stop the product. Keep the code as a library for durable task execution and safe integration. |
 
-25 is chosen before seeing data and does not move. Ties resolve toward
-stopping, not continuing: `d = 0` is a loss, not a tie, because a system that
-adds a verifier, a graph, and an integration stage and lands exactly on the
-control has not earned them.
+The bands are exhaustive and disjoint over the achievable values of `d`, which
+are multiples of 6.7. There is no "within noise" clause, because an earlier
+version had one and it overlapped the loss band — a result of exactly zero was
+simultaneously a tie and a loss. Ties resolve toward stopping: `d = 0` is a
+loss, because a system that adds a verifier, a graph, and an integration stage
+and lands exactly on the control has not earned them.
 
-On sample size: with 15 goals × 3 runs the smallest difference this can
-distinguish at all is roughly one goal's worth, about 7 points. A `d` inside
-that is reported as "indistinguishable" and counts as a **tie**, and I state
-the observed spread rather than only the mean.
+The threshold and the unit are fixed before any data exists and do not move. I
+also report, per goal, how many of its three runs falsely completed, so a
+reader can see whether a goal-level outcome was 3–0 or 2–1.
 
 ---
 

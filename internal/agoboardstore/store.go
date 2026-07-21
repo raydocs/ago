@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"claudexflow/internal/agoboardprotocol"
+	"claudexflow/internal/agoplanner"
 	_ "modernc.org/sqlite"
 )
 
@@ -341,13 +342,29 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 // the exact result for command retries. Lease acquisition without a deadline is
 // supported for callers that do not require expiry.
 func (s *Store) Apply(ctx context.Context, command agoboardprotocol.Command) (Result, error) {
-	return s.apply(ctx, "", command, time.Time{}, nil, nil)
+	return s.apply(ctx, "", command, time.Time{}, nil, nil, nil)
 }
 
 // ApplyBoard applies a command to the named board. It is required when a store
 // contains multiple boards because protocol commands use board-local entity IDs.
 func (s *Store) ApplyBoard(ctx context.Context, boardID string, command agoboardprotocol.Command) (Result, error) {
-	return s.apply(ctx, boardID, command, time.Time{}, nil, nil)
+	return s.apply(ctx, boardID, command, time.Time{}, nil, nil, nil)
+}
+
+// ApplyBoardWithProposal applies a command AND extends the durable plan
+// definition, in one transaction.
+//
+// It exists because a task added by plan.patch reached the board but not the
+// definition, and the definition is where a task's description, path scopes,
+// and acceptance live. Such a task was claimed and then failed at dispatch
+// with "no planner proposal" — a task the system could create and could never
+// run. Writing both together is what makes an added task real; doing it in two
+// commands would reintroduce the crash window between them.
+func (s *Store) ApplyBoardWithProposal(ctx context.Context, boardID string, command agoboardprotocol.Command, proposal agoplanner.TaskProposal) (Result, error) {
+	if strings.TrimSpace(proposal.ID) == "" {
+		return Result{}, fmt.Errorf("a proposal needs an id")
+	}
+	return s.apply(ctx, boardID, command, time.Time{}, nil, nil, &proposal)
 }
 
 // Create is the explicit board.create form of Apply.
@@ -494,7 +511,7 @@ func (s *Store) AcquireLease(ctx context.Context, command agoboardprotocol.Comma
 	if binding != nil {
 		boardID = binding.BoardID
 	}
-	return s.apply(ctx, boardID, command, expiresAt.UTC(), binding, nil)
+	return s.apply(ctx, boardID, command, expiresAt.UTC(), binding, nil, nil)
 }
 
 // AcquireLeaseBoard is the multi-board form of AcquireLease.
@@ -505,7 +522,7 @@ func (s *Store) AcquireLeaseBoard(ctx context.Context, boardID string, command a
 	if boardID == "" || expiresAt.IsZero() {
 		return Result{}, fmt.Errorf("board id and lease expiry are required")
 	}
-	return s.apply(ctx, boardID, command, expiresAt.UTC(), binding, nil)
+	return s.apply(ctx, boardID, command, expiresAt.UTC(), binding, nil, nil)
 }
 
 // AcquireLeaseBoardOnce reports whether this caller created the durable lease
@@ -519,11 +536,11 @@ func (s *Store) AcquireLeaseBoardOnce(ctx context.Context, boardID string, comma
 		return Result{}, false, fmt.Errorf("board id and lease expiry are required")
 	}
 	fresh := false
-	result, err := s.apply(ctx, boardID, command, expiresAt.UTC(), binding, &fresh)
+	result, err := s.apply(ctx, boardID, command, expiresAt.UTC(), binding, &fresh, nil)
 	return result, fresh, err
 }
 
-func (s *Store) apply(ctx context.Context, boardID string, command agoboardprotocol.Command, expiresAt time.Time, binding *Binding, fresh *bool) (Result, error) {
+func (s *Store) apply(ctx context.Context, boardID string, command agoboardprotocol.Command, expiresAt time.Time, binding *Binding, fresh *bool, proposal *agoplanner.TaskProposal) (Result, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Result{}, fmt.Errorf("begin board command: %w", err)
@@ -598,6 +615,11 @@ func (s *Store) apply(ctx context.Context, boardID string, command agoboardproto
 	if err := insertResult(ctx, tx, command.Actor.ID, command.ID, hash, next.ID, result); err != nil {
 		return Result{}, err
 	}
+	if proposal != nil {
+		if err := extendDefinition(ctx, tx, boardID, *proposal); err != nil {
+			return Result{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return Result{}, fmt.Errorf("commit board command: %w", err)
 	}
@@ -605,6 +627,51 @@ func (s *Store) apply(ctx context.Context, boardID string, command agoboardproto
 		*fresh = true
 	}
 	return result, nil
+}
+
+// extendDefinition adds a task proposal to the stored plan, replacing any
+// entry with the same id so a retried command is idempotent.
+func extendDefinition(ctx context.Context, tx *sql.Tx, boardID string, proposal agoplanner.TaskProposal) error {
+	var encoded []byte
+	if err := tx.QueryRowContext(ctx, `SELECT definition_json FROM board_definitions WHERE board_id=?`, boardID).Scan(&encoded); err != nil {
+		return fmt.Errorf("read graph definition: %w", err)
+	}
+	var definition struct {
+		Plan agoplanner.Plan `json:"plan"`
+		Rest map[string]json.RawMessage
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		return fmt.Errorf("decode graph definition: %w", err)
+	}
+	if planRaw, found := raw["plan"]; found {
+		if err := json.Unmarshal(planRaw, &definition.Plan); err != nil {
+			return fmt.Errorf("decode plan: %w", err)
+		}
+	}
+	replaced := false
+	for index, existing := range definition.Plan.Tasks {
+		if existing.ID == proposal.ID {
+			definition.Plan.Tasks[index], replaced = proposal, true
+			break
+		}
+	}
+	if !replaced {
+		definition.Plan.Tasks = append(definition.Plan.Tasks, proposal)
+	}
+	planEncoded, err := json.Marshal(definition.Plan)
+	if err != nil {
+		return err
+	}
+	raw["plan"] = planEncoded
+	updated, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE board_definitions SET definition_json=? WHERE board_id=?`, updated, boardID); err != nil {
+		return fmt.Errorf("extend graph definition: %w", err)
+	}
+	return nil
 }
 
 func soleBoardID(ctx context.Context, tx *sql.Tx) (string, error) {

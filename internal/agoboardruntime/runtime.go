@@ -212,9 +212,6 @@ func (runtime *Runtime) Create(ctx context.Context, goal Goal) (BoardView, error
 	if err != nil {
 		return BoardView{}, fmt.Errorf("admit graph: %w", err)
 	}
-	runtime.mu.Lock()
-	runtime.projects[goal.BoardID] = definition
-	runtime.mu.Unlock()
 	return projectBoard(result.Board), nil
 }
 
@@ -226,15 +223,18 @@ func (runtime *Runtime) Create(ctx context.Context, goal Goal) (BoardView, error
 // recovering them from the durable store when this process did not create it.
 // Callers receive defensive copies and cannot mutate scheduling state through
 // the returned values.
+// Definition reads the goal and its plan from durable state, every time.
+//
+// It used to cache in memory, and that cache made a durable change invisible:
+// a task added to the plan definition after the first read was never seen, so
+// the scheduler claimed it and then failed to dispatch it with "no planner
+// proposal" — a task the system could create and could never run. Ago's whole
+// design says durable state is the truth and a memory cache lies; this was the
+// cache lying. The cost is one SQLite read per dispatch, against a model call.
 func (runtime *Runtime) Definition(ctx context.Context, boardID string) (Goal, agoplanner.Plan, error) {
-	definition, ok := runtime.project(boardID)
-	if !ok {
-		if err := runtime.store.Definition(ctx, boardID, &definition); err != nil {
-			return Goal{}, agoplanner.Plan{}, fmt.Errorf("recover board definition: %w", err)
-		}
-		runtime.mu.Lock()
-		runtime.projects[boardID] = definition
-		runtime.mu.Unlock()
+	var definition project
+	if err := runtime.store.Definition(ctx, boardID, &definition); err != nil {
+		return Goal{}, agoplanner.Plan{}, fmt.Errorf("recover board definition: %w", err)
 	}
 	return cloneGoal(definition.Goal), clonePlan(definition.Plan), nil
 }
@@ -262,13 +262,6 @@ func (runtime *Runtime) validate() error {
 		return fmt.Errorf("positive lease duration and clock are required")
 	}
 	return nil
-}
-
-func (runtime *Runtime) project(boardID string) (project, bool) {
-	runtime.mu.RLock()
-	defer runtime.mu.RUnlock()
-	value, ok := runtime.projects[boardID]
-	return value, ok
 }
 
 func (runtime *Runtime) coordinator() agoboardprotocol.Actor {

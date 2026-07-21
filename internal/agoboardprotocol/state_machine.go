@@ -577,7 +577,7 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 			next.PauseReason, eventType = command.Reason, EventBoardPaused
 		}
 		emit(Event{Type: eventType, Reason: command.Reason})
-	case CommandGatePass, CommandGateFail:
+	case CommandGatePass, CommandGateFail, CommandGateUnavailable:
 		if err := requireInitialized(next); err != nil {
 			return current, nil, err
 		}
@@ -599,7 +599,7 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		// A result is about one revision. Recording it against anything other
 		// than what is currently integrated would let a pass outlive the work
 		// it was about.
-		if revision != next.IntegratedRevision {
+		if revision != next.IntegratedRevision && command.Type != CommandGateUnavailable {
 			return current, nil, fmt.Errorf(
 				"gate result is for revision %s but the board is integrated at %s",
 				revision, next.IntegratedRevision)
@@ -607,9 +607,18 @@ func Apply(current Board, command Command) (Board, []Event, error) {
 		next.Gate.Revision = revision
 		next.Gate.Summary = command.Gate.Summary
 		next.Gate.RanAt = command.Gate.RanAt.UTC()
+		if command.Type == CommandGateUnavailable {
+			// Not a verdict. The work is not blamed, and the repair budget is
+			// untouched; only the durable tally of failed attempts moves.
+			next.Gate.Unavailable++
+			next.Gate.LastError = command.Gate.Summary
+			next.Gate.RanAt = command.Gate.RanAt.UTC()
+			emit(Event{Type: EventGateUnavailable, Reason: command.Gate.Summary})
+			break
+		}
 		if command.Type == CommandGatePass {
 			next.Gate.State, next.Gate.FailureOutput = GatePassed, ""
-			next.Gate.Failures = 0
+			next.Gate.Failures, next.Gate.Unavailable, next.Gate.LastError = 0, 0, ""
 			emit(Event{Type: EventGatePassed, Reason: command.Gate.Summary})
 			break
 		}

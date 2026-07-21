@@ -2,12 +2,14 @@ package agoscheduler_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"claudexflow/internal/agoboardprotocol"
 	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agogate"
+	"claudexflow/internal/agoscheduler"
 )
 
 // scriptedGate answers however a test needs, and counts how often it was asked.
@@ -136,11 +138,63 @@ func TestAGoalWithNoGateCompletesButIsNotMarkedProven(t *testing.T) {
 
 // newGateHarness is the ordinary harness with a project gate and a goal that
 // establishes checks for it to run.
-func newGateHarness(t *testing.T, gate *scriptedGate) *harness {
+func newGateHarness(t *testing.T, gate agoscheduler.ProjectGate) *harness {
 	t.Helper()
 	h := newHarness(t, t.TempDir()+"/board.db")
 	t.Cleanup(func() { h.store.Close() })
-	h.withGate(t, gate, []string{"go test ./..."})
+	if gate != nil {
+		h.withGate(t, gate, nil)
+	}
 	h.createGoalWithGate(t, "board-gate", []string{"go test ./..."})
 	return h
+}
+
+// brokenGate can never run. A permanently broken toolchain, an unreadable
+// repository, a worktree that cannot be created.
+type brokenGate struct{ calls int }
+
+func (gate *brokenGate) Run(_ context.Context, _, _ string, _ []string) (agogate.Result, error) {
+	gate.calls++
+	return agogate.Result{}, errors.New("git worktree add: permission denied")
+}
+
+// A gate that cannot RUN must not be silent. Swallowing the error left a goal
+// not done, with nothing runnable and nothing in the attention queue, forever
+// — the one outcome this system must never produce.
+func TestAGateThatCannotRunIsBoundedAndNeverSilent(t *testing.T) {
+	ctx := context.Background()
+	gate := &brokenGate{}
+	h := newGateHarness(t, nil)
+	h.withGate(t, gate, nil)
+	h.runUntilSettled(t)
+
+	for range agoboardprotocol.MaxGateUnavailable + 5 {
+		if _, err := h.scheduler.RunOnceForBoard(ctx, h.boardID); err != nil {
+			t.Fatalf("a broken gate failed the cycle: %v", err)
+		}
+	}
+	board, err := h.store.Board(ctx, h.boardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// It is counted durably, so a restart does not begin the tally again.
+	if board.Gate.Unavailable == 0 {
+		t.Fatal("the failures to run were not recorded")
+	}
+	// And it stops trying rather than burning a toolchain run every cycle.
+	if board.Gate.Unavailable > agoboardprotocol.MaxGateUnavailable {
+		t.Fatalf("it kept trying past its bound: %d", board.Gate.Unavailable)
+	}
+	if !strings.Contains(board.Gate.LastError, "permission denied") {
+		t.Fatalf("the reason was lost: %q", board.Gate.LastError)
+	}
+	// The repair budget is untouched: the work was never judged.
+	if board.Gate.Failures != 0 {
+		t.Fatalf("an outage spent the repair budget: %d", board.Gate.Failures)
+	}
+	// And it is not a pass.
+	completion := agoboardprotocol.EvaluateCompletion(board)
+	if completion.Done || completion.Proven {
+		t.Fatalf("a goal whose gate never ran reported done=%v proven=%v", completion.Done, completion.Proven)
+	}
 }
