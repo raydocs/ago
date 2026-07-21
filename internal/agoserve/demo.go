@@ -87,16 +87,41 @@ func Demo(args []string, out io.Writer) error {
 	if _, err := ClaimState(canonical); err != nil {
 		return err
 	}
-	// What is already here before Ago starts. Anything appearing under one of
-	// Ago's names afterwards is attributable to this run, and only that is
-	// recorded as Ago's to delete later.
-	existedBefore := PresentReservedEntries(canonical)
+	// Ago creates its own directories, and each creation records itself. The
+	// alternative — letting the components create them and working out
+	// afterwards which ones appeared — is what made the previous version
+	// attribute a user's directory to Ago when it landed in the startup
+	// window.
+	for _, name := range []string{"artifacts", "worktrees", "integration"} {
+		if _, err := CreateOwnedDirectory(canonical, name); err != nil {
+			return err
+		}
+	}
 
 	repository := filepath.Join(canonical, "greeter")
+	// The repository directory is created and recorded BEFORE anything is
+	// written into it. Recording afterwards left a window — however short —
+	// in which Ago's own repository existed with nothing saying Ago made it,
+	// and a crash there stranded it: no later run could attribute it, so
+	// --reset could never remove it while still reporting success.
+	created, err := CreateOwnedDirectory(canonical, "greeter")
+	if err != nil {
+		return err
+	}
 	// A second run reuses the repository and the database, which is what makes
 	// restart recovery observable rather than a claim: the board comes back
-	// exactly where it stopped.
-	if _, err := os.Stat(repository); errors.Is(err, os.ErrNotExist) {
+	// exactly where it stopped. An empty directory left by an interrupted
+	// first run is finished rather than reused.
+	if _, err := os.Stat(filepath.Join(repository, ".git")); created || errors.Is(err, os.ErrNotExist) {
+		// A run killed part-way through leaves files here but no repository.
+		// Since Ago can prove it made this directory, it clears it and starts
+		// again — otherwise the half-built copy is debris that nothing can
+		// finish and nothing can reuse.
+		if !created {
+			if err := ResetOwnedDirectory(canonical, "greeter"); err != nil {
+				return err
+			}
+		}
 		if err := agodemo.Create(context.Background(), repository); err != nil {
 			return fmt.Errorf("创建示例仓库：%w", err)
 		}
@@ -114,12 +139,6 @@ func Demo(args []string, out io.Writer) error {
 		Scenario:     "success",
 		Out:          out,
 		Setup: func(ctx context.Context, s *Stack) error {
-			// The stack has now created whatever it needed. Recording it here
-			// is what lets a later reset tell Ago's own directories apart from
-			// anything that takes their names afterwards.
-			if err := RecordCreatedEntries(canonical, existedBefore); err != nil {
-				return err
-			}
 			return plantDemoGoal(ctx, out, s, repository, *goal)
 		},
 		Announce: func(address string) {
@@ -218,13 +237,18 @@ func checkStateWritable(state string) error {
 		}
 		return probeWritable(state, state)
 	}
-	// The nearest ancestor that exists is probed. Creating the parent here
-	// would leave a directory behind whenever a later step failed — with the
-	// default --state that meant a stray ~/.ago after every failed run.
+	// The nearest existing ancestor only has to exist. Creating the parent
+	// here would leave a directory behind whenever a later step failed — with
+	// the default --state that meant a stray ~/.ago after every failed run.
 	ancestor := filepath.Dir(state)
 	for {
 		if info, err := os.Lstat(ancestor); err == nil && info.IsDir() {
-			return probeWritable(ancestor, state)
+			// Checked, not probed. Writing a temporary file here would put it
+			// in a directory of the user's that Ago has no claim on, and a
+			// SIGKILL in that window would leave it behind. Whether the
+			// directory can actually be created is settled by creating it, a
+			// moment later, with a clear error of its own.
+			return nil
 		}
 		parent := filepath.Dir(ancestor)
 		if parent == ancestor {

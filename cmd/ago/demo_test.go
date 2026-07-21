@@ -808,3 +808,50 @@ func TestAMovedDemoDirectoryLosesItsDeleteAuthority(t *testing.T) {
 		t.Fatalf("the user's file was destroyed: %v", err)
 	}
 }
+
+// A crash during the first startup must not leave Ago's own sample repository
+// unattributable — and therefore permanently beyond --reset while `--reset`
+// reports success it did not deliver.
+//
+// The previous version recorded everything in one batch after startup
+// finished, so a Ctrl+C before that point stranded greeter/ forever.
+func TestACrashDuringFirstStartupStillLeavesEverythingResettable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a server")
+	}
+	requireTools(t)
+	binary := buildAgo(t)
+	home := t.TempDir()
+	state := filepath.Join(home, ".ago", "demo")
+
+	// Start and kill as soon as the repository exists — before the board is
+	// planted and before the server announces itself.
+	process := startDemoAt(t, binary, home, state)
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(state, "greeter", "go.mod")); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	process.kill()
+	if _, err := os.Stat(filepath.Join(state, "greeter", "go.mod")); err != nil {
+		t.Skipf("the run never got as far as creating the repository: %v", err)
+	}
+
+	// Ago's own repository must already be attributable.
+	if _, err := os.Stat(filepath.Join(state, "greeter", ".ago-created")); err != nil {
+		t.Fatalf("the sample repository was created without recording that Ago made it: %v", err)
+	}
+
+	// And a reset must actually remove it.
+	reset := startDemoAt(t, binary, home, state, "--reset")
+	defer reset.kill()
+	_, transcript := readAddress(t, reset.stdout)
+	if !strings.Contains(transcript, "已清理") {
+		t.Fatalf("the reset did not report itself:\n%s", transcript)
+	}
+	if !strings.Contains(transcript, "示例仓库已创建") {
+		t.Errorf("the reset did not actually remove the old repository:\n%s", transcript)
+	}
+}

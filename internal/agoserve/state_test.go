@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"testing"
 
+	"claudexflow/internal/agoboardstore"
 	"claudexflow/internal/agoserve"
 )
 
@@ -30,20 +31,24 @@ func plantSentinel(t *testing.T, dir string) {
 	}
 }
 
-// claimAndCreate is how Ago itself establishes ownership: claim an empty (or
-// absent) directory, let its own components create things, then record what
-// appeared. Tests go through the same sequence, because a marker on its own no
+// claimAndCreate is how Ago itself establishes ownership: claim the directory,
+// then create each of its own directories through the call that records having
+// created them. Tests go through the same sequence, because a marker alone no
 // longer authorises deleting anything.
-func claimAndCreate(t *testing.T, state string, create func(state string)) string {
+func claimAndCreate(t *testing.T, state string, owned ...string) string {
 	t.Helper()
 	resolved, err := agoserve.ClaimState(state)
 	if err != nil {
 		t.Fatalf("ClaimState(%s): %v", state, err)
 	}
-	before := agoserve.PresentReservedEntries(resolved)
-	create(resolved)
-	if err := agoserve.RecordCreatedEntries(resolved, before); err != nil {
-		t.Fatalf("RecordCreatedEntries: %v", err)
+	for _, name := range owned {
+		created, err := agoserve.CreateOwnedDirectory(resolved, name)
+		if err != nil {
+			t.Fatalf("CreateOwnedDirectory(%s): %v", name, err)
+		}
+		if !created {
+			t.Fatalf("CreateOwnedDirectory(%s) did not create it", name)
+		}
 	}
 	return resolved
 }
@@ -163,11 +168,7 @@ func TestResetRefusesASymlinkedPath(t *testing.T) {
 	t.Run("a parent is a link", func(t *testing.T) {
 		real := t.TempDir()
 		state := filepath.Join(real, "inner", "state")
-		claimAndCreate(t, state, func(resolved string) {
-			if err := os.MkdirAll(filepath.Join(resolved, "artifacts"), 0o700); err != nil {
-				t.Fatal(err)
-			}
-		})
+		claimAndCreate(t, state, "artifacts")
 		plantSentinel(t, state)
 		// A sibling of the real state directory, to prove the delete did not
 		// wander up through the resolved parent.
@@ -199,22 +200,24 @@ func TestResetUnlinksRatherThanFollowingAHostileEntry(t *testing.T) {
 	plantSentinel(t, outside)
 
 	state := filepath.Join(t.TempDir(), "state")
-	claimAndCreate(t, state, func(resolved string) {
-		// Ago's own artifacts directory is replaced by a link before it is
-		// recorded, so the recorded identity IS the link's.
-		if err := os.Symlink(outside, filepath.Join(resolved, "artifacts")); err != nil {
-			t.Fatal(err)
-		}
-	})
+	resolved := claimAndCreate(t, state, "artifacts")
+	// Ago's real directory is swapped for a link pointing at the user's data.
+	if err := os.RemoveAll(filepath.Join(resolved, "artifacts")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(resolved, "artifacts")); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := agoserve.ResetState(state, home); err != nil {
 		t.Fatalf("ResetState: %v", err)
 	}
-	// The link is gone; what it pointed at is untouched.
-	if _, err := os.Lstat(filepath.Join(state, "artifacts")); !os.IsNotExist(err) {
-		t.Fatalf("the hostile link survived: %v", err)
-	}
+	// The link carries no sentinel, so it is not Ago's and is left alone —
+	// and above all what it points at is untouched.
 	assertSentinelIntact(t, outside)
+	if _, err := os.Lstat(filepath.Join(outside, sentinelName)); err != nil {
+		t.Fatalf("the link was followed and the target emptied: %v", err)
+	}
 }
 
 // Locations that are never a demo directory are refused even if a marker was
@@ -299,18 +302,7 @@ func TestResetRefusesHighRiskLocations(t *testing.T) {
 func TestResetRemovesOnlyAgoOwnedEntries(t *testing.T) {
 	home := t.TempDir()
 	state := filepath.Join(t.TempDir(), "demo")
-	claimAndCreate(t, state, func(resolved string) {
-		for _, entry := range []string{"ago.db", "ago.db-wal"} {
-			if err := os.WriteFile(filepath.Join(resolved, entry), []byte("x"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for _, entry := range []string{"greeter", "artifacts", "worktrees", "integration"} {
-			if err := os.MkdirAll(filepath.Join(resolved, entry, "nested"), 0o700); err != nil {
-				t.Fatal(err)
-			}
-		}
-	})
+	claimAndCreate(t, state, "greeter", "artifacts", "worktrees", "integration")
 	// Things the user put there afterwards, which Ago never recorded.
 	plantSentinel(t, state)
 	if err := os.MkdirAll(filepath.Join(state, "my-notes"), 0o700); err != nil {
@@ -507,11 +499,7 @@ func TestResetLeavesEntriesAgoDidNotCreateEvenUnderItsOwnNames(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "build")
 
 	// The claiming run: Ago creates the directory and its own artifacts.
-	resolved := claimAndCreate(t, state, func(resolved string) {
-		if err := os.MkdirAll(filepath.Join(resolved, "artifacts"), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	})
+	resolved := claimAndCreate(t, state, "artifacts")
 
 	// Ago's own artifacts go away, and something else takes the name. This is
 	// a different object: a new directory, a new inode.
@@ -553,11 +541,7 @@ func TestOwnershipDoesNotSurviveBeingMovedOrCopied(t *testing.T) {
 	t.Run("moved", func(t *testing.T) {
 		root := t.TempDir()
 		state := filepath.Join(root, "demo")
-		claimAndCreate(t, state, func(resolved string) {
-			if err := os.MkdirAll(filepath.Join(resolved, "artifacts"), 0o700); err != nil {
-				t.Fatal(err)
-			}
-		})
+		claimAndCreate(t, state, "artifacts")
 		moved := filepath.Join(root, "myproject")
 		if err := os.Rename(state, moved); err != nil {
 			t.Fatal(err)
@@ -580,7 +564,7 @@ func TestOwnershipDoesNotSurviveBeingMovedOrCopied(t *testing.T) {
 
 	t.Run("copied", func(t *testing.T) {
 		source := filepath.Join(t.TempDir(), "demo")
-		claimAndCreate(t, source, func(string) {})
+		claimAndCreate(t, source)
 		// A copy: same marker bytes, different directory.
 		destination := filepath.Join(t.TempDir(), "myproject")
 		if err := os.MkdirAll(destination, 0o700); err != nil {
@@ -656,7 +640,10 @@ func TestHighRiskPathRulesAreLoadBearing(t *testing.T) {
 		if err == nil {
 			t.Fatal("reset was allowed on the filesystem root")
 		}
-		if !strings.Contains(err.Error(), "根目录") {
+		// Both refusals mention 根目录, so the assertion has to name the one
+		// under test. Matching the shared substring is how this test passed
+		// while the rule it covers could be deleted.
+		if !strings.Contains(err.Error(), "文件系统根目录") {
 			t.Fatalf("the refusal came from some other rule: %v", err)
 		}
 	})
@@ -693,11 +680,7 @@ func TestHighRiskPathRulesAreLoadBearing(t *testing.T) {
 func TestResetRemovesAgosOwnDirectoriesWholeButNeverTouchesTheTopLevel(t *testing.T) {
 	home := t.TempDir()
 	state := filepath.Join(t.TempDir(), "demo")
-	resolved := claimAndCreate(t, state, func(resolved string) {
-		if err := os.MkdirAll(filepath.Join(resolved, "artifacts"), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	})
+	resolved := claimAndCreate(t, state, "artifacts")
 	// Inside a directory Ago created: goes with it.
 	inside := filepath.Join(resolved, "artifacts", "my-file.txt")
 	if err := os.WriteFile(inside, []byte("mine\n"), 0o600); err != nil {
@@ -765,11 +748,7 @@ func TestAMarkerWithTheRightBindingButTheWrongMagicIsRefused(t *testing.T) {
 	home := t.TempDir()
 	state := filepath.Join(t.TempDir(), "demo")
 	// A genuine claim first, so path and inode are exactly right.
-	resolved := claimAndCreate(t, state, func(resolved string) {
-		if err := os.MkdirAll(filepath.Join(resolved, "artifacts"), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	})
+	resolved := claimAndCreate(t, state, "artifacts")
 	path := filepath.Join(resolved, ".ago-demo-state")
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -806,7 +785,7 @@ func TestAMarkerWithTheRightBindingButTheWrongMagicIsRefused(t *testing.T) {
 func TestResetIgnoresRecordedEntriesOutsideItsOwnNames(t *testing.T) {
 	home := t.TempDir()
 	state := filepath.Join(t.TempDir(), "demo")
-	resolved := claimAndCreate(t, state, func(string) {})
+	resolved := claimAndCreate(t, state)
 
 	// The user's own directory, and a marker that has been edited to name it.
 	notes := filepath.Join(resolved, "my-notes")
@@ -849,5 +828,281 @@ func TestResetIgnoresRecordedEntriesOutsideItsOwnNames(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(notes, "keep.txt")); err != nil {
 		t.Errorf("reset removed a name that is not one of Ago's: %v", err)
+	}
+}
+
+// Attribution had no coverage at all, which is how the previous version's
+// central mechanism could be deleted with the whole suite green.
+//
+// The scenario every earlier test missed: a user's own directory under one of
+// Ago's names, ALREADY PRESENT when a later run starts. Ago must never come to
+// own it — not by finding it, not by re-recording it, not ever.
+func TestAUsersDirectoryPresentAtStartupNeverBecomesAgos(t *testing.T) {
+	home := t.TempDir()
+	state := filepath.Join(t.TempDir(), "demo")
+	resolved := claimAndCreate(t, state, "artifacts")
+
+	// Ago's own goes away and the user's takes the name, before a later run.
+	if err := os.RemoveAll(filepath.Join(resolved, "artifacts")); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(resolved, "artifacts", "thesis.pdf")
+	if err := os.MkdirAll(filepath.Dir(mine), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mine, []byte("IRREPLACEABLE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A later run: Ago tries to create its directories again and finds one
+	// there. It must not adopt it.
+	created, err := agoserve.CreateOwnedDirectory(resolved, "artifacts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created {
+		t.Fatal("CreateOwnedDirectory claimed to have created an existing directory")
+	}
+	if _, err := os.Lstat(filepath.Join(resolved, "artifacts", ".ago-created")); err == nil {
+		t.Fatal("a directory Ago did not create was marked as its own")
+	}
+
+	if err := agoserve.ResetState(state, home); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatalf("reset destroyed a directory Ago never created: %v", err)
+	}
+}
+
+// Inode reuse must not be able to restore that data loss. On a filesystem that
+// reissues inode numbers — ext4 does, straight after a delete in the same block
+// group — the previous version would delete a user's directory that merely
+// inherited the number. Provenance is a nonce Ago wrote, which a filesystem
+// does not hand out, so the same-inode case is simulated directly.
+func TestASameInodeDirectoryWithoutTheSentinelIsNotAgos(t *testing.T) {
+	home := t.TempDir()
+	state := filepath.Join(t.TempDir(), "demo")
+	resolved := claimAndCreate(t, state, "artifacts")
+
+	// Keep Ago's directory — same inode, same name — but remove the record of
+	// who made it. That is exactly what an inode the kernel reissued looks
+	// like to any identity-based check.
+	if err := os.Remove(filepath.Join(resolved, "artifacts", ".ago-created")); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(resolved, "artifacts", "thesis.pdf")
+	if err := os.WriteFile(mine, []byte("IRREPLACEABLE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := agoserve.ResetState(state, home); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatalf("a directory with no proof of authorship was deleted: %v", err)
+	}
+}
+
+// The board database is identified by its contents, not its name.
+func TestOnlyAgosOwnDatabaseIsRemoved(t *testing.T) {
+	home := t.TempDir()
+
+	t.Run("a user's file called ago.db", func(t *testing.T) {
+		state := filepath.Join(t.TempDir(), "demo")
+		resolved := claimAndCreate(t, state)
+		// A real SQLite file, but not Ago's board.
+		content := append([]byte("SQLite format 3\x00"), make([]byte, 4096)...)
+		copy(content[100:], []byte("CREATE TABLE my_own_table (id INTEGER)"))
+		if err := os.WriteFile(filepath.Join(resolved, "ago.db"), content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := agoserve.ResetState(state, home); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(resolved, "ago.db")); err != nil {
+			t.Fatalf("a database that is not Ago's board was removed: %v", err)
+		}
+	})
+
+	t.Run("Ago's own board", func(t *testing.T) {
+		state := filepath.Join(t.TempDir(), "demo")
+		resolved := claimAndCreate(t, state)
+		store, err := agoboardstore.Open(filepath.Join(resolved, "ago.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := agoserve.ResetState(state, home); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(resolved, "ago.db")); !os.IsNotExist(err) {
+			t.Fatalf("Ago's own board database survived a reset: %v", err)
+		}
+	})
+}
+
+// The directory binding exists for a case the move/copy tests never reach: a
+// directory deleted and restored to the SAME path, which a backup restore or
+// `cp -a` back into place produces. Same path, different inode.
+func TestOwnershipDoesNotSurviveBeingRestoredToTheSamePath(t *testing.T) {
+	home := t.TempDir()
+	state := filepath.Join(t.TempDir(), "demo")
+	resolved := claimAndCreate(t, state, "artifacts")
+	content, err := os.ReadFile(filepath.Join(resolved, ".ago-demo-state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The directory is destroyed and recreated at the same path, and the
+	// marker is put back exactly as it was — a restore.
+	if err := os.RemoveAll(resolved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(resolved, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(resolved, ".ago-demo-state"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(resolved, "artifacts", "user.pdf")
+	if err := os.MkdirAll(filepath.Dir(mine), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mine, []byte("mine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if agoserve.OwnsState(resolved) {
+		t.Error("a restored marker still claims a directory that is not the one it described")
+	}
+	if err := agoserve.ResetState(state, home); err == nil {
+		t.Fatal("a restored marker authorised a reset")
+	}
+	if _, err := os.Stat(mine); err != nil {
+		t.Errorf("the user's file was destroyed: %v", err)
+	}
+}
+
+// The sentinel has to be a real file in the directory it speaks for. A symlink
+// pointing at a file that happens to hold the right nonce would let a
+// directory vouch for itself with someone else's evidence — the same trick the
+// marker's own Lstat check refuses.
+func TestASymlinkedSentinelDoesNotAuthoriseDeletion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on windows")
+	}
+	home := t.TempDir()
+	state := filepath.Join(t.TempDir(), "demo")
+	resolved := claimAndCreate(t, state, "artifacts")
+
+	// Take the real nonce, then rebuild artifacts/ as a directory that is not
+	// Ago's but whose sentinel is a link to a file holding that nonce.
+	nonce, err := os.ReadFile(filepath.Join(resolved, "artifacts", ".ago-created"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := filepath.Join(t.TempDir(), "borrowed-nonce")
+	if err := os.WriteFile(elsewhere, nonce, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(resolved, "artifacts")); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(resolved, "artifacts", "thesis.pdf")
+	if err := os.MkdirAll(filepath.Dir(mine), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mine, []byte("IRREPLACEABLE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(resolved, "artifacts", ".ago-created")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := agoserve.ResetState(state, home); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatalf("a symlinked sentinel authorised deleting a directory Ago never created: %v", err)
+	}
+}
+
+// The nonce is the whole point of the sentinel: it ties a directory to ONE
+// claim. A sentinel carrying a different claim's nonce — copied along with the
+// directory, restored from a backup, or written by hand — is evidence about
+// some other directory and authorises nothing here.
+func TestASentinelFromAnotherClaimAuthorisesNothing(t *testing.T) {
+	home := t.TempDir()
+
+	// One demo, whose artifacts directory Ago genuinely created.
+	source := filepath.Join(t.TempDir(), "first")
+	sourceResolved := claimAndCreate(t, source, "artifacts")
+	borrowed, err := os.ReadFile(filepath.Join(sourceResolved, "artifacts", ".ago-created"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A second demo, with its own claim and therefore its own nonce. The
+	// user's directory here carries the FIRST demo's sentinel.
+	state := filepath.Join(t.TempDir(), "second")
+	resolved := claimAndCreate(t, state)
+	mine := filepath.Join(resolved, "artifacts", "thesis.pdf")
+	if err := os.MkdirAll(filepath.Dir(mine), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mine, []byte("IRREPLACEABLE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(resolved, "artifacts", ".ago-created"), borrowed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := agoserve.ResetState(state, home); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatalf("a sentinel from another claim authorised deleting a directory Ago never created: %v", err)
+	}
+	// And a hand-written one is no better.
+	if err := os.WriteFile(filepath.Join(resolved, "artifacts", ".ago-created"), []byte("guessed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := agoserve.ResetState(state, home); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatalf("a forged sentinel authorised deleting a directory Ago never created: %v", err)
+	}
+}
+
+// ResetOwnedDirectory exists so an interrupted creation can be finished. It
+// empties a directory, so it must refuse anything Ago cannot prove it made —
+// otherwise "finish the half-built repository" becomes "empty whatever is at
+// that path".
+func TestResetOwnedDirectoryRefusesWhatAgoDidNotCreate(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "demo")
+	resolved := claimAndCreate(t, state)
+
+	// A directory at one of Ago's names that Ago did not create.
+	mine := filepath.Join(resolved, "greeter", "my-work.txt")
+	if err := os.MkdirAll(filepath.Dir(mine), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mine, []byte("mine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := agoserve.ResetOwnedDirectory(resolved, "greeter")
+	if err == nil {
+		t.Fatal("ResetOwnedDirectory emptied a directory Ago did not create")
+	}
+	if !strings.Contains(err.Error(), "无法证明") {
+		t.Fatalf("the refusal does not explain itself: %v", err)
+	}
+	if _, statErr := os.Stat(mine); statErr != nil {
+		t.Fatalf("the refused call still destroyed the contents: %v", statErr)
 	}
 }

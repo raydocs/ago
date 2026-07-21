@@ -1,8 +1,13 @@
 package agoserve
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,18 +27,31 @@ import (
 //	v3  claimed only absent or empty directories — correct at the moment of
 //	    the claim, and then never re-decided. Point --state at ./build before
 //	    it exists, let `make` fill it, and --reset removed build/artifacts.
+//	v4  bound the claim to the directory's device and inode and recorded each
+//	    entry the same way, attributing to Ago whatever appeared under one of
+//	    its names during startup. Two things were still wrong: the window was
+//	    58 ms of ordinary wall clock that a sync client or a concurrent build
+//	    can land in, and an inode number is not a fact about who wrote
+//	    something — ext4 reissues them freely.
 //
-// What all three share is a claim that outlives the fact it was based on. So
-// the marker is no longer a flag saying "this directory is Ago's". It is a
-// binding, and it is rechecked against the filesystem every time it is used:
+// What all four share: provenance was DERIVED FROM AN OBSERVATION of the
+// filesystem instead of RECORDED BY THE CODE THAT DID THE WRITING. v1 observed
+// a name's absence, v2 a set of names, v3 emptiness once, v4 absence-then-
+// presence across a window, pinned to a number the kernel may hand out again.
 //
-//   - to the directory, by device and inode, so a copy, a move, a restore, or
-//     a symlink pointing somewhere else is not the thing that was claimed;
-//   - to each entry Ago created, by device and inode, so anything that
-//     appeared under one of Ago's names without Ago creating it is not Ago's
-//     to remove.
+// So nothing is inferred any more:
 //
-// The result is that reset deletes what Ago made, and can tell the difference.
+//   - Ago creates each of its directories with os.Mkdir, which is atomic and
+//     fails if the directory exists. Success IS the proof, and it writes a
+//     sentinel inside carrying this claim's random nonce.
+//   - Reset removes a directory only if that sentinel is there with that
+//     nonce. Not its name, not its inode.
+//   - The board database cannot hold a sentinel, so its provenance is its
+//     contents: a SQLite file containing Ago's own schema.
+//
+// The marker still binds to its directory by canonical path and by device and
+// inode, which is what stops a copied or restored marker from speaking for a
+// directory it was not written for.
 
 // markerName is the file that records the binding. Its presence proves nothing
 // on its own; its contents have to still match the filesystem.
@@ -71,18 +89,25 @@ type marker struct {
 	Path string `json:"path"`
 	// Directory is that directory's own identity, which a copy does not carry.
 	Directory entryID `json:"directory"`
-	// Entries records what Ago actually created, by identity. Reset removes an
-	// entry only when what is on disk now is still the same object.
-	Entries map[string]entryID `json:"entries,omitempty"`
+	// Nonce identifies this claim. Every directory Ago creates carries a copy
+	// inside it: that is what makes provenance a record rather than an
+	// observation.
+	Nonce string `json:"nonce"`
 }
 
-// reservedEntries are the names Ago's own components use inside a state
-// directory. Being on this list is what makes an entry a CANDIDATE for
-// removal; the recorded identity is what makes it removable.
-var reservedEntries = []string{
-	"ago.db", "ago.db-wal", "ago.db-shm",
-	"greeter", "artifacts", "worktrees", "integration",
-}
+// reservedDirectories are the directories Ago creates. Each carries a sentinel
+// naming the claim that created it.
+var reservedDirectories = []string{"greeter", "artifacts", "worktrees", "integration"}
+
+// reservedDatabases are the files SQLite creates for Ago's board. They cannot
+// carry a sentinel, so their provenance is their contents.
+var reservedDatabases = []string{"ago.db", "ago.db-wal", "ago.db-shm"}
+
+// reservedEntries is every name Ago uses, for the emptiness rule.
+var reservedEntries = append(append([]string{}, reservedDirectories...), reservedDatabases...)
+
+// ownedSentinelName is written inside every directory Ago creates.
+const ownedSentinelName = ".ago-created"
 
 // ClaimState makes a directory Ago's, or refuses to use it at all, and returns
 // the canonical path everything afterwards should use.
@@ -112,7 +137,7 @@ func ClaimState(state string) (string, error) {
 	if OwnsState(resolved) {
 		return resolved, nil
 	}
-	if err := writeMarker(resolved, nil); err != nil {
+	if err := WriteMarker(resolved); err != nil {
 		return "", err
 	}
 	return resolved, nil
@@ -183,61 +208,113 @@ func CanClaim(state string) (string, error) {
 		resolved, first)
 }
 
-// PresentReservedEntries reports which of Ago's names already exist. A caller
-// takes this before starting, so that whatever appears afterwards can be
-// attributed to the run that created it.
-func PresentReservedEntries(state string) map[string]bool {
-	present := map[string]bool{}
-	for _, name := range reservedEntries {
-		if _, err := os.Lstat(filepath.Join(state, name)); err == nil {
-			present[name] = true
-		}
-	}
-	return present
-}
-
-// RecordCreatedEntries records the identity of everything Ago's own components
-// just created, so a later reset can tell those objects apart from anything
-// that later takes their name.
+// CreateOwnedDirectory creates one of Ago's directories and records, inside
+// it, that Ago created it.
 //
-// Attribution is by absence: the caller reports which reserved names existed
-// before it started, and only names that appeared since are recorded. That is
-// what closes the case the previous version got wrong — a user who fills a
-// claimed directory with their own artifacts/ never has it recorded, so reset
-// leaves it alone.
-func RecordCreatedEntries(state string, existedBefore map[string]bool) error {
-	current, err := readMarker(state)
-	if err != nil {
-		// No usable marker means nothing to record against. Not worth failing
-		// a running demo over; a later reset simply refuses.
-		return nil
-	}
-	entries := current.Entries
-	if entries == nil {
-		entries = map[string]entryID{}
-	}
-	changed := false
-	for _, name := range reservedEntries {
-		if existedBefore[name] {
-			// It was already there when this run began. If Ago recorded it on
-			// an earlier run the record still stands; if not, Ago did not make
-			// it and must not claim it now.
-			continue
+// The proof is os.Mkdir succeeding. It is atomic: if the directory already
+// exists the call fails with EEXIST and nothing is marked, so a directory
+// somebody else made can never be mistaken for Ago's. No window, no polling,
+// no dependence on a number the filesystem may reissue.
+func CreateOwnedDirectory(state, name string) (bool, error) {
+	path := filepath.Join(state, name)
+	if err := os.Mkdir(path, 0o700); err != nil {
+		if os.IsExist(err) {
+			return false, nil
 		}
-		identity, ok := identityOf(filepath.Join(state, name))
-		if !ok {
-			continue
-		}
-		entries[name] = identity
-		changed = true
+		return false, fmt.Errorf("创建 %s：%w", path, err)
 	}
-	if !changed {
-		return nil
+	if err := MarkOwnedDirectory(state, name); err != nil {
+		return false, err
 	}
-	return writeMarker(state, entries)
+	return true, nil
 }
 
-func writeMarker(state string, entries map[string]entryID) error {
+// MarkOwnedDirectory records that Ago created a directory one of its own
+// components made — the sample repository, which its creator refuses to write
+// into an existing directory. It is only ever called immediately after that
+// creation succeeded, so it carries the same proof.
+func MarkOwnedDirectory(state, name string) error {
+	recorded, err := readMarker(state)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(state, name, ownedSentinelName),
+		[]byte(recorded.Nonce+"\n"), 0o600)
+}
+
+// OwnsDirectory reports whether a directory inside the state directory is one
+// Ago created, by the sentinel it wrote there.
+func OwnsDirectory(state, name string) bool {
+	recorded, err := readMarker(state)
+	if err != nil {
+		return false
+	}
+	return ownsDirectory(state, name, recorded.Nonce)
+}
+
+// ResetOwnedDirectory empties a directory Ago created, so an interrupted
+// creation can be finished rather than left as debris nothing can move. It
+// refuses anything Ago cannot prove it made.
+func ResetOwnedDirectory(state, name string) error {
+	if !OwnsDirectory(state, name) {
+		return fmt.Errorf("拒绝清空 %s：Ago 无法证明是自己创建的", filepath.Join(state, name))
+	}
+	path := filepath.Join(state, name)
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("清理 %s：%w", path, err)
+	}
+	if _, err := CreateOwnedDirectory(state, name); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ownsDirectory reports whether a directory carries this claim's sentinel.
+func ownsDirectory(state, name, nonce string) bool {
+	if strings.TrimSpace(nonce) == "" {
+		return false
+	}
+	path := filepath.Join(state, name, ownedSentinelName)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(content)) == nonce
+}
+
+// agoDatabaseHeader is what every SQLite file starts with.
+var agoDatabaseHeader = []byte("SQLite format 3\x00")
+
+// agoBoardSchema appears verbatim in the file, because SQLite stores each
+// creating statement as text in its schema — normalised, so the "IF NOT
+// EXISTS" the code writes is not part of what lands on disk.
+var agoBoardSchema = []byte("CREATE TABLE board_definitions")
+
+// isAgoDatabase reports whether a file is Ago's own board database.
+//
+// A database cannot carry a sentinel, so its provenance is its contents. A
+// user's file that merely happens to be called ago.db is not Ago's.
+func isAgoDatabase(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	// Bounded: the schema lives at the front of the file.
+	content := make([]byte, 256*1024)
+	read, err := io.ReadFull(file, content)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return false
+	}
+	content = content[:read]
+	return bytes.HasPrefix(content, agoDatabaseHeader) && bytes.Contains(content, agoBoardSchema)
+}
+
+func writeMarker(state, nonce string) error {
 	directory, ok := identityOf(state)
 	if !ok {
 		return fmt.Errorf("无法读取 %s 的文件系统标识，不能安全地认领这个目录", state)
@@ -247,7 +324,7 @@ func writeMarker(state string, entries map[string]entryID) error {
 		CreatedAt: time.Now().UTC(),
 		Path:      canonicalDir(state),
 		Directory: directory,
-		Entries:   entries,
+		Nonce:     nonce,
 	})
 	if err != nil {
 		return err
@@ -280,9 +357,26 @@ func writeMarker(state string, entries map[string]entryID) error {
 	return nil
 }
 
-// WriteMarker claims a directory outright. It exists for tests that need a
-// marker without going through a claim; ordinary callers use ClaimState.
-func WriteMarker(state string) error { return writeMarker(state, nil) }
+// WriteMarker claims a directory outright with a fresh nonce. It exists for
+// tests that need a marker without going through a claim; ordinary callers use
+// ClaimState.
+func WriteMarker(state string) error {
+	nonce, err := newNonce()
+	if err != nil {
+		return err
+	}
+	return writeMarker(state, nonce)
+}
+
+// newNonce identifies one claim. It is random because it must not be guessable
+// or reconstructible from anything already on disk.
+func newNonce() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("生成归属随机数：%w", err)
+	}
+	return hex.EncodeToString(raw), nil
+}
 
 // OwnsState reports whether the marker in this directory still binds to it.
 func OwnsState(state string) bool {
@@ -358,9 +452,10 @@ func canonicalDir(path string) string {
 //     shallower than two segments, or a git repository.
 //  3. The marker is present, well-formed, and still binds to this directory by
 //     path and by device and inode.
-//  4. Each entry is removed only if its recorded identity still matches what
-//     is on disk. Everything else survives — including a directory that took
-//     one of Ago's names after Ago's own was gone.
+//  4. Each directory is removed only if it carries this claim's sentinel, and
+//     the database only if its contents are Ago's own schema. Everything else
+//     survives — including a directory that took one of Ago's names after
+//     Ago's own was gone.
 func ResetState(state, home string) error {
 	resolved, err := CheckResetAllowed(state, home)
 	if err != nil {
@@ -370,49 +465,35 @@ func ResetState(state, home string) error {
 	if err != nil {
 		return err
 	}
-	for name, identity := range recorded.Entries {
-		if !isReservedEntry(name) || !identity.known() {
+	// Directories go only if they carry this claim's sentinel — a thing Ago
+	// wrote, not a name and not an inode number.
+	for _, name := range reservedDirectories {
+		if !ownsDirectory(resolved, name, recorded.Nonce) {
 			continue
 		}
 		target := filepath.Join(resolved, name)
-		current, ok := identityOf(target)
-		if !ok {
-			continue
-		}
-		if current != identity {
-			// Something else is here under Ago's name. It is not what was
-			// recorded, so it is not Ago's to remove.
-			continue
-		}
-		info, err := os.Lstat(target)
-		if err != nil {
-			continue
-		}
-		// A symlink is unlinked, not followed, so a link swapped in for a
-		// recorded directory cannot redirect the delete.
-		if info.Mode()&os.ModeSymlink != 0 {
-			if err := os.Remove(target); err != nil {
-				return fmt.Errorf("删除符号链接 %s：%w", target, err)
-			}
-			continue
-		}
 		if err := os.RemoveAll(target); err != nil {
 			return fmt.Errorf("清理 %s：%w", target, err)
 		}
 	}
-	// The record is cleared, not the marker: the directory is still Ago's, so
-	// the next run need not re-decide that — but nothing Ago no longer has is
-	// recorded any more either.
-	return writeMarker(resolved, nil)
-}
-
-func isReservedEntry(name string) bool {
-	for _, entry := range reservedEntries {
-		if name == entry {
-			return true
+	// The database goes only if it IS Ago's board, by its contents. Its
+	// write-ahead log and shared memory belong to it, so they go with it and
+	// never on their own.
+	if isAgoDatabase(filepath.Join(resolved, "ago.db")) {
+		for _, name := range reservedDatabases {
+			target := filepath.Join(resolved, name)
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("清理 %s：%w", target, err)
+			}
 		}
 	}
-	return false
+	// The claim and its nonce both stand. Rotating the nonce here was
+	// tempting and wrong: anything that survived this reset survived because
+	// it carries no sentinel, so it is already beyond reach — while a
+	// directory of Ago's own that a failed removal left behind would become
+	// permanently unremovable. A mechanism with no effect except a bad one is
+	// not worth keeping.
+	return nil
 }
 
 // CheckResetAllowed answers "may --reset touch this directory?" and deletes

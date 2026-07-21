@@ -114,11 +114,23 @@ go test ./...
 const Objective = "为这个示例 CLI 增加 version 子命令，补充 README 使用说明，增加自动化测试，并生成完成报告。"
 
 // Create writes the fixture into root and makes it a git repository with one
-// commit. It refuses a root that already exists so it can never overwrite
-// something the caller cares about.
+// commit.
+//
+// It refuses a root that already holds anything, so it can never overwrite
+// something the caller cares about. An EMPTY directory is accepted, because a
+// caller that just created the directory itself — and recorded that it did —
+// needs to hand it here without a gap in which the directory exists but
+// nothing says who made it.
 func Create(ctx context.Context, root string) error {
-	if _, err := os.Stat(root); err == nil {
-		return fmt.Errorf("refusing to write the fixture into an existing directory %q", root)
+	if entries, err := os.ReadDir(root); err == nil {
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".ago-") {
+				// Bookkeeping the caller wrote about this directory, not
+				// content.
+				continue
+			}
+			return fmt.Errorf("refusing to write the fixture into a non-empty directory %q", root)
+		}
 	}
 	if _, err := exec.LookPath("git"); err != nil {
 		return fmt.Errorf("the sample repository needs git: %w", err)
