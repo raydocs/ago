@@ -48,7 +48,7 @@ f7b0eb1  isolated real-model executor + worktrees      1886 +
 
 **The last three commits — roughly 4,000 lines — are all one thing: making `--reset` on a demo command unable to delete a user's files.** It took five iterations because four of them were subtly wrong, each caught by a review after the previous one was signed off. The demo is unreleased and has no users.
 
-**Verified end to end:** one Chinese sentence → 6-task DAG → 4 sequential write tasks each inheriting the previous *verified* revision → independent verification of each → 0 human decisions → an integration branch whose own `go test ./...` passes. That is one goal, one repository, one sample fixture, one time.
+**Verified end to end:** one Chinese sentence → 6-task DAG → 4 sequential write tasks each inheriting the previous *verified* revision → independent verification of each → 0 human decisions. That is one goal, one repository, one sample fixture, one time. The branch does pass the fixture's tests — but the end-to-end test checked that, not Ago.
 
 **Not built:** remote execution, multi-repo, team/multi-user, cross-agent messaging, cost/budget accounting, any CI, `ago version`, an installer, `ago doctor`.
 

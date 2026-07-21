@@ -2,7 +2,7 @@
 
 **An intelligent project board that plans, delegates, monitors, and finishes work with agents.**
 
-Ago turns one user objective into a live execution board. The board is not a passive task list: it is itself an orchestration agent. It decomposes the objective, assigns bounded work to specialized agents, watches progress and dependencies, reacts to failures, and verifies integrated results until the project is complete.
+Ago turns one user objective into a live execution board. The board is not a passive task list: it is itself an orchestration agent. It decomposes the objective, assigns bounded work, watches progress and dependencies, reacts to failures, verifies each result independently, and promotes accepted work onto a git ref it owns.
 
 > 输入一个目标，Ago 自动生成看板、拆解任务、分配 Agent，并持续监控和验收，直到项目完成。
 
@@ -16,28 +16,72 @@ go build -o ago ./cmd/ago
 
 Then open the printed URL. Full walkthrough: [快速开始](docs/ago-quickstart.zh.md).
 
+## Status
+
+Ago is pre-release and has no users. This section is the honest inventory; the
+rest of this document describes where it is going.
+
+**Built and exercised end to end.** A durable SQLite work graph with fencing
+tokens, leases, exactly-once claims, and generations. Per-attempt isolated git
+worktrees. An executor that cannot mark its own work done. An independent
+verifier whose deterministic checks outrank its model judgement. Integration of
+accepted work onto `refs/heads/ago/*`, with later tasks inheriting earlier
+verified revisions. An autonomous supervisor that repairs, retries with
+backoff, and escalates only on a defined list of conditions. Crash recovery. A
+live board UI. Credential redaction at the durability boundary.
+
+One real run: a Chinese goal became a 6-task graph, four sequential write tasks
+each built on the previous verified revision, every result independently
+verified, zero human decisions. The resulting branch does pass the sample
+project's tests — **but Ago did not check that.** The end-to-end test did,
+afterwards. See the gap below.
+
+**The gap that matters most.** `ProjectGates` are planned, validated, and
+stored, and nothing executes them. Ago reports a goal complete when every task
+has passed, which is not the same as the integrated result being sound. Two
+individually correct changes can combine into something broken and Ago will
+still say "complete". Until the project gate runs against the integrated
+revision, treat completion as "every part was checked", not "the whole was".
+
+**Not built.** Capability routing (one executor serves every task; capability
+tags are recorded and never used for dispatch). Context engineering. Parallel
+execution — the scheduler dispatches synchronously, so one model task runs at a
+time. Remote execution. Multi-repository. Teams. Cost accounting. The HTTP API
+accepts the offline executor only; the real one is reachable from the CLI.
+
+**Scale is unproven.** Everything above was demonstrated on one six-file sample
+repository with one goal. Nothing here has met a large codebase, a long task
+graph, or two changes that genuinely conflict.
+
+
 ## The simplest mental model
 
 **Ago combines automatic agent routing, repository-aware context engineering,
 an intelligent project board, and durable issue-style work items.**
 
-Conceptually, it brings together four proven interaction patterns:
+Conceptually, it brings together four proven interaction patterns. **Two of the
+four are built today; the other two are intent, not description** — see
+[Status](#status) before relying on any of this:
 
-- **Amp-like automatic capability routing** — use the best available model or
-  agent for each kind of work; customers do not select models themselves;
-- **RepoPrompt-like context engineering** — understand the repository and
-  assemble a focused context package for each task instead of sending the whole
-  codebase or conversation;
-- **Linear-like board orchestration** — visualize dependencies and progress
-  while the board automatically schedules, monitors, retries, and re-plans;
-- **GitHub Issues-like durable work items** — every task has an identity,
-  contract, owner, discussion, status, artifacts, history, and acceptance
-  evidence that tools and automations can reference.
+- **Amp-like automatic capability routing** *(not built)* — use the best
+  available model or agent for each kind of work; customers do not select
+  models themselves. Today every task goes to one executor;
+- **RepoPrompt-like context engineering** *(not built)* — understand the
+  repository and assemble a focused context package for each task instead of
+  sending the whole codebase or conversation. Today a task gets a bounded
+  listing of its worktree;
+- **Linear-like board orchestration** *(built)* — visualize dependencies and
+  progress while the board automatically schedules, monitors, retries, and
+  re-plans;
+- **GitHub Issues-like durable work items** *(built)* — every task has an
+  identity, contract, owner, discussion, status, artifacts, history, and
+  acceptance evidence that tools and automations can reference.
 
 These are product inspirations, not integrations or affiliations. In Ago they
-form one execution loop: the issue-style task defines the work, the context
-engine prepares its inputs, capability routing selects its agent, and the board
-supervises it through verified completion.
+form one intended execution loop: the issue-style task defines the work, the
+context engine prepares its inputs, capability routing selects its agent, and
+the board supervises it through verified completion. The durable half of that
+loop exists; the routing and context halves do not yet.
 
 ## The product
 
@@ -95,7 +139,9 @@ Agent execution is not owned by a UI session. Threads, task state, events, artif
 
 ### 4. Completion is evidence-based
 
-Workers do not declare the project finished merely because they produced text. Every board item carries observable acceptance criteria and verification evidence. Ago integrates results, detects conflicts or stale work, runs checks, and closes the project only when the board's completion contract is satisfied.
+Workers do not declare their own work finished merely because they produced text: an independent verifier decides, and deterministic checks outrank its judgement. Every board item carries observable acceptance criteria and verification evidence.
+
+**Today that guarantee stops at the task.** Ago promotes each accepted change onto its own ref, and closes the goal when every task has passed — it does **not** yet run the project-level gate against the integrated result. Until it does, "the whole thing holds together" is not something Ago has checked. Closing that gap is the current priority.
 
 ## One project, many specialized agents
 
@@ -141,7 +187,7 @@ board can split it again before execution.
 5. **Continuous supervision** — Ago consumes durable progress events, detects blockers, retries safe work, and re-plans when evidence changes.
 6. **Integration** — Results are reconciled into the shared project with ownership and stale-state checks.
 7. **Verification** — Checks, diffs, costs, and artifacts are reviewed against the original objective.
-8. **Completion** — The board closes only when required tasks and the project-level exit gate are proven.
+8. **Completion** — The board closes when every required task has passed. Proving the project-level exit gate against the integrated result is **not yet implemented**; see [Status](#status).
 
 Users should not need to choose a model or manually spawn agents. Ago owns routing and orchestration policy; the interface exposes the work and its evidence.
 

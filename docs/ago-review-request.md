@@ -24,7 +24,9 @@ The product claim is: **after the goal is stated, the number of manual messages 
 
 Go, ~30k lines, SQLite, single binary. Runs locally against any OpenAI-compatible endpoint.
 
-**Demonstrated end to end:** one Chinese sentence → a 6-task DAG → 4 sequential write tasks each inheriting the previous integrated revision → independent verification of each → 0 human decisions → an integration branch whose own `go test ./...` passes. The user's own branch and working tree byte-identical afterwards; no credential in the database.
+**Demonstrated end to end:** one Chinese sentence → a 6-task DAG → 4 sequential write tasks each inheriting the previous integrated revision → independent verification of each → 0 human decisions. The user's own branch and working tree byte-identical afterwards; no credential in the database.
+
+**One correction to that claim, because I made it wrongly before.** The resulting branch does pass the sample project's tests, but **Ago did not check that** — the end-to-end test ran `go test ./...` at the integrated revision afterwards. `ProjectGates` are planned, validated, and stored, and nothing executes them. Ago reports complete when every task has passed, which is not the same as the integrated result being sound. So the system verifies each part; it does not yet verify the whole.
 
 ---
 
