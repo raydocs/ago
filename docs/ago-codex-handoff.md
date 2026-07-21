@@ -4,14 +4,14 @@ Everything you need to continue this work without the conversation that produced
 
 - **Repo** `https://github.com/raydocs/ago` — Go module `claudexflow`, Go 1.26
 - **Working copy** `/Users/ruirui/orca/projects/x` (the only one; do not mirror it elsewhere)
-- **Branch** `feat/fresh-mac-install-kit`, at `574b664`, identical to `origin/master`
-- **Last commit** `574b664 D10.3: record what was created instead of inferring it`
+- **Branch** `feat/fresh-mac-install-kit`, identical to `origin/master`
+- **Last commit** `63d5138 feat: complete a goal only when the integrated result proves itself`
 
 ---
 
 ## 1. What Ago is
 
-A user states one goal in Chinese. Ago turns it into a durable task graph and runs it to completion: decompose, schedule, execute each task in an isolated git worktree, verify independently, promote accepted work onto its own git ref. After the goal is stated, **the number of manual relay messages must be zero.**
+A user states one goal in Chinese. Ago turns it into a durable task graph and runs it to completion: decompose, schedule, execute each task in an isolated git worktree, verify independently, promote accepted work onto its own git ref, and prove the INTEGRATED result against the project's own checks before reporting the goal done. After the goal is stated, **the number of manual relay messages must be zero.**
 
 Only these interrupt the user:
 
@@ -42,7 +42,8 @@ These are standing and non-negotiable.
 | API keys come from the **environment only** | A flag lands in shell history and the process list. `AGO_RELAY_API_KEY` is not accepted as a flag and must never become one |
 | Ago **never pushes** the user's repository | Accepted work goes to `refs/heads/ago/*` only |
 | Read/write scope is per task | The executor may read the whole worktree; it may only write the task's declared `PathScopes` |
-| No `A-22 Context Package`, no Linear, no webhooks, no external journal | Out of scope by decision |
+| No Linear, no webhooks, no external journal | Out of scope by decision |
+| Context packages are **unbuilt, not out of scope** | An earlier handoff called them out of scope while the README led with them. The README now marks them not built; whether to build them is open |
 | Concurrent writers must not touch `protocol.go`, `state_machine.go`, `store.go`, `runtime.go` simultaneously | Serialise edits to these |
 
 ---
@@ -63,7 +64,7 @@ internal/agoserve  Serve(Config) builds the whole stack; Demo() is the demo comm
      │                     are derived by syncProjection. Claim() does receipt
      │                     check → readiness → slot counts → generation → token
      │                     mint → attempt+lease → receipt in ONE immediate txn.
-     ├── agoboardprotocol  SchemaVersion 3. Commands, states, failure classes,
+     ├── agoboardprotocol  SchemaVersion 4. Commands, states, failure classes,
      │                     fencing tokens. state_machine.go is the ONLY place a
      │                     transition is decided; recordAttemptFailure is the
      │                     single retry decision point.
@@ -80,6 +81,9 @@ internal/agoserve  Serve(Config) builds the whole stack; Demo() is the demo comm
      │                     judgement and outranks it.
      ├── agorelayverifier  The semantic half — a separate model call, separate role
      ├── agorelayplanner   Real planner (produces a different DAG per goal)
+     ├── agogate           Proves the INTEGRATED result: the repository's own
+     │                     checks, run in a throwaway checkout. Commands are
+     │                     discovered or user-given, never model-proposed.
      ├── agointegrate      Promotes accepted work onto refs/heads/ago/* only
      ├── agoworktree       Per-attempt detached worktrees, scope checks, patches
      ├── agoartifact       Content-addressed store; takes a byte stream, never a path
@@ -101,7 +105,16 @@ internal/agoserve  Serve(Config) builds the whole stack; Demo() is the demo comm
 6. **The verifier sees the change, not just its hashes.** The patch is read back from the artifact store by digest. A criterion written in prose cannot be judged from a file digest.
 7. **Worktrees are `--detach`.** `worktree add -b` writes real branches into the user's repository that `worktree remove` does not delete.
 8. **SSE projects an explicit allowlist.** Embedding `agoboardprotocol.Event` leaked every fencing token.
-9. **Not every OpenAI-compatible endpoint delivers the system role.** `agorelay` repeats system instructions inside the user message. A local agent-style proxy silently dropped them, and the verifier's output contract was ignored on every call.
+9. **Completion is decided by the integrated result, not by counting tasks.**
+   Every task passing is a weaker claim: two individually correct changes can
+   combine into something broken. Ago reported such goals complete, and the
+   only reason it never showed is that the end-to-end TEST ran the project's
+   suite afterwards. `internal/agogate` now runs the repository's own checks
+   against the promoted revision, and a pass is bound to the revision it was
+   recorded for. A repository whose ecosystem is unrecognised gets an ABSENT
+   gate — which is not a pass, and the board says so.
+
+10. **Not every OpenAI-compatible endpoint delivers the system role.** `agorelay` repeats system instructions inside the user message. A local agent-style proxy silently dropped them, and the verifier's output contract was ignored on every call.
 
 ---
 
