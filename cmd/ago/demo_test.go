@@ -177,39 +177,48 @@ func TestResetRefusesUnownedDirectoriesFromTheCLI(t *testing.T) {
 	const sentinel = "IMPORTANT-USER-FILE.txt"
 	const body = "这是用户自己的文件。\n"
 
+	// Each case names the rule that must refuse it. Asserting only "some
+	// refusal happened" is how a deny-list rule ends up unexercised: the
+	// refusal arrives from an unrelated check and the rule itself could be
+	// deleted with the test still green.
 	type target struct {
-		name    string
-		prepare func(t *testing.T, home string) (state string, guarded string)
+		name       string
+		wantReason string
+		prepare    func(t *testing.T, home string) (state string, guarded string)
 	}
 	targets := []target{{
-		name: "a user's own directory",
+		name:       "a user's own directory",
+		wantReason: "归属标记",
 		prepare: func(t *testing.T, home string) (string, string) {
 			state := filepath.Join(t.TempDir(), "my-work")
 			mustWriteSentinel(t, state, sentinel, body)
 			return state, state
 		},
 	}, {
-		name: "the user's home",
+		name:       "the user's home",
+		wantReason: "主目录",
 		prepare: func(t *testing.T, home string) (string, string) {
 			mustWriteSentinel(t, home, sentinel, body)
 			return home, home
 		},
 	}, {
-		name: "the filesystem root",
+		name:       "the filesystem root",
+		wantReason: "根目录",
 		prepare: func(t *testing.T, home string) (string, string) {
 			mustWriteSentinel(t, home, sentinel, body)
 			return "/", home
 		},
 	}, {
-		name: "a symlink to a marked directory",
+		name:       "a symlink to a real demo directory",
+		wantReason: "符号链接",
 		prepare: func(t *testing.T, home string) (string, string) {
+			// A directory Ago genuinely owns, reached through a link. Only the
+			// symlink rule can refuse this one: the marker is real.
 			real := filepath.Join(t.TempDir(), "real")
+			claimed := startDemoAt(t, binary, home, real)
+			readAddress(t, claimed.stdout)
+			claimed.interrupt(t)
 			mustWriteSentinel(t, real, sentinel, body)
-			// Marked, so only the symlink refusal can stop this one.
-			if err := os.WriteFile(filepath.Join(real, ".ago-demo-state"),
-				[]byte(`{"magic":"ago-demo-state-v1"}`), 0o600); err != nil {
-				t.Fatal(err)
-			}
 			link := filepath.Join(t.TempDir(), "link")
 			if err := os.Symlink(real, link); err != nil {
 				t.Fatal(err)
@@ -230,8 +239,8 @@ func TestResetRefusesUnownedDirectoriesFromTheCLI(t *testing.T) {
 			if err == nil {
 				t.Fatalf("reset was allowed on %s:\n%s", target.name, output)
 			}
-			if !strings.Contains(string(output), "拒绝重置") {
-				t.Fatalf("the refusal is not a refusal to reset:\n%s", output)
+			if !strings.Contains(string(output), target.wantReason) {
+				t.Fatalf("the refusal did not come from the %s rule:\n%s", target.wantReason, output)
 			}
 			content, readErr := os.ReadFile(filepath.Join(guarded, sentinel))
 			if readErr != nil {
@@ -340,7 +349,17 @@ type demoProcess struct {
 
 func startDemo(t *testing.T, binary, home string) *demoProcess {
 	t.Helper()
-	command := exec.Command(binary, "demo", "--executor", "fake", "--listen", "127.0.0.1:0")
+	return startDemoAt(t, binary, home, "")
+}
+
+func startDemoAt(t *testing.T, binary, home, state string, extra ...string) *demoProcess {
+	t.Helper()
+	args := []string{"demo", "--executor", "fake", "--listen", "127.0.0.1:0"}
+	if state != "" {
+		args = append(args, "--state", state)
+	}
+	args = append(args, extra...)
+	command := exec.Command(binary, args...)
 	command.Env = append(minimalEnv(t), "HOME="+home)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout, err := command.StdoutPipe()
@@ -476,64 +495,171 @@ func strayEntries(t *testing.T, home string) []string {
 	return stray
 }
 
-// The exploit an adversarial review found against the first version of the
-// reset fix, reproduced at the level a user meets it.
+// The exploit, against the binary, in every shape it took.
 //
-// Ownership was granted by writing a marker whenever the sample repository was
-// absent, which is true of any directory --state can name. Two ordinary
-// commands then destroyed real data, because "artifacts" and "integration" are
-// ordinary directory names.
-func TestDemoRefusesToOccupyADirectoryFullOfSomeoneElsesWork(t *testing.T) {
+// Ownership was first granted whenever the sample repository was absent, then
+// narrowed to directories whose entries all carried Ago's names — the same
+// hole with a longer condition, because "artifacts" and "integration" are
+// ordinary directory names and a name is not provenance.
+//
+// Every case here contains ONLY names Ago reserves. An earlier version of this
+// test added an extra "src" directory, and passed while the hole was open: the
+// refusal it observed came from the one file outside the allowlist, not from
+// the ownership rule.
+func TestDemoRefusesToOccupyADirectoryItDidNotCreate(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds a binary")
 	}
 	requireTools(t)
 	binary := buildAgo(t)
-	home := t.TempDir()
 
-	project := filepath.Join(t.TempDir(), "myproject")
-	for _, entry := range []string{"artifacts", "integration", "src"} {
-		if err := os.MkdirAll(filepath.Join(project, entry), 0o700); err != nil {
-			t.Fatal(err)
-		}
+	sqliteHeader := append([]byte("SQLite format 3\x00"), make([]byte, 84)...)
+	cases := map[string]map[string][]byte{
+		"artifacts holding a report":  {"artifacts/report.pdf": []byte("%PDF-1.7 user data\n")},
+		"integration holding a patch": {"integration/user.patch": []byte("--- a\n+++ b\n")},
+		"worktrees holding a note":    {"worktrees/note.txt": []byte("my notes\n")},
+		"greeter holding a readme":    {"greeter/README.md": []byte("# my project\n")},
+		"a plain file named ago.db":   {"ago.db": []byte("not actually a database\n")},
+		"a real SQLite file":          {"ago.db": sqliteHeader},
+		"a database and an artifacts": {"ago.db": sqliteHeader, "artifacts/report.pdf": []byte("user data\n")},
 	}
-	report := filepath.Join(project, "artifacts", "report.pdf")
-	if err := os.WriteFile(report, []byte("user data i care about\n"), 0o600); err != nil {
+
+	for name, files := range cases {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			project := filepath.Join(t.TempDir(), "myproject")
+			for relative, content := range files {
+				path := filepath.Join(project, filepath.FromSlash(relative))
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, content, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := snapshotTree(t, project)
+
+			// Step one: the mistyped --state. It must be refused, and above all
+			// it must not leave a marker behind.
+			occupy := exec.Command(binary, "demo", "--executor", "fake",
+				"--listen", "127.0.0.1:0", "--state", project)
+			occupy.Env = append(minimalEnv(t), "HOME="+home)
+			output, err := occupy.CombinedOutput()
+			if err == nil {
+				t.Fatalf("the demo occupied a directory it did not create:\n%s", output)
+			}
+			if !strings.Contains(string(output), "拒绝把") {
+				t.Fatalf("the refusal does not explain itself:\n%s", output)
+			}
+			if _, err := os.Lstat(filepath.Join(project, ".ago-demo-state")); err == nil {
+				t.Fatal("a refused directory was still marked as Ago's")
+			}
+			assertTreeUnchanged(t, project, before)
+
+			// Step two: the reset that used to follow. With no marker it cannot
+			// run, now or ever.
+			reset := exec.Command(binary, "demo", "--executor", "fake",
+				"--listen", "127.0.0.1:0", "--state", project, "--reset")
+			reset.Env = append(minimalEnv(t), "HOME="+home)
+			if output, err := reset.CombinedOutput(); err == nil {
+				t.Fatalf("reset ran on a directory Ago never claimed:\n%s", output)
+			}
+			assertTreeUnchanged(t, project, before)
+		})
+	}
+}
+
+// The legitimate paths still work end to end: an empty directory is usable,
+// and a directory Ago owns can be reset without taking a user's later file
+// with it.
+func TestDemoUsesAnEmptyDirectoryAndResetsOnlyItsOwnEntries(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a server")
+	}
+	requireTools(t)
+	binary := buildAgo(t)
+	home := t.TempDir()
+	state := filepath.Join(t.TempDir(), "empty")
+	if err := os.MkdirAll(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
 
-	// Step one: the mistyped --state. It must not be accepted, and above all
-	// it must not leave a marker behind.
-	occupy := exec.Command(binary, "demo", "--executor", "fake", "--listen", "127.0.0.1:0", "--state", project)
-	occupy.Env = append(minimalEnv(t), "HOME="+home)
-	output, err := occupy.CombinedOutput()
-	if err == nil {
-		t.Fatalf("the demo occupied a directory full of someone else's work:\n%s", output)
+	first := startDemoAt(t, binary, home, state)
+	_, transcript := readAddress(t, first.stdout)
+	if !strings.Contains(transcript, "示例仓库已创建") {
+		t.Fatalf("an empty directory was not usable:\n%s", transcript)
 	}
-	if !strings.Contains(string(output), "拒绝把") {
-		t.Fatalf("the refusal does not explain itself:\n%s", output)
-	}
-	if _, err := os.Lstat(filepath.Join(project, ".ago-demo-state")); err == nil {
-		t.Fatal("a refused directory was still marked as Ago's")
+	first.interrupt(t)
+	if _, err := os.Lstat(filepath.Join(state, ".ago-demo-state")); err != nil {
+		t.Fatalf("a directory Ago filled was not marked as its own: %v", err)
 	}
 
-	// Step two: the reset that used to follow. With no marker it cannot run.
-	reset := exec.Command(binary, "demo", "--executor", "fake", "--listen", "127.0.0.1:0", "--state", project, "--reset")
-	reset.Env = append(minimalEnv(t), "HOME="+home)
-	output, err = reset.CombinedOutput()
-	if err == nil {
-		t.Fatalf("reset ran on a directory Ago never owned:\n%s", output)
+	// A file the user drops in afterwards must survive the reset.
+	note := filepath.Join(state, "my-note.txt")
+	if err := os.WriteFile(note, []byte("keep me\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	content, readErr := os.ReadFile(report)
-	if readErr != nil {
-		t.Fatalf("the user's file was destroyed: %v", readErr)
+	second := startDemoAt(t, binary, home, state, "--reset")
+	defer second.kill()
+	_, resetTranscript := readAddress(t, second.stdout)
+	if !strings.Contains(resetTranscript, "已清理") {
+		t.Fatalf("the reset did not report itself:\n%s", resetTranscript)
 	}
-	if string(content) != "user data i care about\n" {
-		t.Fatalf("the user's file was modified: %q", content)
+	content, err := os.ReadFile(note)
+	if err != nil {
+		t.Fatalf("the reset removed a file Ago did not create: %v", err)
 	}
-	for _, entry := range []string{"artifacts", "integration", "src"} {
-		if _, err := os.Stat(filepath.Join(project, entry)); err != nil {
-			t.Errorf("the user's %s directory was removed: %v", entry, err)
+	if string(content) != "keep me\n" {
+		t.Fatalf("the reset modified a file Ago did not create: %q", content)
+	}
+}
+
+// snapshotTree records every path under root with its contents, so a test can
+// assert that nothing changed rather than that one sentinel survived.
+func snapshotTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	tree := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			tree[relative+"/"] = ""
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		tree[relative] = string(content)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tree
+}
+
+func assertTreeUnchanged(t *testing.T, root string, before map[string]string) {
+	t.Helper()
+	after := snapshotTree(t, root)
+	for path, content := range before {
+		got, present := after[path]
+		if !present {
+			t.Errorf("%s was removed", path)
+			continue
+		}
+		if got != content {
+			t.Errorf("%s was modified: %q", path, got)
+		}
+	}
+	for path := range after {
+		if _, present := before[path]; !present {
+			t.Errorf("%s was created in a directory Ago was refused", path)
 		}
 	}
 }
@@ -584,5 +710,101 @@ func TestAFailedPreflightLeavesNoDirectories(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(home, ".ago")); err == nil {
 		t.Error("a failed preflight left ~/.ago behind")
+	}
+}
+
+// The v3 hole, reproduced end to end against the binary exactly as the review
+// found it.
+//
+// A claim was correct when it was made and then never re-decided: point
+// --state at a directory that is empty or absent, let something else fill it,
+// and reset removed what that something else made. No cleanup step, no
+// symlink, no forged marker — two documented commands with an ordinary build
+// in between.
+func TestResetLeavesWhatSomethingElsePutInAClaimedDirectory(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a server")
+	}
+	requireTools(t)
+	binary := buildAgo(t)
+	home := t.TempDir()
+	// The realistic shape: a scratch directory inside a project that does not
+	// exist yet, which the build system will later fill.
+	state := filepath.Join(t.TempDir(), "myrepo", "build")
+
+	// Run one: Ago creates and claims it. Ordinary, non-destructive.
+	first := startDemoAt(t, binary, home, state)
+	_, transcript := readAddress(t, first.stdout)
+	if !strings.Contains(transcript, "示例仓库已创建") {
+		t.Fatalf("the first run did not claim the directory:\n%s", transcript)
+	}
+	first.interrupt(t)
+
+	// Now something else owns the names. Ago's own artifacts are replaced by a
+	// different directory holding the user's work.
+	if err := os.RemoveAll(filepath.Join(state, "artifacts")); err != nil {
+		t.Fatal(err)
+	}
+	thesis := filepath.Join(state, "artifacts", "thesis.pdf")
+	if err := os.MkdirAll(filepath.Dir(thesis), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(thesis, []byte("IRREPLACEABLE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run two: the reset.
+	second := startDemoAt(t, binary, home, state, "--reset")
+	defer second.kill()
+	_, resetTranscript := readAddress(t, second.stdout)
+	t.Logf("reset run:\n%s", resetTranscript)
+
+	content, err := os.ReadFile(thesis)
+	if err != nil {
+		t.Fatalf("reset destroyed a file Ago never created: %v", err)
+	}
+	if string(content) != "IRREPLACEABLE\n" {
+		t.Fatalf("reset modified a file Ago never created: %q", content)
+	}
+}
+
+// Delete authority does not travel with a copy of the marker. Moving a demo
+// directory and repurposing it is the most likely way a user would arrive
+// here.
+func TestAMovedDemoDirectoryLosesItsDeleteAuthority(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a server")
+	}
+	requireTools(t)
+	binary := buildAgo(t)
+	home := t.TempDir()
+	root := t.TempDir()
+	state := filepath.Join(root, "demo")
+
+	first := startDemoAt(t, binary, home, state)
+	readAddress(t, first.stdout)
+	first.interrupt(t)
+
+	moved := filepath.Join(root, "myproject")
+	if err := os.Rename(state, moved); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(moved, "artifacts", "user.pdf")
+	if err := os.MkdirAll(filepath.Dir(mine), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mine, []byte("mine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(binary, "demo", "--executor", "fake",
+		"--listen", "127.0.0.1:0", "--state", moved, "--reset")
+	command.Env = append(minimalEnv(t), "HOME="+home)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("a moved directory kept its delete authority:\n%s", output)
+	}
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatalf("the user's file was destroyed: %v", err)
 	}
 }

@@ -57,36 +57,42 @@ func Demo(args []string, out io.Writer) error {
 		return fmt.Errorf("--state 不能为空")
 	}
 
-	// Whether a reset is even permitted is settled first, before anything has
-	// been created or probed, so the answer is reported in the words of the
-	// refusal rather than as whatever the next step happened to trip over.
-	// Nothing is deleted here.
+	// Both questions that can refuse this directory are settled first, before
+	// anything is created, probed, or written. A directory Ago is going to
+	// refuse must not first have a temporary file written into it, and the
+	// refusal must be reported in its own words rather than as whatever the
+	// next step happened to trip over. Neither call touches anything.
 	if *reset {
 		if _, err := CheckResetAllowed(*state, home); err != nil {
 			return err
 		}
 	}
+	canonical, err := CanClaim(*state)
+	if err != nil {
+		return err
+	}
 	// Then the rest of preflight, and only then the delete. A --reset that ran
 	// ahead of the credential check would destroy existing state and only then
 	// discover it could not do the work.
-	if err := preflight(out, *state, *listen, *executor); err != nil {
+	if err := preflight(out, canonical, *listen, *executor); err != nil {
 		return err
 	}
 	if *reset {
-		if err := ResetState(*state, home); err != nil {
+		if err := ResetState(canonical, home); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "已清理 Ago 创建的演示状态：%s\n", *state)
+		fmt.Fprintf(out, "已清理 Ago 创建的演示状态：%s\n", canonical)
 	}
 
-	// Claiming comes before creating. A directory that is not Ago's to use is
-	// refused here rather than filled with demo state — and, crucially, never
-	// marked, because the marker is what --reset later trusts.
-	if err := ClaimState(*state); err != nil {
+	if _, err := ClaimState(canonical); err != nil {
 		return err
 	}
+	// What is already here before Ago starts. Anything appearing under one of
+	// Ago's names afterwards is attributable to this run, and only that is
+	// recorded as Ago's to delete later.
+	existedBefore := PresentReservedEntries(canonical)
 
-	repository := filepath.Join(*state, "greeter")
+	repository := filepath.Join(canonical, "greeter")
 	// A second run reuses the repository and the database, which is what makes
 	// restart recovery observable rather than a claim: the board comes back
 	// exactly where it stopped.
@@ -102,12 +108,18 @@ func Demo(args []string, out io.Writer) error {
 	}
 
 	return Serve(Config{
-		DatabasePath: filepath.Join(*state, "ago.db"),
+		DatabasePath: filepath.Join(canonical, "ago.db"),
 		Listen:       *listen,
 		Mode:         *executor,
 		Scenario:     "success",
 		Out:          out,
 		Setup: func(ctx context.Context, s *Stack) error {
+			// The stack has now created whatever it needed. Recording it here
+			// is what lets a later reset tell Ago's own directories apart from
+			// anything that takes their names afterwards.
+			if err := RecordCreatedEntries(canonical, existedBefore); err != nil {
+				return err
+			}
 			return plantDemoGoal(ctx, out, s, repository, *goal)
 		},
 		Announce: func(address string) {
